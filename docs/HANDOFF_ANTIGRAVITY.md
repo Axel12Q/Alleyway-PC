@@ -39,6 +39,9 @@ accelerate future Game Boy native ports.
   - Stage 32 clear -> State 9 (Ending celebration) -> Stage 1 loop.
 - Reusable 2bpp planar tile decoder (`src/gb_tile.h`) with flips, palettes, transparency, and clipping.
 - Reusable APU Channel 1 synthesizer (`src/gb_apu.h`) with cycle-accurate fixed-point phase accumulator, length/sweep/envelope, and decoupled injectable backend (`src/gb_audio_backend.h`).
+- Reusable monotonic real-time DMG scheduler and fractional audio generator (`src/gb_scheduler.h`) with fixed-step accumulation, 59.7275 Hz exact timing, and zero-drift 44,100 Hz fractional sample synthesis (`738 + 23157/65536`).
+- Authentic DMG state delay counters (`state_timer`) measured from cartridge (Curtains: 67 frames, Death: 101 frames, Bonus drop: 228 frames, Normal clear: 145 frames, Bonus tally: 499 frames, Game Over: 358 frames).
+- Authentic presentation banners for Game Over and Stage Clear using cartridge font tiles (`0x5375`), plus opening curtain effect in State 4.
 - Deterministic input timeline, hardware register/watchpoint tracer (`tools/capture_reference.py`).
 - Trace and metadata comparator (`tools/compare_traces.py`).
 - Differential RAM scanner and time-series correlation finder (`tools/scan_ram.py`).
@@ -46,12 +49,12 @@ accelerate future Game Boy native ports.
 - Cartridge header, size, bank alignment, and checksum inspector (`tools/inspect_rom.py`).
 - GitHub Actions CI workflow running on Windows with synthetic fixtures only.
 - Local user dump verified at `../Local-Privado/roms/Alleyway (USA).gb`.
-- Test suite: **28 automated tests passing in ~2.2s**.
+- Test suite: **30 automated tests passing in ~2.4s**.
 
 ## Evidence vs Limits
 
-- Verified: Stages 1..4 mechanics (static, horizontal scrolling, vertical paddle-bounce drop, bonus penetration and timer), independent clock timing, 32-stage classification matrix, Game Over and Stage 32 wrap transitions.
-- Limits: Intro sequences (States 0..4 animations) and ending sequence animation (State 9) are currently handled as direct state transitions rather than full frame-by-frame sprite animations. APU channels 2, 3, 4 remain in progress.
+- Verified: Stages 1..4 mechanics (static, horizontal scrolling, vertical paddle-bounce drop, bonus penetration and timer), independent clock timing, monotonic QPC scheduler, zero-drift fractional audio, 32-stage classification matrix and ROM descriptor validation, Game Over and Stage 32 wrap transitions.
+- Limits: Intro sequences (States 0..3 title screen and Mario entrance) and ending sequence animation (State 9) are currently handled as direct state transitions rather than full frame-by-frame sprite animations. APU channels 2, 3, 4 remain in progress.
 
 ## Roadmap & Budget Guidelines
 
@@ -59,4 +62,4 @@ accelerate future Game Boy native ports.
 - Focus on small, bounded milestones backed by synthetic unit tests:
   1. Complete APU Channels 2 (Square 2), 3 (Wave), and 4 (Noise) for polyphonic music and jingles.
   2. Frame-by-frame animated intro sequence (curtains opening, Mario entry) and ending sequence.
-- Update `docs/STATUS.md` and `MODLOG.md` after each verified milestone.
+- Update `docs/STATUS.md` and `HANDOFF_ANTIGRAVITY.md` after each verified milestone.

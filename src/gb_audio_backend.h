@@ -6,9 +6,11 @@
 #include <string.h>
 
 #include "gb_apu.h"
+#include "gb_scheduler.h"
 
 #define AUDIO_SAMPLE_RATE 44100
-#define AUDIO_SAMPLES_PER_FRAME (AUDIO_SAMPLE_RATE / 60)
+#define AUDIO_MAX_SAMPLES_PER_FRAME GB_AUDIO_MAX_SAMPLES_PER_FRAME
+#define AUDIO_SAMPLES_PER_FRAME AUDIO_MAX_SAMPLES_PER_FRAME
 #define AUDIO_NUM_BUFFERS 4
 
 /*
@@ -42,8 +44,9 @@ typedef struct {
     GbApuChannel1 apu_ch1;
     bool enabled;
     GbAudioBufferState buffer_states[AUDIO_NUM_BUFFERS];
-    int16_t sample_buffers[AUDIO_NUM_BUFFERS][AUDIO_SAMPLES_PER_FRAME];
+    int16_t sample_buffers[AUDIO_NUM_BUFFERS][AUDIO_MAX_SAMPLES_PER_FRAME];
     int current_buffer_idx;
+    uint32_t audio_frac_acc;
     GbAudioDeviceOps *device_ops;
 } GbAudioContext;
 
@@ -140,9 +143,16 @@ static inline bool gb_audio_step_frame(
         gb_audio_dispatch_sfx(rom, rom_size, rom_loaded, &ctx->apu_ch1, sfx_trigger);
     }
 
+    ctx->audio_frac_acc += GB_AUDIO_FRAC_NUM;
+    int samples_this_frame = GB_AUDIO_SAMPLE_BASE;
+    if (ctx->audio_frac_acc >= GB_AUDIO_FRAC_DENOM) {
+        ctx->audio_frac_acc -= GB_AUDIO_FRAC_DENOM;
+        samples_this_frame++;
+    }
+
     /* Simulation audio samples MUST advance exactly once */
-    int16_t current_samples[AUDIO_SAMPLES_PER_FRAME];
-    gb_apu_ch1_render(&ctx->apu_ch1, current_samples, AUDIO_SAMPLES_PER_FRAME);
+    int16_t current_samples[AUDIO_MAX_SAMPLES_PER_FRAME];
+    gb_apu_ch1_render(&ctx->apu_ch1, current_samples, samples_this_frame);
 
     if (!ctx->enabled || ctx->device_ops == NULL) {
         return false;
@@ -162,11 +172,11 @@ static inline bool gb_audio_step_frame(
     }
 
     /* Buffer is FREE: copy rendered samples */
-    memcpy(ctx->sample_buffers[idx], current_samples, sizeof(current_samples));
+    memcpy(ctx->sample_buffers[idx], current_samples, (size_t)samples_this_frame * sizeof(int16_t));
 
     /* Write to device */
     if (ctx->device_ops->write) {
-        int res = ctx->device_ops->write(ctx->device_ops, idx, ctx->sample_buffers[idx], AUDIO_SAMPLES_PER_FRAME);
+        int res = ctx->device_ops->write(ctx->device_ops, idx, ctx->sample_buffers[idx], samples_this_frame);
         if (res == 0) {
             ctx->buffer_states[idx] = BUFFER_QUEUED;
             ctx->current_buffer_idx = (ctx->current_buffer_idx + 1) % AUDIO_NUM_BUFFERS;

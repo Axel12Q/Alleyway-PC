@@ -8,6 +8,7 @@
 #include <string.h>
 #include "gb_tile.h"
 #include "gb_apu.h"
+#include "gb_scheduler.h"
 #include "gb_audio_backend.h"
 
 /*
@@ -30,6 +31,7 @@ typedef struct {
     uint8_t rom[ROM_SIZE_BYTES];
     bool rom_loaded;
     uint8_t state;
+    uint16_t state_timer;    /* Delay counter for authentic DMG state transitions */
     uint8_t prng;
     uint8_t paddle_x;
     uint8_t paddle_y;
@@ -115,9 +117,10 @@ static int win32_waveout_open(GbAudioDeviceOps *ops, uint32_t sample_rate) {
 }
 
 static int win32_waveout_write(GbAudioDeviceOps *ops, int buffer_index, const int16_t *samples, int num_samples) {
-    (void)ops; (void)samples; (void)num_samples;
+    (void)ops; (void)samples;
     if (!g_h_wave_out) return -1;
     WAVEHDR *hdr = &g_wave_hdrs[buffer_index];
+    hdr->dwBufferLength = (DWORD)num_samples * sizeof(int16_t);
     MMRESULT res = waveOutWrite(g_h_wave_out, hdr, sizeof(WAVEHDR));
     return (res == MMSYSERR_NOERROR) ? 0 : -2;
 }
@@ -675,7 +678,11 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
     s->vblank_count = (uint8_t)(s->vblank_count + elapsed_vblanks);
     s->sfx_trigger = 0;
     if (s->state == 4) {
-        /* State 4 (0x06A2): Curtain opening / stage grid initialization */
+        /* State 4 (0x06A2): Curtain opening / stage grid initialization (67 frames in DMG) */
+        if (s->state_timer > 0) {
+            s->state_timer--;
+            if (s->state_timer > 0) return;
+        }
         load_stage_grid(s);
         s->paddle_shrunk = 0;
         s->paddle_w = 0x18;
@@ -700,8 +707,12 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
         }
     } else if (s->state == 7) {
         /* Life lost routine (0x07D3):
-         * If bonus_flag != 0: bonus ends without losing a life! (0x07D3: if bonus_flag != 0 -> State 8)
+         * Delay: 101 frames for normal death; 228 frames for bonus drop/expiration.
          */
+        if (s->state_timer > 0) {
+            s->state_timer--;
+            if (s->state_timer > 0) return;
+        }
         if (s->bonus_flag != 0) {
             s->state = 8;
         } else {
@@ -717,9 +728,12 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
         }
     } else if (s->state == 8) {
         /* Stage Clear (0x0805):
-         * If bonus stage: check if all bricks destroyed (0x19F7: bricks_left == 0).
-         * If perfect clear, award bonus tens from big-endian table at 0x1B71 (500, 700, 1000, 1500 tens).
+         * Delay: 145 frames for normal clear; 499 frames for bonus tally.
          */
+        if (s->state_timer > 0) {
+            s->state_timer--;
+            if (s->state_timer > 0) return;
+        }
         if (s->bonus_flag != 0) {
             if (s->bricks_left == 0) {
                 uint8_t round_idx = (uint8_t)(s->stage >> 2);
@@ -751,6 +765,9 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
         }
     } else if (s->state == 9) {
         /* State 9 (0x0839): Stage 32 ending celebration */
+        if (s->state_timer > 0) {
+            s->state_timer--;
+        }
         if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
             s->stage = 0u;
             s->state = 4u;
@@ -760,7 +777,15 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
             s->state = 5u;
         }
     } else if (s->state == 0x0B) {
-        /* State 11 (0x08D1): Game Over */
+        /* State 11 (0x08D1): Game Over (377 frames or Start/A press) */
+        if (s->state_timer > 0) {
+            s->state_timer--;
+            if (s->state_timer == 0) {
+                s->stage = 0u;
+                stage1_reset_for_play(s);
+                return;
+            }
+        }
         if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
             s->stage = 0u;
             stage1_reset_for_play(s);
@@ -964,6 +989,49 @@ static void render_stage1(const AlleywayStage1 *s) {
     }
     draw_number_fb(144, 88, (uint32_t)s->lives, 2, DMG_SHADES[0]);
     draw_number_fb(144, 112, (uint32_t)(s->stage + 1u), 2, DMG_SHADES[1]);
+
+    /* Authentic banners and transitions:
+     * 1. State 4 (Curtains): Draw closing / opening curtain borders across playfield (X = 8..119).
+     * 2. State 8 (Stage Clear): Draw "STAGE CLEAR" banner.
+     * 3. State 9 (Ending Celebration): Draw "CLEAR" banner.
+     * 4. State 0x0B (Game Over): Draw "GAME OVER" banner.
+     */
+    if (s->state == 4 && s->state_timer > 0) {
+        /* Curtains move inwards/outwards: width proportional to remaining timer */
+        int curtain_w = ((int)s->state_timer * 56) / 67;
+        if (curtain_w > 56) curtain_w = 56;
+        fill_rect_fb(8, 8, curtain_w, 128, DMG_SHADES[2]);
+        fill_rect_fb(120 - curtain_w, 8, curtain_w, 128, DMG_SHADES[2]);
+    } else if (s->state == 0x0B) {
+        /* Render GAME OVER box: background plate + authentic font tiles */
+        fill_rect_fb(28, 56, 72, 28, DMG_SHADES[3]);
+        fill_rect_fb(30, 58, 68, 24, DMG_SHADES[0]);
+        /* "GAME" centered at Y=62, "OVER" at Y=70 */
+        static const uint8_t game_str[4] = {0x90, 0x8A, 0x96, 0x8E};
+        static const uint8_t over_str[4] = {0x98, 0x9F, 0x8E, 0x9B};
+        for (int i = 0; i < 4; ++i) {
+            uint32_t g_addr = 0x5375u + (uint32_t)game_str[i] * 16u;
+            uint32_t o_addr = 0x5375u + (uint32_t)over_str[i] * 16u;
+            if (g_addr + 16u <= ROM_SIZE_BYTES) {
+                gb_tile_blit(&s->rom[g_addr], 48 + i * 8, 62, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+            }
+            if (o_addr + 16u <= ROM_SIZE_BYTES) {
+                gb_tile_blit(&s->rom[o_addr], 48 + i * 8, 70, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+            }
+        }
+    } else if (s->state == 8 || s->state == 9) {
+        /* Render STAGE CLEAR / CLEAR box */
+        fill_rect_fb(20, 60, 88, 20, DMG_SHADES[3]);
+        fill_rect_fb(22, 62, 84, 16, DMG_SHADES[0]);
+        static const uint8_t clear_str[10] = {0x9C, 0x9D, 0x8A, 0x90, 0x8E, 0x8C, 0x95, 0x8E, 0x8A, 0x9B};
+        for (int i = 0; i < 10; ++i) {
+            uint32_t c_addr = 0x5375u + (uint32_t)clear_str[i] * 16u;
+            int x_pos = (i < 5) ? (24 + i * 8) : (28 + i * 8);
+            if (c_addr + 16u <= ROM_SIZE_BYTES) {
+                gb_tile_blit(&s->rom[c_addr], x_pos, 66, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+            }
+        }
+    }
 }
 
 static bool try_load_rom_file(AlleywayStage1 *s, const char *path) {
@@ -1269,14 +1337,9 @@ static void handle_key_change(WPARAM vk, bool down, HWND w) {
 }
 
 static LRESULT CALLBACK window_proc(HWND w, UINT m, WPARAM a, LPARAM b) {
-    if (m == WM_DESTROY) { KillTimer(w, 1); audio_backend_shutdown(); PostQuitMessage(0); return 0; }
+    if (m == WM_DESTROY) { audio_backend_shutdown(); PostQuitMessage(0); return 0; }
     if (m == WM_KEYDOWN) { handle_key_change(a, true, w); return 0; }
     if (m == WM_KEYUP)   { handle_key_change(a, false, w); return 0; }
-    if (m == WM_TIMER && a == 1) {
-        step_window_frame();
-        InvalidateRect(w, NULL, FALSE);
-        return 0;
-    }
     if (m == WM_PAINT) {
         PAINTSTRUCT paint; HDC dc = BeginPaint(w, &paint);
         RECT rect; GetClientRect(w, &rect);
@@ -1379,6 +1442,74 @@ int main(int argc, char **argv) {
         if (g_sim.stage != 4 || g_sim.state != 5 || g_sim.lives != lives_before) return 11;
 
         puts("PASS: autonomous clock and bonus lifecycle verified");
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--verify-scheduler-timing") == 0) {
+        GbScheduler sched;
+        gb_scheduler_init(&sched);
+
+        /* 1. Verify exact DMG timing constants */
+        if (GB_CYCLES_PER_FRAME != 70224u) return 1;
+        if (GB_CPU_CLOCK_HZ != 4194304u) return 2;
+        double expected_fps = 4194304.0 / 70224.0; /* 59.72750056961936... */
+        if (GB_FRAMES_PER_SEC < expected_fps - 0.001 || GB_FRAMES_PER_SEC > expected_fps + 0.001) return 2;
+        if (sched.frame_duration < 0.016742 || sched.frame_duration > 0.016743) return 3;
+
+        /* 2. Step uniform 60 Hz dt (1/60 = 0.016666... sec) */
+        /* Since 1/60 < 1/59.7275, every ~219 frames has 0 ticks, giving exact 59.7275 ticks/sec */
+        int total_ticks = 0;
+        double dt_60fps = 1.0 / 60.0;
+        for (int i = 0; i < 600; ++i) {
+            total_ticks += gb_scheduler_advance(&sched, dt_60fps);
+        }
+        /* Over 10.0 seconds of wall clock, DMG steps 597 or 598 ticks */
+        if (total_ticks < 597 || total_ticks > 598) return 4;
+
+        /* 3. Verify irregular intervals / frame jitter decoupling */
+        gb_scheduler_reset(&sched);
+        int j_ticks = 0;
+        double jitters[6] = {0.005, 0.025, 0.010, 0.035, 0.008, 0.017};
+        for (int cycle = 0; cycle < 100; ++cycle) {
+            for (int k = 0; k < 6; ++k) {
+                j_ticks += gb_scheduler_advance(&sched, jitters[k]);
+            }
+        }
+        /* Sum of jitters is 0.100s per cycle * 100 = 10.0s -> 597 ticks */
+        if (j_ticks != 597) return 5;
+
+        /* 4. Verify pause freeze & accumulator discard */
+        gb_scheduler_set_paused(&sched, true);
+        if (gb_scheduler_advance(&sched, 1.0) != 0) return 6;
+        gb_scheduler_set_paused(&sched, false);
+        /* First frame after unpause should not burst past 1 tick */
+        int unpause_ticks = gb_scheduler_advance(&sched, sched.frame_duration);
+        if (unpause_ticks != 1) return 7;
+
+        /* 5. Verify stall clamp (e.g. 5-second window freeze/drag clamps to max_frame_skip_sec) */
+        int stall_ticks = gb_scheduler_advance(&sched, 5.0);
+        if (stall_ticks > 12) return 8; /* Clamped to 200 ms ~ 11 ticks */
+
+        /* 6. Verify zero-drift fractional audio accumulation across 1,000 DMG frames */
+        gb_scheduler_reset(&sched);
+        uint64_t accumulated_samples = 0;
+        for (int f = 0; f < 1000; ++f) {
+            int s_count = gb_scheduler_get_frame_audio_samples(&sched);
+            if (s_count < 738 || s_count > 739) return 9;
+            accumulated_samples += (uint64_t)s_count;
+        }
+        /* Exact expected samples: (1000 * 44100 * 70224) / 4194304 = 738353 */
+        uint64_t expected_samples = gb_scheduler_expected_audio_samples_total(1000, 44100);
+        if (accumulated_samples != expected_samples || accumulated_samples != 738353ull) return 10;
+
+        /* 7. Verify HUD bonus timer units to ticks and seconds */
+        /* 95 units = 3040 ticks = 50.90 seconds */
+        uint64_t bonus_ticks = gb_scheduler_bonus_units_to_ticks(95);
+        if (bonus_ticks != 3040ull) return 11;
+        double bonus_sec = gb_scheduler_bonus_units_to_seconds(95);
+        if (bonus_sec < 50.89 || bonus_sec > 50.91) return 12;
+
+        puts("PASS: scheduler monotonic timing and fractional audio verified");
         return 0;
     }
 
@@ -1552,11 +1683,38 @@ int main(int argc, char **argv) {
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top, NULL, NULL, instance, NULL);
     if (!window) { audio_backend_shutdown(); return 3; }
-    SetTimer(window, 1, 16, NULL);
-    MSG msg; int result;
-    while ((result = GetMessageW(&msg, NULL, 0, 0)) > 0) {
-        TranslateMessage(&msg); DispatchMessageW(&msg);
+
+    GbScheduler sched;
+    gb_scheduler_init(&sched);
+
+    LARGE_INTEGER perf_freq, prev_counter;
+    QueryPerformanceFrequency(&perf_freq);
+    QueryPerformanceCounter(&prev_counter);
+
+    MSG msg = {0};
+    while (msg.message != WM_QUIT) {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) break;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (msg.message == WM_QUIT) break;
+
+        LARGE_INTEGER cur_counter;
+        QueryPerformanceCounter(&cur_counter);
+        double dt = (double)(cur_counter.QuadPart - prev_counter.QuadPart) / (double)perf_freq.QuadPart;
+        prev_counter = cur_counter;
+
+        int ticks = gb_scheduler_advance(&sched, dt);
+        if (ticks > 0) {
+            for (int t = 0; t < ticks; ++t) {
+                step_window_frame();
+            }
+            InvalidateRect(window, NULL, FALSE);
+        } else {
+            Sleep(1); /* Yield CPU to avoid 100% spin while waiting for next frame boundary */
+        }
     }
     audio_backend_shutdown();
-    return result < 0 ? 4 : 0;
+    return 0;
 }

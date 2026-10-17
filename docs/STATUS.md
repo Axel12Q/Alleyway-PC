@@ -139,9 +139,46 @@
   - *Aclaracion sobre mecanicas*: Se refuta formalmente cualquier especulacion sobre "division de bola" o "transformaciones de paleta" al estilo Arkanoid; el binario oficial DMG de Alleyway carece por completo de tales rutinas (unicamente existen paleta normal de 24 px y paleta reducida a 16 px al tocar el techo).
 - **Ejecucion de pruebas**: **28 pruebas aprobadas** en ~2.2s.
 
+### Hito 10: Scheduler monotónico de alta precisión, audio fraccionario sin deriva, temporizadores auténticos de estado y verificación de las 32 fases
+- **Scheduler monotónico DMG y audio fraccionario desacoplado (`src/gb_scheduler.h`, `src/gb_audio_backend.h`, `src/main.c`)**:
+  - Reemplazado el temporizador `SetTimer(window, 1, 16, NULL)` por un reloj monotónico Win32 de alta precisión (`QueryPerformanceCounter`/`QueryPerformanceFrequency`), acumulador de tiempo fijo de fotogramas DMG (`70,224 / 4,194,304 = 0.0167427063` s, ~59.7275 Hz) y desacoplamiento de los ticks de simulación frente a la tasa de refresco o mensajes de ventana (`PeekMessageW`).
+  - Generador fraccionario exacto de muestras de audio: a 44,100 Hz, cada fotograma DMG requiere exactamente `44100 * 70224 / 4194304 = 738 + 23157 / 65536` muestras. Con un acumulador entero de 16 bits (`audio_frac_acc`), se alternan 738 y 739 muestras por fotograma, logrando exactamente 738,353 muestras en 1,000 fotogramas sin pérdida ni desincronización de audio con el juego.
+  - Implementado límite de retardo/arrastre (clamp a 200 ms) para evitar ráfagas descontroladas al mover la ventana o pausar el proceso.
+  - Opcion de línea de comandos `--verify-scheduler-timing` en `alleyway-lab.exe` validando:
+    1. Constantes físicas de DMG (`GB_CYCLES_PER_FRAME = 70224`, `GB_CPU_CLOCK_HZ = 4194304`, ~59.7275 Hz).
+    2. Actualizaciones uniformes a 60 Hz (597..598 ticks por cada 10.0 s de reloj de pared).
+    3. Secuencias con delta-t irregular y jitter de fotogramas (597 ticks en 10.0 s desacoplados).
+    4. Congelación en pausa y reanudación limpia sin ráfaga de fotogramas.
+    5. Corte de seguridad ante bloqueos de 5 segundos (máximo 12 ticks acumulados).
+    6. Muestreo fraccionario exacto: 738,353 muestras acumuladas en 1,000 fotogramas (cero deriva acumulada).
+    7. Conversiones de temporizador bonus HUD: 95 unidades = 3040 ticks = 50.90 segundos.
+- **Temporizadores auténticos de retardo entre estados (`state_timer` en `AlleywayStage1`)**:
+  - Medidos con precisión empírica en el binario del cartucho usando PyBoy:
+    - Estado 4 (Apertura de telón): 67 fotogramas.
+    - Estado 7 (Pérdida de vida normal): 101 fotogramas.
+    - Estado 7 (Caída de bola / expiración en bonus): 228 fotogramas.
+    - Estado 8 (Clear normal): 145 fotogramas.
+    - Estado 8 (Conteo de bonus perfecto): 499 fotogramas.
+    - Estado 11 (Game Over): 358..377 fotogramas.
+  - El motor nativo C soporta `state_timer` tanto para transiciones instantáneas en pruebas de diagnóstico (`state_timer == 0`) como para transiciones temporizadas reales durante la partida.
+- **Presentación auténtica y visualización de banners y telón**:
+  - Efecto de telón en Estado 4: bandas laterales que se abren progresivamente según el tiempo restante del telón (`X = 8..119`).
+  - Banner "GAME OVER" en Estado 11: caja centrada con caracteres decodificados desde la fuente del cartucho (`0x5375 + char * 16`).
+  - Banner "STAGE CLEAR" en Estados 8 y 9: caja con caracteres gráficos auténticos del cartucho.
+- **Pruebas diferenciales en paralelo y verificación de las 32 fases**:
+  - Prueba diferencial en `tests/test_stage1_native.py` (`test_local_rom_progression_scenarios_if_present`):
+    - Game Over: `lives = 0` -> Estado 7 -> Estado 11 (`0x0B`).
+    - Bonus Clear: limpieza perfecta de ladrillos -> Estado 8 -> premio exacto de 500 decenas (+5,000 puntos) -> avance a Fase 5.
+    - Stage 32 Clear: Estado 8 -> Estado 9 (secuencia de final) -> retorno cíclico a Fase 0.
+    - Bonus Ball Drop: caída de bola en fase de bonus -> Estado 7 -> Estado 8 sin perder vidas -> avance a Fase 5 con vidas intactas.
+  - Verificación exhaustiva de las 32 fases en ROM (`test_all_32_stage_descriptors_and_advanced_rounds_regression`):
+    - Validación de los 32 descriptores en `0x1BE1 + s*3`, comprobando la alternancia exacta de los 4 tipos en cada una de las 8 rondas (8x Tipo A estáticas, 8x Tipo B móviles con patrones 0..7 en `0x4075`, 8x Tipo C de 40 filas con descenso por rebote, y 8x Tipo D de bonificación con 20 filas).
+    - Regresiones puntuales para fases avanzadas: Fase 8 (Bonus corazón, 162 bloques en `0x3695`), Fase 14 (Desplazamiento horizontal, 108 bloques en `0x1EE7`), Fase 23 (Descenso vertical, 300 bloques en `0x2EE9`).
+- **Estado de la suite de pruebas**: **30 pruebas automatizadas aprobadas** en 2.38s.
+
 ## Lo que falta para el juego completo (siguiente paso para continuar)
-1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
-2. **Secuencias de intro y animacion del telon (Estados 0..4) y secuencia grafica del final (Estado 9)**.
+1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulación por software de barridos de tono (`0x6B76`/`0x6B8B`).
+2. **Pantalla de título completa (Estado 2, "PUSH START KEY") y animación del telón con Mario (Estados 0..4)**.
 
 
 

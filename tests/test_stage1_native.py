@@ -754,6 +754,110 @@ class NativeStage1VerifierTests(unittest.TestCase):
         finally:
             gb3.stop()
 
+        # 4. Test Bonus Stage ball drop preserves lives and advances to next stage
+        gb4 = _spawn_past_title()
+        try:
+            # Advance to Stage 4 (bonus)
+            gb4.memory[0xCA45] = 2; gb4.memory[0xFFAA] = 0
+            gb4.memory[0xFFC8] = 0; gb4.memory[0xFFC9] = 0; gb4.memory[0xFFA4] = 8
+            for _ in range(500):
+                if gb4.memory[0xCA45] == 3 and gb4.memory[0xFFA4] == 5:
+                    break
+                gb4.tick()
+            self.assertEqual(gb4.memory[0xCA45], 3, "Failed to reach Stage 4")
+            lives_before = gb4.memory[0xCA44]
+            # Trigger ball drop in bonus stage (State 7)
+            gb4.memory[0xFFA4] = 7
+            for _ in range(300):
+                if gb4.memory[0xCA45] == 4 and gb4.memory[0xFFA4] == 5:
+                    break
+                gb4.tick()
+            self.assertEqual(gb4.memory[0xCA45], 4, "Did not advance to Stage 5 after bonus ball drop")
+            self.assertEqual(gb4.memory[0xCA44], lives_before, "Lives were decremented after bonus ball drop")
+        finally:
+            gb4.stop()
+
+    def test_scheduler_timing_and_fractional_audio(self):
+        """Verify monotonic scheduler timing, fractional zero-drift audio, and bonus conversions."""
+        proc = subprocess.run([str(EXE_PATH), "--verify-scheduler-timing"], check=True, capture_output=True, text=True)
+        self.assertIn("PASS: scheduler monotonic timing and fractional audio verified", proc.stdout)
+
+    def test_all_32_stage_descriptors_and_advanced_rounds_regression(self):
+        """Verify ROM descriptors for all 32 stages: 8 rounds x 4 types (A, B, C, D) and advanced layouts."""
+        local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
+        if not local_rom.is_file():
+            self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
+        rom = local_rom.read_bytes()
+
+        # Expected stage type cycle: A, B, C, D repeated for 8 rounds
+        # Stage descriptors start at 0x1BE1, 3 bytes each:
+        # byte 0: flags (bit 7 = bonus_flag, bit 6 = scroll_flag, bits 0..5 = pattern index)
+        # bytes 1..2: little-endian pointer to brick map
+        stage_types = []
+        for s in range(32):
+            desc = 0x1BE1 + s * 3
+            b0 = rom[desc]
+            m_ptr = rom[desc + 1] | (rom[desc + 2] << 8)
+            is_bonus = (b0 & 0x80) != 0
+            is_scroll = (b0 & 0x40) != 0
+
+            # Count rows and destructible bricks in ROM map
+            ptr = m_ptr
+            rows = 0
+            brick_count = 0
+            while ptr < len(rom) and rom[ptr] != 0xFF:
+                row = rom[ptr:ptr + 14]
+                brick_count += sum(1 for x in row if x != 0)
+                rows += 1
+                ptr += 14
+
+            stype = 'D' if is_bonus else ('B' if is_scroll else ('C' if rows >= 25 else 'A'))
+            stage_types.append(stype)
+
+            # Assert valid map properties for each stage
+            self.assertGreater(rows, 0, f"Stage {s+1} has 0 rows")
+            self.assertGreater(brick_count, 0, f"Stage {s+1} has 0 bricks")
+
+            # Check authentic structure:
+            round_idx = s // 4
+            stage_in_round = s % 4
+            if stage_in_round == 0:
+                self.assertEqual(stype, 'A', f"Stage {s+1} should be Type A (static)")
+            elif stage_in_round == 1:
+                self.assertEqual(stype, 'B', f"Stage {s+1} should be Type B (horizontal scroll)")
+                pattern_idx = b0 & 0x3F
+                self.assertLess(pattern_idx, 8, f"Stage {s+1} scroll pattern index out of range")
+            elif stage_in_round == 2:
+                self.assertEqual(stype, 'C', f"Stage {s+1} should be Type C (vertical drop, 40 rows)")
+                self.assertEqual(rows, 40, f"Stage {s+1} should have 40 rows for vertical drop")
+            elif stage_in_round == 3:
+                self.assertEqual(stype, 'D', f"Stage {s+1} should be Type D (bonus stage)")
+                self.assertEqual(rows, 20, f"Stage {s+1} bonus should have 20 rows")
+
+        # Verify exact round breakdown (8 rounds x 4 stages = 32)
+        self.assertEqual(len(stage_types), 32)
+        self.assertEqual(stage_types.count('A'), 8)
+        self.assertEqual(stage_types.count('B'), 8)
+        self.assertEqual(stage_types.count('C'), 8)
+        self.assertEqual(stage_types.count('D'), 8)
+
+        # Regressions for specific advanced rounds:
+        # Stage 8 (Round 2 Bonus, Heart shape): map_ptr 0x3695, 162 bricks
+        desc8 = 0x1BE1 + 7 * 3
+        map8 = rom[desc8 + 1] | (rom[desc8 + 2] << 8)
+        self.assertEqual(map8, 0x3695)
+
+        # Stage 14 (Round 4 Scroll, 108 bricks): map_ptr 0x1EE7, pattern index 3
+        desc14 = 0x1BE1 + 13 * 3
+        self.assertEqual(rom[desc14] & 0x3F, 3)
+        map14 = rom[desc14 + 1] | (rom[desc14 + 2] << 8)
+        self.assertEqual(map14, 0x1EE7)
+
+        # Stage 23 (Round 6 Drop, 300 bricks, 40 rows): map_ptr 0x2EE9
+        desc23 = 0x1BE1 + 22 * 3
+        map23 = rom[desc23 + 1] | (rom[desc23 + 2] << 8)
+        self.assertEqual(map23, 0x2EE9)
+
 
 if __name__ == "__main__":
     unittest.main()

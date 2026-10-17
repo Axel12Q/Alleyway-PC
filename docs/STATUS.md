@@ -24,19 +24,24 @@
   - Prueba extendida de paridad sobre la Fase 1 real: **5,651 ticks consecutivos de logica comparados (`mismatches = 0`, 59 bloques rotos de 84 a 25, puntuacion `1150`, aceleracion `speed_idx: 3 -> 5 -> 7`)**.
   - Flujo de CI en GitHub Actions (`.github/workflows/ci.yml`) configurado sobre `windows-latest` usando exclusivamente datos sinteticos.
 
-### Hito 4: Componentes genericos reutilizables — decodificador de tiles 2bpp y sintesis APU Canal 1
+### Hito 4: Componentes genericos reutilizables — decodificador 2bpp, sintesis APU y backend waveOut
 - **Decodificador generico de tiles 2bpp (`src/gb_tile.h`)**:
-  - Decodifica el formato planar de 16 bytes caracteristico de Game Boy a indices de 2 bits (0..3) o a pixeles ARGB/XRGB aplicando paletas DMG (BGP/OBP0/OBP1) y transformaciones OAM (flip horizontal y vertical, transparencia de color 0).
-  - Pruebas sinteticas en `tests/test_tile_decode.py` (solidos, damero, mapeo y reversion de paleta).
+  - Decodifica el formato planar de 16 bytes a indices 0..3 o a pixeles ARGB/XRGB aplicando paletas DMG (`BGP`/`OBP0`/`OBP1`) y transformaciones OAM (flip horizontal y vertical, transparencia de color 0 y clipping).
+  - Validado en C mediante el ejecutable de pruebas `tests/test_c_modules.c` (indices de planos, paletas estándar e invertidas, flips, transparencia y clipping negativo) ejecutado de forma automatizada por `tests/test_c_modules.py`.
   - Conectado a `src/main.c`: cuando la ROM local esta cargada, la paleta (Tile 0 izquierda, Tile 1 centro, Tile 0 volteado derecha), la bola (Tile 5 en `0x4BC5`), el muro superior (Tile 179 en `0x56A5`) y los bloques 168..176 (en `0x55F5`, empaquetando 2 filas de 4 px por tile de 8x8) se renderizan directamente con los graficos autenticos del cartucho.
-- **Sintesis y medicion APU Canal 1 (`src/gb_apu.h`)**:
-  - Modulo reutilizable de sintesis de onda cuadrada con barrido de frecuencia por hardware (`NR10`), ciclo de trabajo 12.5%/25%/50%/75% (`NR11`), envolvente de volumen (`NR12`) y control de frecuencia/disparo (`NR13`/`NR14`).
-  - Pruebas unitarias de aritmetica APU en `tests/test_apu.py` (calculo de frecuencia, tiempos de barrido y pasos de envolvente).
-  - Ingenieria inversa del driver de sonido (`0x6800..0x7FF0`) documentada en `docs/RESEARCH_PROTOCOL.md`: localizadas las colas en `0xDFE0..0xDFE2` y las tablas de registros en ROM (`0x6FDE`, `0x6FBB`, `0x6FCA`, `0x701A`). Descubierta la razon del retraso en VBlank: el bucle de barrido por software en `0x6E10..0x6E35` para el rebote en pared (SFX 12).
-  - Conectados los eventos reales en `src/main.c` (`sfx_trigger` con SFX 7 para saque y paleta, SFX 11 para techo, SFX 12 para pared y SFX 1..3 para bloques segun el byte 5 de la tabla `0x1B87`).
+- **Sintesis APU Canal 1 (`src/gb_apu.h`) y Backend Win32 waveOut**:
+  - **Sintetizador**: implementado con avance en ciclos de reloj de CPU (4.194304 MHz) y acumulador de fase en punto fijo 32.32 para evitar acumulacion de error fraccionario. Incorpora Frame Sequencer de 512 Hz, contador de longitud de 64 pasos (`NR11` bits 0..5 y `NR14` bit 6), apagado de DAC cuando `NR12` bits 7..3 son 0, barrido por hardware (`NR10`) con deteccion de desbordamiento en trigger/paso, y decaimiento/incremento de envolvente de volumen (`NR12`).
+  - **Pruebas en C real**: `tests/test_c_modules.c` valida apagado de DAC (silencio absoluto), expiracion de contador de longitud, desbordamiento de barrido por hardware y alternancia de pulsos PCM en muestras reales, incluyendo deteccion de fallo provocado (`--deliberate-fail`).
+  - **Integracion de audio de extremo a extremo**: `src/main.c` conecta los eventos del juego (`sfx_trigger`) y las tablas de ROM (`0x701A`, `0x6FDE`, `0x6FBB`, `0x6FCA`) al sintetizador APU y a una cola de 4 buffers waveOut en Win32 (`AUDIO_SAMPLE_RATE = 44100`, ~735 muestras por fotograma a 60 Hz). Si no hay dispositivo de audio disponible o se ejecuta en entorno headless/CI, avanza la simulacion APU de forma puramente determinista sin fallar.
+- **Distincion de capas del sistema**:
+  - *Logica y fisica*: determinista, bit-exacta verificada contra PyBoy (5,651 ticks).
+  - *Graficos*: decodificacion planar 2bpp autentica desde ROM sobre framebuffer Win32/GDI.
+  - *Sintesis PCM*: calculada en tiempo real por `src/gb_apu.h` en base a registros DMG reales y tablas de efectos extraidas de la ROM.
+  - *Salida a dispositivo*: Win32 waveOut con reciclaje de buffers (`WHDR_PREPARED`/`WHDR_DONE`) y cierre seguro en `WM_DESTROY`.
 
 ## Lo que falta para el juego completo (siguiente paso para continuar)
 1. **Desplazamiento vertical y horizontal de bloques (`0x0B21..0x0C31`)**: necesario para las fases con bloques moviles (`0xFFAB = 1`, patrones en tabla `0x4075`) y fases de mas de 20 filas (`0xFFA9 > 0`, como la Fase 3).
 2. **Fases de bonificacion (`0xFFAA = 1`, `0x198C..0x1A50`)**: donde la bola atraviesa bloques sin rebotar (`0x0E76`).
-3. **Progresion completa de las 32 fases (`0xCA45 = 0..31`), umbral de vidas extra (`1-UP` en `0x0C71..0x0CA5`, tabla `0x1B5D`) y emision de audio mediante dispositivo Win32 (waveOut / WASAPI)**.
+3. **Progresion completa de las 32 fases (`0xCA45 = 0..31`), umbral de vidas extra (`1-UP` en `0x0C71..0x0CA5`, tabla `0x1B5D`) y avance a canales adicionales APU (Ch2, Ch3, Ch4)**.
+
 

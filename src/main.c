@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <mmsystem.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -62,11 +63,118 @@ typedef struct {
 } AlleywayStage1;
 
 static AlleywayStage1 g_sim;
+static GbApuChannel1 g_apu_ch1;
+static HWAVEOUT g_h_wave_out = NULL;
+#define AUDIO_SAMPLE_RATE 44100
+#define AUDIO_SAMPLES_PER_FRAME (AUDIO_SAMPLE_RATE / 60)
+#define AUDIO_NUM_BUFFERS 4
+static WAVEHDR g_wave_hdrs[AUDIO_NUM_BUFFERS];
+static int16_t g_audio_buffers[AUDIO_NUM_BUFFERS][AUDIO_SAMPLES_PER_FRAME];
+static int g_current_audio_buf = 0;
+static bool g_audio_enabled = false;
+
 static bool g_key_left = false;
 static bool g_key_right = false;
 static bool g_key_a = false;
 static bool g_key_b = false;
 static bool g_key_start = false;
+
+/*
+ * Dispatch sound effect to APU Channel 1 using authentic ROM tables:
+ * - SFX 1 (Brick type 1): table at 0x6FDE
+ * - SFX 2 (Brick type 2): table at 0x6FBB
+ * - SFX 3 (Brick type 3): table at 0x6FCA
+ * - SFX 7 (Paddle serve/bounce): table at 0x701A
+ * - SFX 11 (Ceiling bounce): table at 0x701A (or NR12=0xF0, NR13/14 high)
+ * - SFX 12 (Wall bounce): NR10=0x00, NR11=0x80, NR12=0xF0, NR13=0x85, NR14=0x87
+ */
+static void apu_dispatch_sfx(const AlleywayStage1 *s, GbApuChannel1 *ch, uint8_t sfx_id) {
+    if (sfx_id == 0) return;
+    if (sfx_id == 7 && 0x701A + 5 <= ROM_SIZE_BYTES && s->rom[0x701A] != 0) {
+        gb_apu_ch1_write_regs(ch, s->rom[0x701A], s->rom[0x701B], s->rom[0x701C], s->rom[0x701D], s->rom[0x701E]);
+    } else if (sfx_id == 1 && 0x6FDE + 5 <= ROM_SIZE_BYTES && s->rom[0x6FDE] != 0) {
+        gb_apu_ch1_write_regs(ch, s->rom[0x6FDE], s->rom[0x6FDF], s->rom[0x6FE0], s->rom[0x6FE1], s->rom[0x6FE2]);
+    } else if (sfx_id == 2 && 0x6FBB + 5 <= ROM_SIZE_BYTES && s->rom[0x6FBB] != 0) {
+        gb_apu_ch1_write_regs(ch, s->rom[0x6FBB], s->rom[0x6FBC], s->rom[0x6FBD], s->rom[0x6FBE], s->rom[0x6FBF]);
+    } else if (sfx_id == 3 && 0x6FCA + 5 <= ROM_SIZE_BYTES && s->rom[0x6FCA] != 0) {
+        gb_apu_ch1_write_regs(ch, s->rom[0x6FCA], s->rom[0x6FCB], s->rom[0x6FCC], s->rom[0x6FCD], s->rom[0x6FCE]);
+    } else if (sfx_id == 11) {
+        /* Ceiling bounce */
+        gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0xC0, 0x87);
+    } else if (sfx_id == 12) {
+        /* Wall bounce */
+        gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0x85, 0x87);
+    } else {
+        /* Generic fallback sound */
+        gb_apu_ch1_write_regs(ch, 0x1A, 0x81, 0xF0, 0x9D, 0x87);
+    }
+}
+
+static void audio_backend_init(void) {
+    gb_apu_ch1_init(&g_apu_ch1, AUDIO_SAMPLE_RATE);
+    WAVEFORMATEX wfx = {0};
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
+    wfx.nChannels = 1;
+    wfx.nSamplesPerSec = AUDIO_SAMPLE_RATE;
+    wfx.wBitsPerSample = 16;
+    wfx.nBlockAlign = (WORD)(wfx.nChannels * (wfx.wBitsPerSample / 8));
+    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+
+    MMRESULT res = waveOutOpen(&g_h_wave_out, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
+    if (res != MMSYSERR_NOERROR) {
+        g_h_wave_out = NULL;
+        g_audio_enabled = false;
+        return;
+    }
+
+    memset(g_wave_hdrs, 0, sizeof(g_wave_hdrs));
+    for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
+        g_wave_hdrs[i].lpData = (LPSTR)g_audio_buffers[i];
+        g_wave_hdrs[i].dwBufferLength = AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t);
+        waveOutPrepareHeader(g_h_wave_out, &g_wave_hdrs[i], sizeof(WAVEHDR));
+    }
+    g_audio_enabled = true;
+}
+
+static void audio_backend_shutdown(void) {
+    if (!g_h_wave_out) return;
+    g_audio_enabled = false;
+    waveOutReset(g_h_wave_out);
+    for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
+        if (g_wave_hdrs[i].dwFlags & WHDR_PREPARED) {
+            waveOutUnprepareHeader(g_h_wave_out, &g_wave_hdrs[i], sizeof(WAVEHDR));
+        }
+    }
+    waveOutClose(g_h_wave_out);
+    g_h_wave_out = NULL;
+}
+
+static void audio_step_frame(void) {
+    if (g_sim.sfx_trigger != 0) {
+        apu_dispatch_sfx(&g_sim, &g_apu_ch1, g_sim.sfx_trigger);
+    }
+
+    if (!g_audio_enabled || !g_h_wave_out) {
+        /* Headless / device-less mode: advance APU state deterministically */
+        int16_t dummy_buf[AUDIO_SAMPLES_PER_FRAME];
+        gb_apu_ch1_render(&g_apu_ch1, dummy_buf, AUDIO_SAMPLES_PER_FRAME);
+        return;
+    }
+
+    WAVEHDR *hdr = &g_wave_hdrs[g_current_audio_buf];
+    if (hdr->dwFlags & WHDR_DONE) {
+        waveOutUnprepareHeader(g_h_wave_out, hdr, sizeof(WAVEHDR));
+    }
+
+    int16_t *buf = g_audio_buffers[g_current_audio_buf];
+    gb_apu_ch1_render(&g_apu_ch1, buf, AUDIO_SAMPLES_PER_FRAME);
+
+    hdr->dwFlags = 0;
+    waveOutPrepareHeader(g_h_wave_out, hdr, sizeof(WAVEHDR));
+    waveOutWrite(g_h_wave_out, hdr, sizeof(WAVEHDR));
+
+    g_current_audio_buf = (g_current_audio_buf + 1) % AUDIO_NUM_BUFFERS;
+}
 
 static uint16_t neg16(uint16_t val) {
     return (uint16_t)(((val ^ 0xFFFFu) + 1u) & 0xFFFFu);
@@ -816,6 +924,7 @@ static void step_window_frame(void) {
     g_sim.prev_joyp_raw = joyp_raw;
 
     stage1_step_tick(&g_sim, joyp_raw, joyp_edge);
+    audio_step_frame();
     render_stage1(&g_sim);
 }
 
@@ -830,7 +939,7 @@ static void handle_key_change(WPARAM vk, bool down, HWND w) {
 }
 
 static LRESULT CALLBACK window_proc(HWND w, UINT m, WPARAM a, LPARAM b) {
-    if (m == WM_DESTROY) { KillTimer(w, 1); PostQuitMessage(0); return 0; }
+    if (m == WM_DESTROY) { KillTimer(w, 1); audio_backend_shutdown(); PostQuitMessage(0); return 0; }
     if (m == WM_KEYDOWN) { handle_key_change(a, true, w); return 0; }
     if (m == WM_KEYUP)   { handle_key_change(a, false, w); return 0; }
     if (m == WM_TIMER && a == 1) {
@@ -894,13 +1003,14 @@ int main(int argc, char **argv) {
         }
     }
     render_stage1(&g_sim);
+    audio_backend_init();
 
     HINSTANCE instance = GetModuleHandleW(NULL);
     WNDCLASSW cls = {0}; cls.lpfnWndProc = window_proc;
     cls.style = CS_HREDRAW | CS_VREDRAW;
     cls.hInstance = instance; cls.lpszClassName = L"AlleywayResearch";
     cls.hCursor = LoadCursor(NULL, IDC_ARROW);
-    if (!RegisterClassW(&cls)) return 2;
+    if (!RegisterClassW(&cls)) { audio_backend_shutdown(); return 2; }
     RECT r = {0, 0, 640, 576}; AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     const wchar_t *title = g_sim.rom_loaded
         ? L"Alleyway PC | Stage 1 Native (Arrows: Move, Space/Z: A, Shift/X: B, Enter: Pause, R: Reset)"
@@ -908,11 +1018,12 @@ int main(int argc, char **argv) {
     HWND window = CreateWindowW(cls.lpszClassName, title,
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top, NULL, NULL, instance, NULL);
-    if (!window) return 3;
+    if (!window) { audio_backend_shutdown(); return 3; }
     SetTimer(window, 1, 16, NULL);
     MSG msg; int result;
     while ((result = GetMessageW(&msg, NULL, 0, 0)) > 0) {
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
+    audio_backend_shutdown();
     return result < 0 ? 4 : 0;
 }

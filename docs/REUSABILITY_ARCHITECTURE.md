@@ -15,20 +15,18 @@ para futuros ports de Game Boy y la **ingenieria inversa especifica** requerida 
 
 ## 2. Componentes Genericos Reutilizables (Para cualquier juego de Game Boy)
 
-1. **Inspeccion e integridad de cartucho (`tools/inspect_rom.py`, `src/gb_cart.h`)**:
-   - Validacion de cabecera DMG/CGB, alineacion de bancos de 16 KiB, suma de comprobacion de cabecera y global, decodificacion de MBC y capacidades RAM.
-2. **Linea temporal determinista y captura de trazas (`tools/capture_reference.py`, `tools/compare_traces.py`)**:
-   - Registro frame-a-frame de entradas (`button:action`), hashes de framebuffer (`PPM`) y trazas JSONL de memoria/registros.
-   - Comparador que aisla divergencias logicas de divergencias de renderizado.
-3. **Escaneo diferencial de memoria (`tools/scan_ram.py`)**:
-   - `diff_timelines` y `find_correlated_addresses` para aislar coordenadas y contadores en WRAM (`0xC000..0xDFFF`), HRAM (`0xFF80..0xFFFE`) y OAM (`0xFE00..0xFE9F`).
-4. **Decodificador generico de tiles 2bpp (`src/gb_tile.h`, `tools/decode_tiles.py`)**:
-   - Formato estandar Game Boy: 16 bytes por tile de 8x8 (2 planos entrelazados por fila de 8 pixeles).
-   - Mapeo de indices 0..3 a paletas de 4 colores configurables.
-5. **Capa de plataforma y tiempo (`src/platform_win32.c`, futura abstraccion SDL)**:
-   - Framebuffer de 160x144, escalado entero arbitrario, reloj de 59.73 Hz / 60 Hz, mapeo de teclado a joypad DMG.
-6. **Sintesis y eventos de audio APU**:
-   - Mapeo de registros de los 4 canales DMG (Square 1 con barrido, Square 2, Wave programable, Noise) a sintesis PCM en tiempo real.
+Estado de desarrollo de cada componente generico:
+
+| Componente | Archivo / Ubicacion | Estado | Descripcion / Alcance real |
+|---|---|---|---|
+| **Inspeccion e integridad de cartucho** | `tools/inspect_rom.py` | **Implementado** | Valida cabecera DMG/CGB, alineacion de 16 KiB, checksums de cabecera/global y carga en PyBoy. (Nota: `src/gb_cart.h` es una cabecera en C propuesta a futuro). |
+| **Linea temporal determinista y captura de trazas** | `tools/capture_reference.py`, `tools/compare_traces.py` | **Implementado** | Registro de entradas por fotograma, atomic logic ticks via hooks (`START:END`), hashes PPM de framebuffer y trazas JSONL. Comparador desacoplado. |
+| **Escaneo diferencial de memoria** | `tools/scan_ram.py` | **Implementado** | `diff_timelines` y `find_correlated_addresses` para aislar variables correlacionadas en WRAM, HRAM y OAM. |
+| **Decodificador generico de tiles 2bpp** | `src/gb_tile.h` | **Implementado** | Decodificador planar C11 de 16 bytes a indices 0..3 o ARGB/XRGB con paletas DMG, flips X/Y, transparencia y clipping. Probado con harness C (`tests/test_c_modules.c`). |
+| **Sintesis APU Canal 1 (Onda cuadrada + sweep)** | `src/gb_apu.h` | **Implementado** | Sintesis PCM mono 16-bit con avance en ciclos CPU (4.19 MHz), Frame Sequencer de 512 Hz, longitud (NR11/NR14), barrido (NR10) y envolvente (NR12). |
+| **Capa de plataforma y presentacion Win32** | `src/main.c` (Win32/GDI + waveOut) | **Parcial** | Framebuffer 160x144 con escalado entero, entradas de teclado a Joypad y backend waveOut de 4 buffers a 44.1 kHz. (Propuesto: desacoplar a `src/platform_win32.c` / SDL). |
+| **Sintetizador APU Canales 2, 3 y 4** | Futuro `src/gb_apu.h` | **Propuesto** | Canal 2 (pulso sin barrido), Canal 3 (onda arbitraria/sampleada) y Canal 4 (ruido blanco pseudoaleatorio). |
+
 
 ---
 

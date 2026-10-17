@@ -31,21 +31,23 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
 - `tests/test_stage1_native.py`: pruebas automatizadas del ejecutable C (`--smoke-test`, `--verify-trace` con ROM sintetica + fallo deliberado, y paridad real con `../Local-Privado/roms/Alleyway (USA).gb` cuando esta presente).
 - `.github/workflows/ci.yml`: integracion continua en Windows usando exclusivamente fixtures sinteticos.
 
-## Hito 4 (2026-10-17): Componentes reutilizables — decodificador 2bpp y sintesis APU Canal 1
+## Hito 4 (2026-10-17): Componentes reutilizables — decodificador 2bpp, sintesis APU y backend waveOut
 ### 1. Decodificador generico de tiles 2bpp (`src/gb_tile.h`)
 - Implementada la conversion del formato planar 2bpp a matrices de color y a renderizado directo sobre framebuffer.
-- Soporta paletas DMG (BGP, OBP0, OBP1), volteo en X/Y (DMG OAM flags bit 5 y 6) y transparencia de color 0 para sprites.
+- Soporta paletas DMG (BGP, OBP0, OBP1), volteo en X/Y (DMG OAM flags bit 5 y 6), transparencia de color 0 para sprites y clipping de coordenadas fuera de pantalla.
 - Conectado a `src/main.c`: la paleta (Tile 0 en `0x4B75`, Tile 1 en `0x4B85`), la bola (Tile 5 en `0x4BC5`), el muro superior (Tile 179 en `0x56A5`) y los bloques 168..176 (en `0x55F5`, empaquetando 2 filas de 4 px por tile de 8x8) se renderizan con los graficos del cartucho local.
-- Pruebas sinteticas en `tests/test_tile_decode.py`: 3 pruebas (solidos, damero, paleta).
+- Pruebas en C real compiladas con Zig: `tests/test_c_modules.c` verifica indices de planos, paletas, volteo X/Y, transparencia y clipping negativo sobre el codigo C real.
 
-### 2. Sintesis APU Canal 1 y medicion del driver de audio (`src/gb_apu.h`)
-- Implementada la sintesis de onda cuadrada con barrido de frecuencia por hardware (`NR10`), ciclo de trabajo (`NR11`), envolvente de volumen (`NR12`) y disparo/longitud (`NR13`/`NR14`).
-- Documentado el driver de audio (`0x6800..0x7FF0`) y las tablas de efectos en ROM (`0x6FDE`, `0x6FBB`, `0x6FCA`, `0x701A`). Descubierto que el bucle de barrido software en `0x6E10..0x6E35` para el rebote en pared (SFX 12) explica con precision el retraso en la interrupcion VBlank observado en el Hito 3.
-- Eventos de audio conectados a la simulacion nativa en `src/main.c` (`sfx_trigger` para saque/paleta, techo, pared y bloques).
-- Pruebas unitarias en `tests/test_apu.py`: 3 pruebas de conversion de registros y frecuencias.
+### 2. Sintesis APU Canal 1 y backend Win32 waveOut (`src/gb_apu.h`)
+- Sintetizador refactorizado con avance en ciclos CPU (4.194304 MHz) y acumulador fraccionario de fase en punto fijo 32.32 (eliminando acumulacion de error fraccionario en frecuencias).
+- Incorpora Frame Sequencer a 512 Hz (longitud a 256 Hz, barrido a 128 Hz, envolvente a 64 Hz), contador de longitud de 64 pasos (`NR11`/`NR14`), verificacion de DAC apagado cuando bits 7..3 de `NR12` son 0, desbordamiento de barrido por hardware (`NR10`) y actualizacion de envolvente aun con volumen en 0.
+- Pruebas en C real (`tests/test_c_modules.c` y runner `tests/test_c_modules.py`): verifican silencio en DAC apagado, expiracion y desactivacion de longitud, deteccion de desbordamiento de barrido, polaridad de pulso PCM y deteccion de fallo provocado (`--deliberate-fail`).
+- Backend Win32 `waveOut` implementado en `src/main.c`: 4 buffers rotativos a 44.1 kHz (~735 muestras por fotograma a 60 Hz). Despacha las tablas reales de la ROM (`0x701A`, `0x6FDE`, etc.) ante los eventos `sfx_trigger` (saque/paleta, techo, pared, bloques). Limpieza segura con `waveOutReset`/`waveOutUnprepareHeader`/`waveOutClose` en `WM_DESTROY`.
+- Modo determinista y headless: si `waveOutOpen` falla o se ejecuta sin dispositivo de audio, avanza el estado APU de forma identica sin fallar ni bloquearse.
 
 ## Siguiente paso recomendado para Codex / futuras sesiones
 1. Implementar el desplazamiento horizontal de filas (`0x0B21..0x0B66`, patrones de la tabla `0x4075`) y el descenso vertical del mural (`0x0BC7..0x0C31`) para soportar las Fases 2 y 3.
 2. Implementar la regla de bonificacion (`0xFFAA == 1`, penetracion de bola en `0x0E76`) y la progresion automatica de fases (`0xCA45 = 0..31`).
-3. Conectar la salida de muestras de `src/gb_apu.h` al dispositivo de audio de Windows (waveOut / WASAPI).
+3. Avanzar en la sintesis de los canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido).
+
 

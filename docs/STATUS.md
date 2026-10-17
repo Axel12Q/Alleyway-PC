@@ -1,28 +1,20 @@
 # Estado
 
-2026-10-17: preparacion inicial en Windows y relevo activo en `antigravity/development`.
+2026-10-17: desarrollo activo en `antigravity/development` con volcado del usuario verificado en `../Local-Privado/roms/Alleyway (USA).gb` (fuera de Git).
 
-## Hito 1 completado (infraestructura determinista de trazas y verificacion de metadatos)
-- Implementado generador de cartucho sintetico interactivo (`tools/synthetic_rom.py`) con bucle sincronizado a VBlank (`0xFF44 == 144`), lectura de cruceta/botones via `0xFF00` y desplazamiento `SCX`/`SCY` para pruebas deterministas sin datos comerciales.
-- Ampliado `tools/inspect_rom.py` con validacion de alineacion de bancos (16 KiB), correspondencia de tamano declarado en cabecera, codigos de licenciatario/destino y comprobacion de carga en PyBoy (`pyboy_loadable`).
-- Ampliado `tools/capture_reference.py` (esquema v2) con:
-  - Linea temporal determinista de entradas (`--inputs`: `frame`, `button`, `action` `press`/`release`) validada y canonizada con hash `inputs_sha256`.
-  - Grabacion por fotograma en `trace.jsonl` de registros hardware (`PC`, `SP`, `LY`, `LCDC`, `STAT`, `SCY`, `SCX`, `BGP`, `WY`, `WX`, `JOYP`, `SB`, `SC`, `bootrom_unmapped`) y watchpoints configurables (`--watch` / `--watch-file` con tipos `u8`, `i8`, `u16le`, `u16be`, `bcd8`).
-- Implementado comparador de capturas y trazas (`tools/compare_traces.py`) que separa la paridad logica (`logic_match` y primer fotograma/campo divergente) de la comparacion de imagen (`screen_match`).
-- Suite de pruebas ampliada a 8 tests (`tests/test_inspect_rom.py` y `tests/test_capture_and_compare.py`), incluyendo ejecuciones repetidas identicas y deteccion exacta de divergencia deliberada en el fotograma 69.
+## Hitos completados
+### Hito 1: Infraestructura determinista de entradas, trazas y comparador (`df314f1`)
+- `tools/synthetic_rom.py`, `tools/inspect_rom.py`, `tools/capture_reference.py`, `tools/compare_traces.py` y pruebas en `tests/`.
 
-## Disponibilidad del volcado del usuario (fuera de Git)
-- Verificado en `../Local-Privado/roms/Alleyway (USA).gb` (copia de `C:/Users/maric/Documents/ROMS/Alleyway (USA).gb`, mantenida estrictamente fuera del repositorio):
-  - `bytes`: 32768 (ROM ONLY, `cartridge_type = 0`, sin MBC ni RAM externa).
-  - `title`: `ALLEY WAY`, `version`: 0, `old_licensee_code`: 1.
-  - `header_checksum_valid`: `true` (94), `global_checksum_valid`: `true` (53662).
-  - `sha256`: `ed8070e011713527bdc03e2b9cec9f9c4a7e3aaa00e57e8786a186b265da1bb2`.
-  - Esto confirma consistencia interna del archivo para iniciar la ingenieria inversa; no certifica procedencia comercial.
+### Hito 2: Escaneo diferencial de RAM e ingenieria inversa verificada de la Fase 1
+- Implementado `tools/scan_ram.py` (`diff_timelines` y `find_correlated_addresses`) con pruebas unitarias sobre cartucho sintetico (`tests/test_scan_ram.py`; 9 tests en total pasando).
+- Creado `tools/alleyway_watchpoints.json` con los watchpoints verificados de Alleyway (USA) para `tools/capture_reference.py`.
+- **Verificado en `../Local-Privado/roms/Alleyway (USA).gb` (`ed8070e01171...`)**:
+  - **Protocolo de controles y puerto serie (`0x01F0..0x0296`, `0x03C1..0x0415`, `0x10A4..0x10FA`)**: Cada VBlank lanza 2 transferencias serie con reloj interno (`0xFF90 = 2`, `0xFF02 = 0x81`). La interrupcion serie (`0x0058 -> 0x0272`) guarda `SB` en `0xFF91` (dial rotatorio) y `0xFF92`/`0xFF93` (boton serie). Sin periferico externo, `0xFF91 = 0xFF` (`>= 0xF1`), habilitando la lectura normal de la cruceta en `0xFF8C`.
+  - **Movimiento de paleta (`0x10A4..0x10DC`)**: Posicion X en `0xFFC0` (`OAM[0].X = 0xFFC0 + 1`), Y fija en `0xFFBF = 144`, ancho en `0xFFC2` (`24 px` normal, `16 px` encogida cuando `0xFFC1 = 1`). Velocidades exactas: **3 px/frame** normal, **5 px/frame** manteniendo `A`, **1 px/frame** manteniendo `B`. Limites: `[15, 127 - ancho]`.
+  - **Fisica de bola en punto fijo 8.8 big-endian (`0x0F7C`, `0x0CB0..0x116A`)**: Posicion `Y` en `0xFFB4:0xFFB5`, `X` en `0xFFB6:0xFFB7`, velocidad `vy` en `0xFFB8:0xFFB9`, `vx` en `0xFFBA:0xFFBB`, indice de velocidad en `0xFFBE` (`1..25`, tabla de punteros en `0x11EE`), tabla de 15 zonas de rebote en paleta normal en `0x1B41` (`[3,6,6,6,9,9,9,9,9,9,9,9,6,6,6]`) y 11 zonas en paleta encogida en `0x1B51`.
+  - **Estructura de la Fase 1 (`0x1BE1 -> 0x1C44`, cargada en `0xC000` y durabilidad en `0xC400`)**: Matriz de 14 columnas (`8 px` de ancho, `X = 16..127`) $\times$ 14 filas (`4 px` de alto, `Y = 24..79`). Filas `0..1`: muro superior indestructible (tipo 4, `hp = 0`). Filas `6..7`: 24 bloques tipo 3 (`30 pts`, `min_speed = 7`). Filas `8..9`: 24 bloques tipo 2 (`20 pts`, `min_speed = 5`). Filas `10..12`: 36 bloques tipo 1 (`10 pts`, `min_speed = 0`). Total destructibles en `0xFFC8:0xFFC9` = **84**.
+  - **Traza de referencia verificada (650 fotogramas)**: Arranque -> `Start` en fotograma 120 -> movimiento de paleta a la derecha (`40 -> 100`) en fotogramas `450..470` -> saque con `A` en fotograma 475 (`ball = (88.0, 116.0)`, `v = (+181, +181)`) -> rebote en paleta en fotograma 514 (`v = (+226, -226)`) -> rebote en pared derecha -> rotura del primer bloque en fotograma 588 (`bricks_left = 84 -> 83`, `score = 0 -> 10`).
 
-## Hallazgos verificados sobre el entorno
-- **Observado / Verificado**: La bootrom DMG interna por defecto de PyBoy 2.8.1 tarda 65 fotogramas en desmapear `0xFF50` y saltar a `0x0100`. Cualquier captura de menos de 65 fotogramas permanece dentro de la bootrom (`PC < 0x0100`).
-
-## Siguiente paso inmediato (Hito 2)
-- Analizar `../Local-Privado/roms/Alleyway (USA).gb` con PyBoy y herramientas de escaneo de RAM/desensamblado local:
-  1. Verificar el comportamiento de arranque, controles y puerto serie (`0xFF00`, `0xFF01`, `0xFF02`).
-  2. Localizar y verificar direcciones reales de estado de partida, posicion/velocidad de paleta y bola, vidas, puntuacion y mapa de bloques de la Fase 1.
+## Siguiente paso inmediato (Hito 3)
+- Implementar la simulacion nativa verificable de la Fase 1 en C (`src/`) y su verificador/comparador de trazas frente a PyBoy, cargando los datos de la ROM local del usuario en tiempo de ejecucion sin incluir recursos comerciales en Git.

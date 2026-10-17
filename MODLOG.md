@@ -1,46 +1,33 @@
-# Alleyway: estudio de viabilidad
+# Alleyway: registro de investigacion y desarrollo
 Fecha: 2026-10-17
-Estado: investigacion documental; ningun binario del juego analizado ni port construido.
+Estado: infraestructura de captura/comparacion verificada y volcado del usuario disponible en `../Local-Privado/roms/Alleyway (USA).gb`; iniciando ingenieria inversa de la Fase 1.
 
-## Candidato
-Alleyway, Game Boy (1989). Nintendo describe 32 fases, bloques moviles y fases de bonificacion.
-No se encontro port nativo de PC ni decompilacion en las busquedas realizadas. Esto no demuestra inexistencia absoluta. Hay conversiones comunitarias para otras plataformas y versiones emuladas; deben distinguirse de un port nativo.
+## Candidato y copia local
+- Juego objetivo: Alleyway, Game Boy (1989).
+- Copia local del usuario ubicada en `../Local-Privado/roms/Alleyway (USA).gb` (fuera de Git):
+  - Tamano: 32768 bytes (`rom_size_code = 0`, `cartridge_type = 0`, `ram_size_code = 0`).
+  - Titulo en cabecera: `ALLEY WAY`, `version = 0`, `old_licensee_code = 1`.
+  - Checksums: `header_checksum_valid = true` (94), `global_checksum_valid = true` (53662).
+  - SHA256: `ed8070e011713527bdc03e2b9cec9f9c4a7e3aaa00e57e8786a186b265da1bb2`.
 
-## Ruta propuesta
-Ingenieria inversa guiada por ejecucion y reimplementacion nativa en C/C++ con SDL. No inventar una fisica de Breakout y presentarla como port fiel.
-1. Identificar version y hash del volcado propio del usuario.
-2. Reproducir arranque y controles en emulador de referencia.
-3. Localizar posiciones, velocidades, colisiones, puntuacion y datos de un nivel.
-4. Registrar entradas y estados por fotograma.
-5. Implementar una fase y comparar trazas; ampliar solo tras validar.
-6. Distribuir codigo propio y herramientas de importacion; mantener ROM y datos extraidos fuera del repositorio.
+## Hito 1 (2026-10-17): Linea temporal determinista, trazas y comparador
+### Hechos verificados
+- **Observado / Verificado (experimento PyBoy `0xFF50` y `PC`)**: La bootrom DMG integrada de PyBoy 2.8.1 mantiene `PC < 0x0100` durante los primeros 64 fotogramas (animacion de 60 fotogramas en `0x0043..0x0070`) y transfiere la ejecucion a `0x0100` en el fotograma 65.
+- **Implementado y probado**:
+  - `tools/synthetic_rom.py`: construye en memoria un cartucho sintetico de 32 KiB con codigo SM83 sincronizado a VBlank que responde a `0xFF00` (cruceta y boton A) y actualiza variables de prueba en `0xC000..0xC004` y `SCX`/`SCY`.
+  - `tools/inspect_rom.py`: valida alineacion de bancos de 16 KiB, tamano esperado, checksums e indicador `pyboy_loadable`.
+  - `tools/capture_reference.py`: soporta lineas temporales deterministas (`frame`, `button`, `action`), muestreo de registros hardware (`PC`, `SP`, `LY`, `LCDC`, `STAT`, `SCY`, `SCX`, `BGP`, `WY`, `WX`, `JOYP`, `SB`, `SC`) y watchpoints tipados (`u8`, `i8`, `u16le`, `u16be`, `bcd8`) hacia `trace.jsonl`.
+  - `tools/compare_traces.py`: compara `trace.jsonl` y `capture.json`, separando `logic_match` (y reportando el primer fotograma/campo divergente) de `screen_match`.
+  - Pruebas automatizadas: `python -m unittest discover -s tests -v` ejecuta 8 pruebas en ~0.12s (incluyendo paridad exacta en corridas repetidas y deteccion de divergencia deliberada en el fotograma 69).
 
-## Herramientas evaluadas documentalmente
-- SameBoy: referencia y depuracion. https://github.com/LIJI32/SameBoy
-- PyBoy: automatizacion Python e inspeccion de estado. https://github.com/Baekalfen/PyBoy
-- Pan Docs: documentacion del hardware. https://gbdev.io/pandocs/
-- gb-recompiled: posible experimento de recompilacion a C con runtime SDL2. No se verifico compatibilidad con Alleyway ni se recomienda como ruta garantizada. https://github.com/arcanite24/gb-recompiled
-- Disassembler: alternativa a evaluar si el depurador no basta. https://github.com/ericwoude/gameboy-disassembler
+## Herramientas y fuentes de referencia
+- SameBoy 1.0.4: `.tools/sameboy/` (SHA256 verificado). https://github.com/LIJI32/SameBoy
+- PyBoy 2.8.1: automatizacion e inspeccion determinista. https://github.com/Baekalfen/PyBoy
+- Pan Docs: documentacion de hardware DMG. https://gbdev.io/pandocs/
+- Incidencia documentada de controles/puerto serie en Alleyway: https://github.com/visualboyadvance-m/visualboyadvance-m/issues/274
 
-## Evidencia y fuentes
-Nintendo, fuente primaria sobre plataformas y contenido:
-https://www.nintendo.com/es-es/Juegos/Game-Boy/Alleyway-275451.html
-Incidencia primaria de emulador: controles y puerto serie son un riesgo que conviene probar, no una explicacion del codigo verificada por nosotros:
-https://github.com/visualboyadvance-m/visualboyadvance-m/issues/274
-Base de conocimiento consultada:
-https://github.com/rehan-remade/universal-modder/blob/main/knowledge/INDEX.md
-No se identifico una nota especifica de Alleyway en la consulta.
-
-## Consultas
-Alleyway Game Boy native PC port remake github
-Alleyway disassembly github gameboy
-Alleyway decompilation
-Alleyway remake Windows github
-Solar Striker PC port / disassembly github
-Mole Mania decompilation PC port github
-Kwirk PC port github disassembly
-
-## Limites y siguiente paso
-No se instalaron herramientas, no se descargaron ROMs, no se ejecutaron juegos y no se capturaron pantallas.
-Falta una copia propia del juego y su volcado para verificar viabilidad sobre el binario real.
-Primera meta: una fase ejecutable en Windows con comportamiento medido contra el original.
+## Siguiente paso (Hito 2)
+- Ejecutar analisis estatico/dinamico sobre `../Local-Privado/roms/Alleyway (USA).gb` para:
+  1. Documentar la secuencia exacta de fotogramas desde el arranque hasta la pantalla de titulo y el inicio de la Fase 1 al pulsar `Start`.
+  2. Comprobar el uso de `0xFF00` (`P1/JOYP`), `0xFF01` (`SB`) y `0xFF02` (`SC`) durante la lectura de controles.
+  3. Identificar y verificar con experimentos en PyBoy las direcciones de HRAM/WRAM/OAM de: estado de juego, posicion X y velocidad de la paleta, posicion X/Y y velocidad de la bola, vidas, puntuacion y matriz de bloques de la Fase 1.

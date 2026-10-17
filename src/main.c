@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "gb_tile.h"
+#include "gb_apu.h"
 
 /*
  * Alleyway PC research & native Stage 1 verifier/player.
@@ -54,6 +56,7 @@ typedef struct {
     uint8_t total_rows;
     uint8_t row_offset;
     uint8_t prev_joyp_raw;
+    uint8_t sfx_trigger; /* Queued SFX ID (0 = none, 7 = paddle bounce, 12 = wall bounce, etc.) */
     uint8_t grid_type[GRID_CELLS];
     uint8_t grid_hp[GRID_CELLS];
 } AlleywayStage1;
@@ -127,6 +130,7 @@ static void stage1_reset_for_play(AlleywayStage1 *s) {
     s->bonus_flag = 0;
     s->scroll_flag = 0;
     s->prev_joyp_raw = 0xFF;
+    s->sfx_trigger = 0;
     load_stage_grid(s);
 }
 
@@ -215,6 +219,7 @@ static void serve_ball(AlleywayStage1 *s) {
     }
     s->ball_vx = vx;
     s->state = 6;
+    s->sfx_trigger = 7; /* SFX 7: Serve / Paddle bounce */
 }
 
 static void snap_y_positive(AlleywayStage1 *s) {
@@ -314,6 +319,9 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
     if (s->bricks_left == 0) {
         s->state = 8;
     }
+    /* Authentic Alleyway brick hit sound: byte 5 of 0x1B87 brick properties */
+    uint8_t sfx_id = (btype <= 3) ? btype : 1;
+    s->sfx_trigger = sfx_id;
     if (s->bonus_flag != 0) return 0;
     return 1;
 }
@@ -349,6 +357,7 @@ static void step_ball_and_collisions(AlleywayStage1 *s) {
                         vx = neg16(vx);
                     }
                     s->ball_vx = vx;
+                    s->sfx_trigger = 7; /* SFX 7: Paddle bounce */
 
                     s->scroll_timer = (uint8_t)(s->scroll_timer - 1u);
                     if (s->scroll_timer == 0) {
@@ -375,6 +384,7 @@ static void step_ball_and_collisions(AlleywayStage1 *s) {
             s->paddle_x = (uint8_t)(s->paddle_x + 4u);
         }
         bounce_vertical(s);
+        s->sfx_trigger = 11; /* SFX 11: Ceiling bounce */
     } else if (s->ball_y >= 0xA0u) {
         s->state = 7;
         return;
@@ -383,6 +393,7 @@ static void step_ball_and_collisions(AlleywayStage1 *s) {
     /* Left and right walls (0x0D15..0x0D26) */
     if (s->ball_x < 0x10u || s->ball_x >= 0x7Cu) {
         bounce_horizontal(s);
+        s->sfx_trigger = 12; /* SFX 12: Wall bounce */
     }
 
     /* Brick grid collisions (0x0D27..0x0E8C) */
@@ -431,6 +442,7 @@ static void step_ball_and_collisions(AlleywayStage1 *s) {
 }
 
 static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
+    s->sfx_trigger = 0;
     if (s->state == 5) {
         update_paddle(s, joyp_raw);
         if ((joyp_edge & 0x01u) == 0) {
@@ -516,7 +528,6 @@ static void render_stage1(const AlleywayStage1 *s) {
     fill_rect_fb(0, 0, 160, 144, DMG_SHADES[0]);
 
     /* Left wall (X=0..7), Right wall & HUD panel (X=120..159) in OAM-adjusted screen coords:
-     * Note: Game Boy OAM X has +8 offset and OAM Y has +16 offset!
      * Playfield left wall is at OAM X=16 -> screen X=8.
      * Playfield right wall is at OAM X=128 -> screen X=120.
      * Top border is at OAM Y=24..31 -> screen Y=8..15 (rows 0..1 of grid!).
@@ -525,43 +536,120 @@ static void render_stage1(const AlleywayStage1 *s) {
     fill_rect_fb(120, 0, 8, 144, DMG_SHADES[2]);
     fill_rect_fb(128, 0, 32, 144, DMG_SHADES[3]);
 
-    /* Render 14x20 visible brick cells (each cell is 8x4 pixels at screen X = 8 + col*8, Y = 8 + row*4) */
-    for (int r = 0; r < 20; ++r) {
-        for (int c = 0; c < GRID_COLS; ++c) {
-            uint8_t t = s->grid_type[r * GRID_COLS + c];
-            if (t == 0) continue;
-            int sx = 8 + c * 8;
-            int sy = 8 + r * 4;
-            if (t == 4) {
-                fill_rect_fb(sx, sy, 8, 4, DMG_SHADES[2]);
-            } else {
-                uint32_t fill = (t == 3) ? DMG_SHADES[3] : (t == 2 ? DMG_SHADES[2] : DMG_SHADES[1]);
-                fill_rect_fb(sx, sy, 7, 3, fill);
-                fill_rect_fb(sx, sy + 3, 8, 1, DMG_SHADES[0]);
+    /* Render 14x20 visible brick cells.
+     * In Alleyway DMG, background tiles 168..176 are located at ROM offset 0x55F5.
+     * Every 8x8 tile packs TWO 4-pixel rows:
+     * - Both rows present: tile = 168 (type 1), 169 (type 2), 170 (type 3).
+     * - Top row only:      tile = 171 (type 1), 172 (type 2), 173 (type 3).
+     * - Bottom row only:   tile = 174 (type 1), 175 (type 2), 176 (type 3).
+     * - Top wall (type 4): tile 179 at ROM offset 0x56A5.
+     */
+    bool has_rom_tiles = (0x56A5 + 16 <= ROM_SIZE_BYTES && s->rom[0x55F5] != 0);
+
+    if (has_rom_tiles) {
+        /* Render paired 8x8 tile rows (r = 0, 2, 4, ..., 18) */
+        for (int r = 0; r < 20; r += 2) {
+            for (int c = 0; c < GRID_COLS; ++c) {
+                uint8_t top_t = s->grid_type[r * GRID_COLS + c];
+                uint8_t bot_t = s->grid_type[(r + 1) * GRID_COLS + c];
+                if (top_t == 0 && bot_t == 0) continue;
+
+                int sx = 8 + c * 8;
+                int sy = 8 + r * 4;
+
+                if (top_t == 4 || bot_t == 4) {
+                    /* Type 4 is top boundary wall (tile 179 at 0x56A5) */
+                    gb_tile_blit(&s->rom[0x56A5], sx, sy, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+                } else {
+                    uint8_t tile_id = 0;
+                    uint8_t ref_t = (top_t != 0) ? top_t : bot_t;
+                    uint8_t base_offset = (ref_t >= 1 && ref_t <= 3) ? (uint8_t)(ref_t - 1) : 0u;
+
+                    if (top_t != 0 && bot_t != 0) {
+                        tile_id = (uint8_t)(168 + base_offset);
+                    } else if (top_t != 0) {
+                        tile_id = (uint8_t)(171 + base_offset);
+                    } else {
+                        tile_id = (uint8_t)(174 + base_offset);
+                    }
+                    uint32_t rom_addr = 0x55F5u + (uint32_t)(tile_id - 168) * 16u;
+                    gb_tile_blit(&s->rom[rom_addr], sx, sy, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+                }
+            }
+        }
+    } else {
+        /* Fallback synthetic / block renderer */
+        for (int r = 0; r < 20; ++r) {
+            for (int c = 0; c < GRID_COLS; ++c) {
+                uint8_t t = s->grid_type[r * GRID_COLS + c];
+                if (t == 0) continue;
+                int sx = 8 + c * 8;
+                int sy = 8 + r * 4;
+                if (t == 4) {
+                    fill_rect_fb(sx, sy, 8, 4, DMG_SHADES[2]);
+                } else {
+                    uint32_t fill = (t == 3) ? DMG_SHADES[3] : (t == 2 ? DMG_SHADES[2] : DMG_SHADES[1]);
+                    fill_rect_fb(sx, sy, 7, 3, fill);
+                    fill_rect_fb(sx, sy + 3, 8, 1, DMG_SHADES[0]);
+                }
             }
         }
     }
 
     /* Render Paddle: OAM[0].X = paddle_x + 1 -> screen X = (paddle_x + 1) - 8 = paddle_x - 7
-     * OAM.Y = 144 -> screen Y = 144 - 16 = 128 */
+     * OAM.Y = 144 -> screen Y = 144 - 16 = 128.
+     * Authentic DMG paddle:
+     * - Normal (24 px): Tile 0 at 0x4B75 (left cap), Tile 1 at 0x4B85 (middle), Tile 0 flipped X (right cap).
+     * - Shrunk (16 px): Tile 0 (left cap), Tile 0 flipped X (right cap).
+     */
     int pad_sx = (int)s->paddle_x - 7;
     int pad_sy = (int)s->paddle_y - 16;
-    fill_rect_fb(pad_sx, pad_sy, (int)s->paddle_w, 6, DMG_SHADES[3]);
-    fill_rect_fb(pad_sx + 2, pad_sy + 1, (int)s->paddle_w - 4, 2, DMG_SHADES[1]);
+    bool has_paddle_tiles = (0x4B85 + 16 <= ROM_SIZE_BYTES && s->rom[0x4B75] != 0);
 
-    /* Render Ball when active (state == 6 or 0x0C): OAM.X = ball_x -> screen X = ball_x - 8 + 2, Y = ball_y - 16 + 2 */
+    if (has_paddle_tiles) {
+        if (s->paddle_w == 16) {
+            /* Left cap (8x8) */
+            gb_tile_blit(&s->rom[0x4B75], pad_sx, pad_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+            /* Right cap (8x8 flipped X) */
+            gb_tile_blit(&s->rom[0x4B75], pad_sx + 8, pad_sy, true, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+        } else {
+            /* Left cap */
+            gb_tile_blit(&s->rom[0x4B75], pad_sx, pad_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+            /* Middle piece */
+            gb_tile_blit(&s->rom[0x4B85], pad_sx + 8, pad_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+            /* Right cap */
+            gb_tile_blit(&s->rom[0x4B75], pad_sx + 16, pad_sy, true, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+        }
+    } else {
+        fill_rect_fb(pad_sx, pad_sy, (int)s->paddle_w, 6, DMG_SHADES[3]);
+        fill_rect_fb(pad_sx + 2, pad_sy + 1, (int)s->paddle_w - 4, 2, DMG_SHADES[1]);
+    }
+
+    /* Render Ball: Tile 5 at ROM 0x4BC5
+     * Active (state == 6 or 0x0C): OAM.X = ball_x -> screen X = ball_x - 8, Y = ball_y - 16
+     */
+    bool has_ball_tile = (0x4BC5 + 16 <= ROM_SIZE_BYTES && s->rom[0x4BC5] != 0);
+
     if (s->state == 6 || s->state == 0x0C) {
         int ball_sx = (int)s->ball_x - 8;
         int ball_sy = (int)s->ball_y - 16;
-        fill_rect_fb(ball_sx, ball_sy, 4, 4, DMG_SHADES[3]);
+        if (has_ball_tile) {
+            gb_tile_blit(&s->rom[0x4BC5], ball_sx, ball_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+        } else {
+            fill_rect_fb(ball_sx, ball_sy, 4, 4, DMG_SHADES[3]);
+        }
     } else if (s->state == 5) {
         /* Preview ball resting above paddle before serve */
         int preview_sx = pad_sx + ((int)s->paddle_w / 2) - 2;
         int preview_sy = pad_sy - 5;
-        fill_rect_fb(preview_sx, preview_sy, 4, 4, DMG_SHADES[2]);
+        if (has_ball_tile) {
+            gb_tile_blit(&s->rom[0x4BC5], preview_sx - 1, preview_sy - 1, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+        } else {
+            fill_rect_fb(preview_sx, preview_sy, 4, 4, DMG_SHADES[2]);
+        }
     }
 
-    /* HUD numbers on right panel (X = 132..156): High Score, Score, Bricks left, Lives */
+    /* HUD numbers on right panel (X = 132..156): High Score, Score, Bricks left, Lives, Stage */
     draw_number_fb(132, 16, (uint32_t)s->high_score_tens * 10u, 6, DMG_SHADES[0]);
     draw_number_fb(132, 36, (uint32_t)s->score_tens * 10u, 6, DMG_SHADES[0]);
     draw_number_fb(140, 64, (uint32_t)s->bricks_left, 3, DMG_SHADES[1]);

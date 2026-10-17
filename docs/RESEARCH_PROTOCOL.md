@@ -35,6 +35,9 @@ Todas las direcciones siguientes fueron localizadas mediante `tools/scan_ram.py`
 | `stage` | `0xCA45` | `u8` | Indice de fase (`0..31`; `0` = Fase 1) |
 | `brick_type_grid` | `0xC000..0xC347` | `u8[60][14]` | Matriz de tipos de bloque (14 columnas de `8 px` $\times$ hasta 60 filas de `4 px`) |
 | `brick_hp_grid` | `0xC400..0xC747` | `u8[60][14]` | Durabilidad por celda (`0` = indestructible, `>=1` = destructible) |
+| `sfx_queue_0` | `0xDFE0` | `u8` | Cola primaria de efectos de sonido (ID 1..12) |
+| `sfx_queue_1` | `0xDFE1` | `u8` | Cola secundaria de efectos de sonido |
+| `sfx_active_0` | `0xDFE2` | `u8` | Efecto de sonido activo actualmente |
 
 ## 3. Reglas fisicas medidas y verificadas en la Fase 1
 1. **Velocidad de la paleta (`0x10AA..0x10DC`)**:
@@ -61,3 +64,15 @@ Todas las direcciones siguientes fueron localizadas mediante `tools/scan_ram.py`
    - Filas `8..9`: columnas `1..12` tipo `2` (`20 pts`, `hp = 1`, `min_speed_idx = 5`, 24 bloques).
    - Filas `10..12`: columnas `1..12` tipo `1` (`10 pts`, `hp = 1`, `min_speed_idx = 0`, 36 bloques).
    - Total destructibles: **84 bloques**.
+
+## 4. Arquitectura de audio APU y efectos de sonido medidos — VERIFICADO
+- El driver de sonido reside en `0x6800..0x7FF0`, invocado en cada VBlank via `CALL 0x7FF0`.
+- Los eventos del juego activan efectos escribiendo su ID en `0xDFE0` (`LD (0xDFE0), A`):
+  - **SFX 1** (`0x63AE`): Destruccion de bloque Tipo 1 (`0x1B87[5] = 1`). Tabla en `0x6FDE`: `NR10=0x00, NR11=0x71, NR12=0xF2, NR13=0x59, NR14=0x87`.
+  - **SFX 2** (`0x63B2`): Destruccion de bloque Tipo 2 (`0x1B8D[5] = 2`). Tabla en `0x6FBB`: `NR10=0x00, NR11=0x81, NR12=0x72, NR13=0x7B, NR14=0xC7`.
+  - **SFX 3** (`0x63B6`): Destruccion de bloque Tipo 3 (`0x1B93[5] = 3`). Tabla en `0x6FCA`: `NR10=0x00, NR11=0x81, NR12=0xC2, NR13=0xAC, NR14=0xC7`.
+  - **SFX 7** (`0x6B17`): Saque de la bola y rebote en la paleta (`0x101B`, `0x1113`). Tabla en `0x701A`: `NR10=0x1A, NR11=0x81, NR12=0xF0, NR13=0x9D, NR14=0xC7`.
+  - **SFX 11** (`0x63D6`): Rebote en el techo (`0x0CF2`).
+  - **SFX 12** (`0x63DA`): Rebote en paredes laterales (`0x0D24`). Ejecuta un bucle de sweep por software en `0x6E10..0x6E35` que incrementa `DFFB` hasta `0x63` y escribe `NR13/NR14`; este bucle dentro de la ISR explica con precision matematica el alargamiento del tiempo de VBlank cuando ocurre un rebote en pared.
+- La rutina en `0x6F9D` copia directamente 5 bytes consecutivos desde la tabla de ROM hacia los registros hardware del Canal 1 (`NR10..NR14` en `0xFF10..0xFF14`).
+

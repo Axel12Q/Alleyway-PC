@@ -3,54 +3,51 @@
 The user requested that you take over development while Codex credits recover.
 Work locally in the Antigravity worktree on antigravity/development, test changes,
 and push coherent milestones to the specified GitHub repository. Continue doing
-useful independent work without asking routine implementation questions.
+useful independent work with focused, budget-conscious steps.
+
+## Overarching Project Objective
+
+Understand and reproduce how Game Boy games work internally, using Alleyway as the
+first concrete case study, to build reusable components (ROM/header parsing, deterministic
+input/trace timelines, RAM differential scanners, 2bpp tile decoders, APU audio) to
+accelerate future Game Boy native ports.
+
+## Architectural Boundaries
+
+1. Native Reimplementation (Chosen route): Native C logic faithfully executing the
+   measured formulas, state machines, and fixed-point math, reading original assets
+   from local ROM at runtime.
+2. Emulation: Complete hardware virtualization (CPU, PPU, APU, timers). Used as reference
+   oracle (PyBoy, SameBoy), not embedded in the port.
+3. Static Recompilation: Automated binary translation. Not assumed or promised.
 
 ## What exists and was verified
 
-- Native Windows C diagnostic renderer (Win32/GDI), 160x144 integer scaling.
-- Python ROM metadata/checksum inspector with two synthetic tests.
-- PyBoy no-input boot capture to PPM/JSON, repeatable on a synthetic cartridge.
-- SameBoy 1.0.4 portable download, publisher SHA256 verified.
-- PyBoy 2.8.1, Zig 0.16.0 and dependency lock.
-- No original Alleyway dump, gameplay, RAM map or extracted levels have been validated.
+- Stage 1 Native C playable engine in `src/main.c` (Win32/GDI at 60 Hz).
+- Bit-exact trace verification (`--verify-trace`) comparing native C simulation
+  against PyBoy logic ticks (`0x051F..0x0525`) for 5,651 consecutive ticks (0 mismatches).
+- Deterministic input timeline, hardware register/watchpoint tracer (`tools/capture_reference.py`).
+- Trace and metadata comparator (`tools/compare_traces.py`).
+- Differential RAM scanner and time-series correlation finder (`tools/scan_ram.py`).
+- Synthetic interactive ROM fixture generator (`tools/synthetic_rom.py`).
+- Cartridge header, size, bank alignment, and checksum inspector (`tools/inspect_rom.py`).
+- GitHub Actions CI workflow running on Windows with synthetic fixtures only.
+- Local user dump verified at `../Local-Privado/roms/Alleyway (USA).gb`.
 
-## Start here
+## Evidence vs Limits
 
-1. Read AGENTS.md, README.md, docs/STATUS.md, MODLOG.md and RESEARCH_PROTOCOL.md.
-2. Check current branch, git status and origin. Remain in this worktree.
-3. Use .venv/Scripts/python.exe explicitly. If git/uv is missing from terminal PATH,
-   dot-source .tools/machine-env.ps1; it adds existing tools only for that shell.
-4. Run tools/build.py, build/alleyway-lab.exe --smoke-test and unittest discovery.
-5. Check only this worktree's local/roms and ../Local-Privado/roms for a user-provided
-   genuine dump. synthetic.gb is a synthetic fixture, NEVER Alleyway evidence.
+- Verified: Stage 1 paddle movement speeds (1, 3, 5 px/tick), ball 8.8 big-endian launch
+  and bounce vectors, paddle zone table lookup, wall rebounds, 4-probe brick collision,
+  durability and score calculations.
+- Limits: 5651 ticks of verified parity on Stage 1 do NOT prove that all game paths or all
+  32 stages are complete. Moving brick scrolls, bonus stages, full 1-UP progression,
+  authentic 2bpp tile decoding, and APU audio remain to be implemented.
 
-## Useful work that does not require the original ROM
+## Roadmap & Budget Guidelines
 
-- Harden and test metadata errors, reference capture/replay and a trace comparator.
-- Add a deterministic input timeline (frame, button, press/release), explicit emulator
-  settings and version/hash metadata. Keep captures private and schema documented.
-- Compare repeat runs on synthetic fixtures, including a deliberate mismatch test.
-- Prepare debugger workflow and RAM discovery experiments from official documentation.
-- Improve Windows setup/build usability and a small CI workflow using synthetic data.
-- Keep actual game logic unspecified until measured. Do not make a Breakout clone
-  and describe it as a faithful Alleyway port.
-
-Choose concrete small milestones; implement, test, document, commit and push each.
-Do not endlessly expand scaffolding if all meaningful work needs the ROM.
-
-## After the user supplies the original dump
-
-Identify hash/revision, reproduce boot/controls, locate actual state variables,
-measure movement/rebounds/collision timing, decode one level locally, implement
-one native playable stage, compare recorded traces, then extend levels/audio/menus.
-The port should read/import the user's data locally; no original resources in Git.
-Known controls/serial-port pitfall:
-https://github.com/visualboyadvance-m/visualboyadvance-m/issues/274
-
-## Git and progress
-
-Commit author: Antigravity (use existing user identity if intentionally configured;
-otherwise per-command `-c user.name=Antigravity -c user.email=antigravity@localhost`).
-Push antigravity/development after successful milestones. No force push or main
-merge. On a genuine blocker update STATUS with what is done, exact missing input
-and next command; tell the user. Never claim the complete game was ported if not.
+- Maintain Gemini 3.8 Flash (Medium) as active model; avoid heavy multi-agent spawns.
+- Focus on small, bounded milestones backed by synthetic unit tests:
+  1. Reusable 2bpp tile decoding module + connection to local Alleyway rendering.
+  2. Horizontal/vertical brick scrolling and bonus stage mechanics.
+  3. Reusable Game Boy APU research, license evaluation, and first synchronized audio event.
+- Update `docs/STATUS.md` and `MODLOG.md` after each verified milestone.

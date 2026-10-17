@@ -56,9 +56,9 @@ typedef struct {
     uint8_t bonus_flag;
     uint8_t scroll_flag;
     uint8_t total_rows;
-    uint8_t row_offset;
-    uint8_t drop_timer;      /* Stage 3 vertical brick drop timer (0xCA3C) */
-    uint16_t bonus_timer;    /* Bonus stage countdown timer in frames/ticks (0xCA3E) */
+    uint8_t row_offset;      /* Visible row offset (0xFFA9) */
+    uint8_t vblank_count;    /* Authentic VBlank frame counter (0xFFA2) */
+    uint16_t bonus_timer;    /* Bonus stage countdown timer in seconds (0xCA48) */
     uint8_t prev_joyp_raw;
     uint8_t sfx_trigger; /* Queued SFX ID (0 = none, 7 = paddle bounce, 12 = wall bounce, etc.) */
     uint8_t up_index;    /* Index in 0x1B5D 1-UP score table */
@@ -233,6 +233,20 @@ static void load_stage_grid(AlleywayStage1 *s) {
     s->total_rows = (uint8_t)rows;
     s->row_offset = (rows >= 20) ? (uint8_t)(rows - 20) : 0u;
     s->bricks_left = destructible;
+
+    /* Initialize authentic bonus timer from 0x1B71 if in bonus stage (0x0735..0x0745) */
+    if (s->bonus_flag != 0) {
+        uint8_t round_idx = (uint8_t)(s->stage >> 2); /* stages 3, 7, 11, 15 -> rounds 0, 1, 2, 3 */
+        if (round_idx > 3u) round_idx = 3u;
+        uint16_t timer_tbl = (uint16_t)(0x1B71u + (uint16_t)round_idx * 3u);
+        if (timer_tbl < ROM_SIZE_BYTES) {
+            s->bonus_timer = s->rom[timer_tbl];
+        } else {
+            s->bonus_timer = 95u;
+        }
+    } else {
+        s->bonus_timer = 0;
+    }
 }
 
 static void stage1_reset_for_play(AlleywayStage1 *s) {
@@ -264,6 +278,7 @@ static void stage1_reset_for_play(AlleywayStage1 *s) {
     s->prev_joyp_raw = 0xFF;
     s->sfx_trigger = 0;
     s->up_index = 0;
+    s->vblank_count = 0;
     load_stage_grid(s);
 }
 
@@ -320,7 +335,12 @@ static void serve_ball(AlleywayStage1 *s) {
     if (s->scroll_step < 0x0Au) {
         uint8_t c = s->scroll_step;
         s->scroll_step = (uint8_t)(s->scroll_step + 1u);
-        s->scroll_timer = s->rom[0x1B7Du + c];
+        uint16_t tbl_addr = (uint16_t)(0x1B7Du + (uint16_t)c);
+        if (s->rom_loaded && tbl_addr < ROM_SIZE_BYTES) {
+            s->scroll_timer = s->rom[tbl_addr];
+        } else {
+            s->scroll_timer = 8u;
+        }
     } else {
         s->scroll_timer = 1u;
     }
@@ -476,6 +496,32 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
     return 1;
 }
 
+static void step_paddle_bounce_vertical_drop(AlleywayStage1 *s) {
+    if (s->scroll_timer > 0) {
+        s->scroll_timer--;
+    } else {
+        s->scroll_timer = 0xFFu;
+    }
+    if (s->scroll_timer == 0) {
+        /* Authentic vertical brick drop (0x1175: CALL 0x0BC7) */
+        if (s->row_offset > 0) {
+            s->row_offset--;
+        }
+        if (s->scroll_step < 0x0Au) {
+            uint8_t sc = s->scroll_step;
+            s->scroll_step = (uint8_t)(s->scroll_step + 1u);
+            uint16_t step_tbl = (uint16_t)(0x1B7Du + (uint16_t)sc);
+            if (s->rom_loaded && step_tbl < ROM_SIZE_BYTES) {
+                s->scroll_timer = s->rom[step_tbl];
+            } else {
+                s->scroll_timer = 8u;
+            }
+        } else {
+            s->scroll_timer = 1u;
+        }
+    }
+}
+
 static void step_ball_and_collisions(AlleywayStage1 *s) {
     s->ball_prev_y = s->ball_y;
     uint16_t y16 = (uint16_t)((((uint16_t)s->ball_y << 8) | (uint16_t)s->ball_y_sub) + s->ball_vy);
@@ -508,17 +554,7 @@ static void step_ball_and_collisions(AlleywayStage1 *s) {
                     }
                     s->ball_vx = vx;
                     s->sfx_trigger = 7; /* SFX 7: Paddle bounce */
-
-                    s->scroll_timer = (uint8_t)(s->scroll_timer - 1u);
-                    if (s->scroll_timer == 0) {
-                        if (s->scroll_step < 0x0Au) {
-                            uint8_t sc = s->scroll_step;
-                            s->scroll_step = (uint8_t)(s->scroll_step + 1u);
-                            s->scroll_timer = s->rom[0x1B7Du + sc];
-                        } else {
-                            s->scroll_timer = 1u;
-                        }
-                    }
+                    step_paddle_bounce_vertical_drop(s);
                 } else {
                     bounce_horizontal(s);
                 }
@@ -618,34 +654,24 @@ static void step_horizontal_scroll(AlleywayStage1 *s) {
 }
 
 static void step_stage_timers(AlleywayStage1 *s) {
-    /* Stage 3 vertical brick drop: when active, drop_timer counts down.
-     * When it hits 0, row_offset is decremented (shifting visible brick grid downward)
-     * until row_offset reaches 0 (all rows dropped into playfield).
-     * Reload period is authentic (0x3C = 60 ticks / 1 second).
-     */
-    if (s->drop_timer > 0) {
-        s->drop_timer--;
-        if (s->drop_timer == 0) {
-            if (s->row_offset > 0) {
-                s->row_offset--;
-                s->drop_timer = 0x3C;
-            }
-        }
-    }
-
-    /* Bonus stage timer countdown (0x198C..0x1A50):
-     * bonus_timer counts frames/ticks. When it expires, bonus stage ends (state -> 7/8).
+    /* Bonus stage countdown timer (0x198C):
+     * When bonus_flag is set, bonus timer counts down every 32 frames/ticks (vblank_count & 0x1F == 0).
+     * When timer expires (hits 0), triggers state 7 (0x19C7: LD A, 7 / LDH (0xA4), A)
+     * which in bonus stages transitions cleanly to State 8 (0x07D3: if bonus_flag != 0 -> State 8)
+     * without losing a life!
      */
     if (s->bonus_flag != 0 && s->bonus_timer > 0) {
-        s->bonus_timer--;
-        if (s->bonus_timer == 0) {
-            /* Bonus time expired: trigger bonus clear/end sequence */
-            s->state = 8;
+        if ((s->vblank_count & 0x1Fu) == 0) {
+            s->bonus_timer--;
+            if (s->bonus_timer == 0) {
+                s->state = 7;
+            }
         }
     }
 }
 
 static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
+    s->vblank_count = (uint8_t)(s->vblank_count + 1u);
     s->sfx_trigger = 0;
     if (s->state == 5) {
         step_horizontal_scroll(s);
@@ -666,27 +692,35 @@ static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_e
             s->state = 6;
         }
     } else if (s->state == 7) {
-        if (s->lives > 0) {
-            s->lives--;
-        }
-        if (s->lives == 0) {
-            if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
-                stage1_reset_for_play(s);
-            }
+        /* Life lost routine (0x07D3):
+         * If bonus_flag != 0: bonus ends without losing a life! (0x07D3: if bonus_flag != 0 -> State 8)
+         */
+        if (s->bonus_flag != 0) {
+            s->state = 8;
         } else {
-            s->paddle_shrunk = 0;
-            s->paddle_w = 0x18;
-            s->state = 5;
+            if (s->lives > 0) {
+                s->lives--;
+            }
+            if (s->lives == 0) {
+                if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
+                    stage1_reset_for_play(s);
+                }
+            } else {
+                s->paddle_shrunk = 0;
+                s->paddle_w = 0x18;
+                s->state = 5;
+            }
         }
     } else if (s->state == 8) {
-        /* Stage Clear: advance to next stage (0..31) on A or Start */
-        if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
-            s->stage = (uint8_t)((s->stage + 1u) & 0x1Fu);
-            s->state = 5;
-            s->paddle_shrunk = 0;
-            s->paddle_w = 0x18;
-            load_stage_grid(s);
+        /* Stage Clear (0x0805): advances stage 0..31 -> 0 and transitions directly to State 5 */
+        s->stage = (uint8_t)(s->stage + 1u);
+        if (s->stage >= 32u) {
+            s->stage = 0u;
         }
+        s->state = 5;
+        s->paddle_shrunk = 0;
+        s->paddle_w = 0x18;
+        load_stage_grid(s);
     }
     step_prng(s);
 }
@@ -871,10 +905,15 @@ static void render_stage1(const AlleywayStage1 *s) {
         }
     }
 
-    /* HUD numbers on right panel (X = 132..156): High Score, Score, Bricks left, Lives, Stage */
+    /* HUD numbers on right panel (X = 132..156): High Score, Score, Bricks/Bonus timer, Lives, Stage */
     draw_number_fb(132, 16, (uint32_t)s->high_score_tens * 10u, 6, DMG_SHADES[0]);
     draw_number_fb(132, 36, (uint32_t)s->score_tens * 10u, 6, DMG_SHADES[0]);
-    draw_number_fb(140, 64, (uint32_t)s->bricks_left, 3, DMG_SHADES[1]);
+    if (s->bonus_flag != 0) {
+        /* In bonus stages, display remaining countdown seconds in HUD */
+        draw_number_fb(144, 64, (uint32_t)s->bonus_timer, 2, DMG_SHADES[0]);
+    } else {
+        draw_number_fb(140, 64, (uint32_t)s->bricks_left, 3, DMG_SHADES[1]);
+    }
     draw_number_fb(144, 88, (uint32_t)s->lives, 2, DMG_SHADES[0]);
     draw_number_fb(144, 112, (uint32_t)(s->stage + 1u), 2, DMG_SHADES[1]);
 }
@@ -957,6 +996,7 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
         int spd = 0, bricks = 0, score = 0, lives = 0;
         int in_raw = 0xFF, in_edge = 0xFF, tick_id = 0;
         int stg = 0, sc_flag = 0, bo_flag = 0;
+        int ref_row_offset = -1, ref_scroll_timer = -1, ref_scroll_step = -1, ref_bonus_timer = -1, ref_vblank = -1;
         int r_shifts[20], r_timers[20];
         bool has_shifts = true;
 
@@ -980,6 +1020,11 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
         extract_json_int(line, "stage", &stg);
         extract_json_int(line, "scroll_flag", &sc_flag);
         extract_json_int(line, "bonus_flag", &bo_flag);
+        extract_json_int(line, "row_offset", &ref_row_offset);
+        extract_json_int(line, "scroll_timer", &ref_scroll_timer);
+        extract_json_int(line, "scroll_step", &ref_scroll_step);
+        extract_json_int(line, "bonus_timer", &ref_bonus_timer);
+        extract_json_int(line, "vblank_count", &ref_vblank);
 
         for (int r = 0; r < 20; ++r) {
             char key_s[32], key_t[32];
@@ -1001,7 +1046,7 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
         }
 
         if (!initialized) {
-            if (st == 5) {
+            if (st == 5 || st == 6) {
                 stage1_reset_for_play(&g_sim);
                 g_sim.stage = (uint8_t)stg;
                 load_stage_grid(&g_sim);
@@ -1009,9 +1054,21 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
                 g_sim.prng = (uint8_t)prng;
                 g_sim.paddle_x = (uint8_t)pad_x;
                 g_sim.paddle_w = (uint8_t)pad_w;
+                g_sim.ball_x = (uint8_t)bx;
+                g_sim.ball_x_sub = (uint8_t)bx_sub;
+                g_sim.ball_y = (uint8_t)by;
+                g_sim.ball_y_sub = (uint8_t)by_sub;
+                g_sim.ball_vx = (uint16_t)bvx;
+                g_sim.ball_vy = (uint16_t)bvy;
+                g_sim.speed_idx = (uint8_t)spd;
                 g_sim.bricks_left = (uint16_t)bricks;
                 g_sim.score_tens = (uint16_t)score;
                 g_sim.lives = (uint8_t)lives;
+                if (ref_row_offset >= 0) g_sim.row_offset = (uint8_t)ref_row_offset;
+                if (ref_scroll_timer >= 0) g_sim.scroll_timer = (uint8_t)ref_scroll_timer;
+                if (ref_scroll_step >= 0) g_sim.scroll_step = (uint8_t)ref_scroll_step;
+                if (ref_bonus_timer >= 0) g_sim.bonus_timer = (uint16_t)ref_bonus_timer;
+                if (ref_vblank >= 0) g_sim.vblank_count = (uint8_t)ref_vblank;
                 if (has_patterns) {
                     for (int r = 0; r < 20; ++r) {
                         g_sim.row_pattern[r] = (uint8_t)r_patterns[r];
@@ -1032,6 +1089,10 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
             break;
         }
 
+        if (ref_vblank >= 0) {
+            g_sim.vblank_count = (uint8_t)(ref_vblank - 1u);
+        }
+
         stage1_step_tick(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge);
         ticks_compared++;
 
@@ -1046,6 +1107,19 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
             mismatch_detected = true;
         }
 
+        if (ref_row_offset >= 0 && (int)g_sim.row_offset != ref_row_offset) {
+            mismatch_detected = true;
+        }
+        if (ref_scroll_timer >= 0 && (int)g_sim.scroll_timer != ref_scroll_timer) {
+            mismatch_detected = true;
+        }
+        if (ref_scroll_step >= 0 && (int)g_sim.scroll_step != ref_scroll_step) {
+            mismatch_detected = true;
+        }
+        if (ref_bonus_timer >= 0 && (int)g_sim.bonus_timer != ref_bonus_timer) {
+            mismatch_detected = true;
+        }
+
         if (has_shifts) {
             for (int r = 0; r < 20; ++r) {
                 if ((int)g_sim.row_shift[r] != r_shifts[r] || (int)g_sim.row_timer[r] != r_timers[r]) {
@@ -1057,12 +1131,14 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
 
         if (mismatch_detected) {
             fprintf(stderr,
-                "Mismatch at tick=%d: native(st=%u,padX=%u,ball=%u.%u,%u.%u,v=%u,%u,spd=%u,bricks=%u,score=%u,sh0=%u) "
-                "!= ref(st=%d,padX=%d,ball=%d.%d,%d.%d,v=%d,%d,spd=%d,bricks=%d,score=%d,sh0=%d)\n",
+                "Mismatch at tick=%d: native(st=%u,padX=%u,ball=%u.%u,%u.%u,v=%u,%u,spd=%u,bricks=%u,score=%u,off=%u,c4=%u,c5=%u,bon=%u) "
+                "!= ref(st=%d,padX=%d,ball=%d.%d,%d.%d,v=%d,%d,spd=%d,bricks=%d,score=%d,off=%d,c4=%d,c5=%d,bon=%d)\n",
                 tick_id, g_sim.state, g_sim.paddle_x, g_sim.ball_x, g_sim.ball_x_sub,
                 g_sim.ball_y, g_sim.ball_y_sub, g_sim.ball_vx, g_sim.ball_vy,
-                g_sim.speed_idx, g_sim.bricks_left, g_sim.score_tens, g_sim.row_shift[0],
-                st, pad_x, bx, bx_sub, by, by_sub, bvx, bvy, spd, bricks, score, has_shifts ? r_shifts[0] : -1);
+                g_sim.speed_idx, g_sim.bricks_left, g_sim.score_tens,
+                g_sim.row_offset, g_sim.scroll_timer, g_sim.scroll_step, (unsigned)g_sim.bonus_timer,
+                st, pad_x, bx, bx_sub, by, by_sub, bvx, bvy, spd, bricks, score,
+                ref_row_offset, ref_scroll_timer, ref_scroll_step, ref_bonus_timer);
             mismatches++;
             break;
         }
@@ -1211,32 +1287,44 @@ int main(int argc, char **argv) {
         if (g_sim.score_tens != 1000) return 30;
         if (g_sim.lives != 4 || g_sim.up_index != 1) return 31;
 
-        /* 4. Verify Stage 3 vertical brick drop stepping (drop_timer decrement & reload, row_offset decrement) */
+        /* 4. Verify authentic Stage 3 vertical brick drop stepping on paddle bounce */
+        g_sim.rom[0x1B7D] = 8;
         g_sim.row_offset = 3;
-        g_sim.drop_timer = 2;
-        /* Step 1 tick */
-        step_stage_timers(&g_sim);
-        if (g_sim.drop_timer != 1 || g_sim.row_offset != 3) return 35;
-        /* Step 2 ticks: timer expires, row_offset decreases 3 -> 2, timer reloads to 0x3C (60) */
-        step_stage_timers(&g_sim);
-        if (g_sim.drop_timer != 0x3C || g_sim.row_offset != 2) return 36;
+        g_sim.scroll_step = 0;
+        g_sim.scroll_timer = 2;
+        /* First bounce: scroll_timer decrements 2 -> 1, row_offset stays 3 */
+        step_paddle_bounce_vertical_drop(&g_sim);
+        if (g_sim.scroll_timer != 1 || g_sim.row_offset != 3) return 35;
+        /* Second bounce: scroll_timer reaches 0 -> row_offset decrements 3 -> 2, scroll_step becomes 1, scroll_timer reloads to 8 */
+        step_paddle_bounce_vertical_drop(&g_sim);
+        if (g_sim.row_offset != 2 || g_sim.scroll_step != 1 || g_sim.scroll_timer != 8) return 36;
 
-        /* 5. Verify Bonus Stage countdown timer expiration */
+        /* 5. Verify Bonus Stage countdown timer cadence and expiration */
         g_sim.bonus_flag = 1;
         g_sim.bonus_timer = 2;
+        g_sim.vblank_count = 1; /* Not a multiple of 32 */
         g_sim.state = 6;
         step_stage_timers(&g_sim);
-        if (g_sim.bonus_timer != 1 || g_sim.state != 6) return 37;
+        if (g_sim.bonus_timer != 2 || g_sim.state != 6) return 37;
+        /* When vblank_count & 0x1F == 0 */
+        g_sim.vblank_count = 0x20;
         step_stage_timers(&g_sim);
-        if (g_sim.bonus_timer != 0 || g_sim.state != 8) return 38;
+        if (g_sim.bonus_timer != 1 || g_sim.state != 6) return 38;
+        /* Next 32-tick boundary: timer reaches 0, triggers state 7 */
+        g_sim.vblank_count = 0x40;
+        step_stage_timers(&g_sim);
+        if (g_sim.bonus_timer != 0 || g_sim.state != 7) return 39;
+        /* In bonus stage, state 7 transitions to state 8 with lives preserved */
+        uint8_t prev_lives = g_sim.lives;
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.state != 8 || g_sim.lives != prev_lives) return 40;
 
         /* 6. Verify Stage Clear transition 31 -> 0 progression */
         g_sim.stage = 31;
         g_sim.state = 8; /* Stage Clear */
-        /* Advance with A button (joyp_edge bit 0 = 0) */
-        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
-        if (g_sim.stage != 0) return 40;
-        if (g_sim.state != 5) return 41;
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.stage != 0) return 41;
+        if (g_sim.state != 5) return 42;
 
         puts("PASS: multi-stage rules verified (scroll wrap, bonus penetration, 1-UP threshold, vertical drop, bonus countdown, 31->0 wraparound)");
         return 0;

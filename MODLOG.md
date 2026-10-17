@@ -106,10 +106,33 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
   - **Eventos observados y validados**: desplazamiento continuo hacia la derecha (`row_pattern = 0x04`), avance de `row_shift` a traves de los 112 valores posibles (0 a 111 con wraparound modular a 0), y colision real con bloque en fila desplazada (`bricks_left: 84 -> 82`, `score_tens: 0 -> 2` [20 puntos], `speed_idx: 0 -> 3`).
   - Verificacion multi-direccional inyectada: ejecucion de 939 ticks con filas alternadas izquierda (`0x83`) y derecha (`0x02`), alcanzando el rango completo de 0 a 111 en ambas direcciones sin divergencias (`mismatches = 0`).
 
+## Hito 8 (2026-10-17): Paridad real de Fase 3 (descenso vertical autentico por rebotes) y Primera Fase Bonus (Fase 4)
+### 1. Paridad real y desensamblado del descenso vertical de Fase 3
+- Se comprobo mediante desensamblado de `0x1165..0x1195` y `0x0BC7..0x0C00` que el descenso vertical no se rige por tiempo/fotogramas, sino por el contador `scroll_timer` (`0xFFC4`) decrementado en cada rebote de la pala (`0x1167`).
+- En el saque (`0x0788`), `0x1177` carga `scroll_timer = 8` de `ROM[0x1B7D]` y fija `scroll_step = 1`.
+- Al agotarse `scroll_timer` tras 8 rebotes, `CALL 0x0BC7` decrementa `row_offset` (40 -> 39 filas visibles desplazadas) y recarga de la tabla `0x1B7D + scroll_step` (`[8, 8, 5, 5, 3, 3, 2, 2, 2, 2]`).
+- Se anadio la prueba automatica `test_local_rom_stage3_parity_if_present` comparando **2,138 ticks consecutivos** frente a PyBoy:
+  - Cero discrepancias (`mismatches = 0`).
+  - Se observaron y validaron 2 descensos completos (`row_offset: 20 -> 19 -> 18`).
+  - Colisiones con bloques desplazados y destruccion de 24 bloques (`bricks_left: 84 -> 60`, puntuacion `270`, `speed_idx: 3 -> 5`).
+
+### 2. Primera Fase de Bonificacion (Fase 4, 161 bloques)
+- Descriptor `0x1BEA` activa `bonus_flag = 1` y apunta a `map_ptr = 0x357C`.
+- Temporizador oficial inicializado desde tabla `0x1B71`: 95 segundos (`0x5F`) para la Ronda 0.
+- Cadencia de cuenta atras (`0x198C`): decrementa en Estado 6 unicamente en ticks donde el contador VBlank `vblank_count & 0x1F == 0` (cada 32 frames).
+- Penetracion: en `0x0E43` la destruccion de bloques es inmediata y en `0x0E76` salta a `0x0DF3`, atravesando bloques sin rebotar.
+- Expiracion y caida: al expirar o caer la bola (`0x0CED`), transiciona a Estado 7, el cual en bonus (`0x07DD`) preserva intactas las vidas y salta a Estado 8 (Clear).
+- Pruebas automatizadas en `test_stage1_native.py`:
+  - `test_local_rom_stage4_bonus_parity_if_present`: 140+ ticks verificados con `mismatches = 0`, 47 bloques destruidos por penetracion continua.
+  - `test_local_rom_stage4_bonus_expiration_if_present`: con temporizador en 2, comprueba decremento, cruce por cero (`bonus_timer = 0`), paso a Estado 7 y conservacion de vidas con `mismatches = 0`.
+
+### 3. Suite de pruebas
+- Total de pruebas automatizadas: **25 pruebas pasando en 4.4s** (`unittest discover tests`).
+
 ## Siguiente paso recomendado para Codex / futuras sesiones
-1. Paridad real de Fase 3 (descenso vertical `0x0BC7..0x0C31`): contrastar con PyBoy la cadencia real de decremento de `row_offset`.
-2. Paridad real de Fases de bonificacion (`0xFFAA = 1`): verificar la cuenta atras del HUD (`0x198C..0x1A50`) y la penetracion continua.
-3. Extender la sintesis APU a los Canales 2, 3 y 4.
+1. Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido) y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
+2. Secuencias de intro y telon de transicion (Estados 1..4).
+3. Mecanica de division de bola / transformacion de pala en fases avanzadas.
 
 
 

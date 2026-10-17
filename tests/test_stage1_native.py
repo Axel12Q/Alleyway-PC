@@ -259,6 +259,403 @@ class NativeStage1VerifierTests(unittest.TestCase):
             self.assertGreater(report["ticks_compared"], 500)
             self.assertLess(report["bricks_left"], 84)
 
+            # Coverage assertions for Stage 2
+            self.assertTrue(any(r["stage"] == 1 for r in records), "Did not reach Stage 2 (stage == 1)")
+            self.assertTrue(all(r["scroll_flag"] == 1 for r in records if r["stage"] == 1), "scroll_flag != 1 in Stage 2")
+            self.assertTrue(any(r["row_shift_0"] > 0 for r in records), "Row shift did not advance in Stage 2")
+
+    def test_local_rom_stage3_parity_if_present(self):
+        local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
+        if not local_rom.is_file():
+            self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
+        from pyboy import PyBoy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_trace = Path(tmp) / "stage3_parity.jsonl"
+            gb = PyBoy(str(local_rom), window="null", sound_emulated=False)
+            drops = 0
+            try:
+                # Advance past title
+                for f in range(346):
+                    if f == 120: gb.button_press("start")
+                    elif f == 125: gb.button_release("start")
+                    gb.tick()
+
+                # Trigger stage clear on Stage 1 to transition to Stage 2
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(346, 558):
+                    if f >= 400 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+
+                # Trigger stage clear on Stage 2 to transition into Stage 3
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(558, 800):
+                    if f >= 600 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+                    if gb.memory[0xCA45] == 2 and gb.memory[0xFFA4] == 5:
+                        break
+
+                start_frame = f
+                records = []
+                tick_id = [0]
+                latched = [0xFF, 0xFF]
+
+                def _on_logic_start(context):
+                    latched[0] = int(gb.memory[0xFF8C])
+                    latched[1] = int(gb.memory[0xFF8D])
+
+                def _on_logic_end(context):
+                    rec = {
+                        "tick": tick_id[0],
+                        "state": gb.memory[0xFFA4],
+                        "prng": gb.memory[0xFFA1],
+                        "vblank_count": gb.memory[0xFFA2],
+                        "paddle_x": gb.memory[0xFFC0],
+                        "paddle_w": gb.memory[0xFFC2],
+                        "ball_x": gb.memory[0xFFB6],
+                        "ball_x_sub": gb.memory[0xFFB7],
+                        "ball_y": gb.memory[0xFFB4],
+                        "ball_y_sub": gb.memory[0xFFB5],
+                        "ball_vx": (gb.memory[0xFFBA] << 8) | gb.memory[0xFFBB],
+                        "ball_vy": (gb.memory[0xFFB8] << 8) | gb.memory[0xFFB9],
+                        "speed_idx": gb.memory[0xFFBE],
+                        "bricks_left": (gb.memory[0xFFC8] << 8) | gb.memory[0xFFC9],
+                        "score_tens": gb.memory[0xFFCA] | (gb.memory[0xFFCB] << 8),
+                        "lives": gb.memory[0xCA44],
+                        "stage": gb.memory[0xCA45],
+                        "scroll_flag": gb.memory[0xFFAB],
+                        "bonus_flag": gb.memory[0xFFAA],
+                        "row_offset": gb.memory[0xFFA9],
+                        "scroll_timer": gb.memory[0xFFC4],
+                        "scroll_step": gb.memory[0xFFC5],
+                        "in_joyp_raw": latched[0],
+                        "in_joyp_edge": latched[1],
+                    }
+                    records.append(rec)
+                    tick_id[0] += 1
+
+                gb.hook_register(0, 0x051F, _on_logic_start, None)
+                gb.hook_register(0, 0x0525, _on_logic_end, None)
+
+                last_offset = gb.memory[0xFFA9]
+
+                # Run simulation and track ball with paddle
+                for f in range(start_frame, start_frame + 2500):
+                    if f == start_frame + 10:
+                        gb.button_press("a")
+                    elif f == start_frame + 15:
+                        gb.button_release("a")
+
+                    ball_x = gb.memory[0xFFB6]
+                    pad_x = gb.memory[0xFFC0]
+                    pad_w = gb.memory[0xFFC2]
+                    target_x = ball_x - (pad_w // 2)
+                    if pad_x < target_x - 1:
+                        gb.button_press("right")
+                        gb.button_release("left")
+                    elif pad_x > target_x + 1:
+                        gb.button_press("left")
+                        gb.button_release("right")
+                    else:
+                        gb.button_release("left")
+                        gb.button_release("right")
+
+                    gb.tick()
+                    if gb.memory[0xFFA9] != last_offset:
+                        drops += 1
+                        last_offset = gb.memory[0xFFA9]
+                        if drops >= 2 and f > start_frame + 1800:
+                            break
+            finally:
+                gb.stop()
+
+            with open(tmp_trace, "w", encoding="utf-8") as fp:
+                for r in records:
+                    fp.write(json.dumps(r) + "\n")
+
+            res = subprocess.run(
+                [str(EXE_PATH), "--verify-trace", str(local_rom), str(tmp_trace)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            report = json.loads(res.stdout.strip())
+            self.assertEqual(report["mismatches"], 0)
+            self.assertGreater(report["ticks_compared"], 1000)
+            self.assertLess(report["bricks_left"], 84)
+
+            # Assert coverage for Stage 3
+            self.assertTrue(any(r["stage"] == 2 for r in records), "Did not reach Stage 3 (stage == 2)")
+            self.assertGreaterEqual(drops, 2, "Did not observe at least two vertical drops")
+            self.assertLessEqual(last_offset, 18, f"row_offset did not drop to <= 18 (was {last_offset})")
+
+    def test_local_rom_stage4_bonus_parity_if_present(self):
+        local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
+        if not local_rom.is_file():
+            self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
+        from pyboy import PyBoy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_trace = Path(tmp) / "stage4_bonus_parity.jsonl"
+            gb = PyBoy(str(local_rom), window="null", sound_emulated=False)
+            try:
+                # Advance past title
+                for f in range(346):
+                    if f == 120: gb.button_press("start")
+                    elif f == 125: gb.button_release("start")
+                    gb.tick()
+
+                # Fast-forward across stages 1..3 into Stage 4 (first bonus stage)
+                # Stage 1 -> 2
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(346, 558):
+                    if f >= 400 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+
+                # Stage 2 -> 3
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(558, 780):
+                    if f >= 600 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+
+                # Stage 3 -> 4 (Bonus Stage 1)
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(780, 1100):
+                    if f >= 820 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+                    if gb.memory[0xCA45] == 3 and gb.memory[0xFFA4] == 5:
+                        break
+
+                start_frame = f
+                records = []
+                tick_id = [0]
+                latched = [0xFF, 0xFF]
+
+                def _on_logic_start(context):
+                    latched[0] = int(gb.memory[0xFF8C])
+                    latched[1] = int(gb.memory[0xFF8D])
+
+                def _on_logic_end(context):
+                    rec = {
+                        "tick": tick_id[0],
+                        "state": gb.memory[0xFFA4],
+                        "prng": gb.memory[0xFFA1],
+                        "vblank_count": gb.memory[0xFFA2],
+                        "paddle_x": gb.memory[0xFFC0],
+                        "paddle_w": gb.memory[0xFFC2],
+                        "ball_x": gb.memory[0xFFB6],
+                        "ball_x_sub": gb.memory[0xFFB7],
+                        "ball_y": gb.memory[0xFFB4],
+                        "ball_y_sub": gb.memory[0xFFB5],
+                        "ball_vx": (gb.memory[0xFFBA] << 8) | gb.memory[0xFFBB],
+                        "ball_vy": (gb.memory[0xFFB8] << 8) | gb.memory[0xFFB9],
+                        "speed_idx": gb.memory[0xFFBE],
+                        "bricks_left": (gb.memory[0xFFC8] << 8) | gb.memory[0xFFC9],
+                        "score_tens": gb.memory[0xFFCA] | (gb.memory[0xFFCB] << 8),
+                        "lives": gb.memory[0xCA44],
+                        "stage": gb.memory[0xCA45],
+                        "scroll_flag": gb.memory[0xFFAB],
+                        "bonus_flag": gb.memory[0xFFAA],
+                        "bonus_timer": gb.memory[0xCA48],
+                        "row_offset": gb.memory[0xFFA9],
+                        "in_joyp_raw": latched[0],
+                        "in_joyp_edge": latched[1],
+                    }
+                    records.append(rec)
+                    tick_id[0] += 1
+
+                gb.hook_register(0, 0x051F, _on_logic_start, None)
+                gb.hook_register(0, 0x0525, _on_logic_end, None)
+
+                # Serve ball in Stage 4
+                gb.button_release("a")
+                for _ in range(5): gb.tick()
+                gb.button_press("a")
+                for _ in range(5): gb.tick()
+                gb.button_release("a")
+
+                # Step 150 frames observing ball brick penetration and authentic timer countdown
+                initial_bricks = (gb.memory[0xFFC8] << 8) | gb.memory[0xFFC9]
+                initial_timer = gb.memory[0xCA48]
+
+                for f in range(150):
+                    ball_x = gb.memory[0xFFB6]
+                    pad_x = gb.memory[0xFFC0]
+                    pad_w = gb.memory[0xFFC2]
+                    target_x = ball_x - (pad_w // 2)
+                    if pad_x < target_x - 1:
+                        gb.button_press("right"); gb.button_release("left")
+                    elif pad_x > target_x + 1:
+                        gb.button_press("left"); gb.button_release("right")
+                    else:
+                        gb.button_release("left"); gb.button_release("right")
+                    gb.tick()
+
+                final_bricks = (gb.memory[0xFFC8] << 8) | gb.memory[0xFFC9]
+                final_timer = gb.memory[0xCA48]
+            finally:
+                gb.stop()
+
+            with open(tmp_trace, "w", encoding="utf-8") as fp:
+                for r in records:
+                    fp.write(json.dumps(r) + "\n")
+
+            res = subprocess.run(
+                [str(EXE_PATH), "--verify-trace", str(local_rom), str(tmp_trace)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            report = json.loads(res.stdout.strip())
+            self.assertEqual(report["mismatches"], 0)
+            self.assertGreater(report["ticks_compared"], 140)
+
+            # Assert coverage for Stage 4 Bonus
+            self.assertTrue(any(r["stage"] == 3 for r in records), "Did not reach Stage 4 (stage == 3)")
+            self.assertTrue(any(r["bonus_flag"] == 1 for r in records), "bonus_flag != 1 in Stage 4")
+            self.assertLess(final_bricks, initial_bricks, "No bricks destroyed during bonus stage")
+            self.assertLess(final_timer, initial_timer, "Bonus countdown timer did not decrement")
+            # Verify ball penetrated through multiple bricks
+            bricks_destroyed = initial_bricks - final_bricks
+            self.assertGreaterEqual(bricks_destroyed, 10, f"Expected penetration through multiple bricks, got {bricks_destroyed}")
+
+    def test_local_rom_stage4_bonus_expiration_if_present(self):
+        local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
+        if not local_rom.is_file():
+            self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
+        from pyboy import PyBoy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_trace = Path(tmp) / "stage4_expire.jsonl"
+            gb = PyBoy(str(local_rom), window="null", sound_emulated=False)
+            try:
+                # Advance past title
+                for f in range(346):
+                    if f == 120: gb.button_press("start")
+                    elif f == 125: gb.button_release("start")
+                    gb.tick()
+
+                # Fast-forward across stages 1..3 into Stage 4
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(346, 558):
+                    if f >= 400 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(558, 780):
+                    if f >= 600 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(780, 1100):
+                    if f >= 820 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+                    if gb.memory[0xCA45] == 3 and gb.memory[0xFFA4] == 5:
+                        break
+
+                start_frame = f
+                # Serve ball
+                gb.button_release("a")
+                for _ in range(5): gb.tick()
+                gb.button_press("a")
+                for _ in range(5): gb.tick()
+                gb.button_release("a")
+
+                # Step 10 frames in state 6 so ball is flying
+                for _ in range(10): gb.tick()
+
+                # Documented intervention: fast-forward authentic bonus_timer (0xCA48) to 2
+                # to measure countdown cadence, zero expiration, and State 7 transition with lives preserved
+                gb.memory[0xCA48] = 2
+
+                records = []
+                tick_id = [0]
+                latched = [0xFF, 0xFF]
+
+                def _on_logic_start(context):
+                    latched[0] = int(gb.memory[0xFF8C])
+                    latched[1] = int(gb.memory[0xFF8D])
+
+                def _on_logic_end(context):
+                    rec = {
+                        "tick": tick_id[0],
+                        "state": gb.memory[0xFFA4],
+                        "prng": gb.memory[0xFFA1],
+                        "vblank_count": gb.memory[0xFFA2],
+                        "paddle_x": gb.memory[0xFFC0],
+                        "paddle_w": gb.memory[0xFFC2],
+                        "ball_x": gb.memory[0xFFB6],
+                        "ball_x_sub": gb.memory[0xFFB7],
+                        "ball_y": gb.memory[0xFFB4],
+                        "ball_y_sub": gb.memory[0xFFB5],
+                        "ball_vx": (gb.memory[0xFFBA] << 8) | gb.memory[0xFFBB],
+                        "ball_vy": (gb.memory[0xFFB8] << 8) | gb.memory[0xFFB9],
+                        "speed_idx": gb.memory[0xFFBE],
+                        "bricks_left": (gb.memory[0xFFC8] << 8) | gb.memory[0xFFC9],
+                        "score_tens": gb.memory[0xFFCA] | (gb.memory[0xFFCB] << 8),
+                        "lives": gb.memory[0xCA44],
+                        "stage": gb.memory[0xCA45],
+                        "scroll_flag": gb.memory[0xFFAB],
+                        "bonus_flag": gb.memory[0xFFAA],
+                        "bonus_timer": gb.memory[0xCA48],
+                        "row_offset": gb.memory[0xFFA9],
+                        "in_joyp_raw": latched[0],
+                        "in_joyp_edge": latched[1],
+                    }
+                    records.append(rec)
+                    tick_id[0] += 1
+
+                gb.hook_register(0, 0x051F, _on_logic_start, None)
+                gb.hook_register(0, 0x0525, _on_logic_end, None)
+
+                lives_before_expire = gb.memory[0xCA44]
+
+                for f in range(100):
+                    ball_x = gb.memory[0xFFB6]
+                    pad_x = gb.memory[0xFFC0]
+                    pad_w = gb.memory[0xFFC2]
+                    target_x = ball_x - (pad_w // 2)
+                    if pad_x < target_x - 1:
+                        gb.button_press("right"); gb.button_release("left")
+                    elif pad_x > target_x + 1:
+                        gb.button_press("left"); gb.button_release("right")
+                    else:
+                        gb.button_release("left"); gb.button_release("right")
+                    gb.tick()
+                    if gb.memory[0xFFA4] == 7:
+                        break
+
+                lives_after_expire = gb.memory[0xCA44]
+            finally:
+                gb.stop()
+
+            with open(tmp_trace, "w", encoding="utf-8") as fp:
+                for r in records:
+                    fp.write(json.dumps(r) + "\n")
+
+            res = subprocess.run(
+                [str(EXE_PATH), "--verify-trace", str(local_rom), str(tmp_trace)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            report = json.loads(res.stdout.strip())
+            self.assertEqual(report["mismatches"], 0)
+            self.assertGreater(report["ticks_compared"], 30)
+
+            # Assert coverage for expiration
+            self.assertEqual(records[-1]["bonus_timer"], 0, "Timer did not expire to 0")
+            self.assertEqual(records[-1]["state"], 7, "Did not transition to State 7 upon expiration")
+            self.assertEqual(lives_after_expire, lives_before_expire, "Lives were incorrectly lost during bonus stage expiration")
+
 
 if __name__ == "__main__":
     unittest.main()

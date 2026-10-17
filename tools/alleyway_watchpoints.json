@@ -72,5 +72,8 @@
   "row_timer_16": "0xCA38:u8",
   "row_timer_17": "0xCA39:u8",
   "row_timer_18": "0xCA3A:u8",
-  "row_timer_19": "0xCA3B:u8"
+  "row_timer_19": "0xCA3B:u8",
+  "bonus_timer": "0xCA48:u8",
+  "bonus_round": "0xCA47:u8",
+  "vblank_count": "0xFFA2:u8"
 }

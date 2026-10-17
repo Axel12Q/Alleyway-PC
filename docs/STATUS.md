@@ -92,10 +92,35 @@
     - Verificacion multi-direccional inyectada: ejecucion de 939 ticks con filas alternadas izquierda (`0x83`) y derecha (`0x02`), alcanzando el rango completo de 0 a 111 en ambas direcciones sin divergencias (`mismatches = 0`).
 - **Ejecucion de pruebas**: **22 pruebas aprobadas** en ~1.2s.
 
+### Hito 8: Paridad real de Fase 3 (descenso vertical autentico por rebotes de paleta) y Primera Fase Bonus (Fase 4)
+- **Descenso vertical autentico de Fase 3 (`0x0BC7..0x0C31` y `0x1165..0x1195`)**:
+  - Se descubrio mediante desensamblado e inspeccion dinamica que el descenso vertical **NO esta gobernado por fotogramas**, sino por **rebotes en la paleta**.
+  - Al sacar la bola, la rutina en `0x0788` llama a `0x1177`, inicializando `scroll_timer = 8` (leido de `ROM[0x1B7D]`) y `scroll_step = 1`.
+  - En cada rebote de paleta en juego activo (`0x1167`), la rutina `0x116D` decrementa `scroll_timer`. Cuando llega a 0:
+    - Invoca `CALL 0x0BC7`, que decrementa `row_offset` (`0xFFA9`) en 1 (desplazando la matriz de 40 filas hacia abajo) hasta llegar a 0.
+    - Incrementa `scroll_step` y recarga `scroll_timer` desde la tabla oficial en `0x1B7D + scroll_step`: `[8, 8, 5, 5, 3, 3, 2, 2, 2, 2]`. A partir de `scroll_step >= 10`, se recarga a 1 (descenso por cada rebote).
+  - **Validacion de paridad bit a bit frente al cartucho (`test_local_rom_stage3_parity_if_present`)**:
+    - **Ticks comparados**: **2,138 ticks consecutivos** de logica atomica con **cero discrepancias (`mismatches = 0`)**.
+    - **Eventos observados y verificados**: 2 descensos completos (`row_offset: 20 -> 19 -> 18`), colisiones continuas de la bola con las filas desplazadas y destruccion de 24 bloques (`bricks_left: 84 -> 60`, puntuacion 270, aceleracion `speed_idx: 3 -> 5`).
+- **Mecanica autentica de la Primera Fase de Bonificacion (Fase 4, `0x1BEA`)**:
+  - Descriptor en `0x1BEA`: `desc0 = 0x80` (`bonus_flag = 1`), `map_ptr = 0x357C` (161 bloques con el sprite de Mario).
+  - Temporizador oficial de bonificacion: leido de tabla `0x1B71` segun la ronda (`stage >> 2`). En Ronda 0 (Fase 4): 95 segundos (`0x5F`).
+  - Cadencia del temporizador (`0x198C`): solo avanza en Estado 6 (juego activo). En cada tick donde el contador de cuadros VBlank `vblank_count & 0x1F == 0` (cada 32 fotogramas, ~1.86 Hz), `bonus_timer` decrementa en 1.
+  - Penetracion completa de bloques: en `0x0E43`, `bonus_flag != 0` destruye el bloque de inmediato sin decrementar HP; en `0x0E76` salta a `0x0DF3`, suprimiendo la reflexion de velocidad para que la bola atraviese formaciones densas sin rebotar.
+  - Caida de bola y expiracion: cuando la bola cae (`0x0CED`) o el tiempo se agota (`0x1996: bonus_timer == 0`), se activa el Estado 7. En Estado 7 (`0x07DD`), las fases de bonus saltan la rutina de decremento de vidas y transicionan a Estado 8 (Clear) sin perder vidas.
+  - Recompensa y transicion (`0x0805`): si `bricks_left == 0`, se otorgan 500 puntos de bonificacion (`0x01F4` decenas) de la tabla `0x1B71`. Se incrementa `stage` (3 -> 4) y se pasa al telon de intro (Estado 4).
+  - **Validacion de paridad bit a bit frente al cartucho (`test_local_rom_stage4_bonus_parity_if_present` y `test_local_rom_stage4_bonus_expiration_if_present`)**:
+    - Prueba 1 (penetracion y cadencia): 140+ ticks verificados con `mismatches = 0`, 47 bloques penetrados y destruidos continuamente (`bricks_left: 161 -> 114`), puntuacion 1,040 y decremento de temporizador observado.
+    - Prueba 2 (expiracion y conservacion de vidas): simulacion con temporizador preparado cerca de cero (`bonus_timer = 2`), verificando 62 ticks de logica, cruce por cero (`bonus_timer = 0`), transicion a Estado 7 y preservacion intacta de vidas (`lives = 4`).
+- **Aserciones de cobertura y suite de pruebas**:
+  - Anadidas aserciones explicitas en `test_local_rom_stage2_parity_if_present` (`stage == 1`, `scroll_flag == 1`, avance y rotacion modular de `row_shift`).
+  - Actualizado `--verify-multi-stage-rules` en `src/main.c` para verificar de forma aislada el descenso vertical por rebote y la cadencia de cuenta atras y transicion sin perdida de vidas en bonus.
+  - Total de pruebas automatizadas: **25 pruebas aprobadas** en ~4.4s.
+
 ## Lo que falta para el juego completo (siguiente paso para continuar)
-1. **Paridad real de Fase 3 (descenso vertical `0x0BC7..0x0C31`)**: capturar y contrastar contra PyBoy la cadencia real de decremento de `row_offset` y su impacto en las colisiones.
-2. **Paridad real de Fases de bonificacion (`0xFFAA = 1`)**: verificar la cuenta atras del HUD (`0x198C..0x1A50`) y la penetracion continua en formaciones densas contra traza real.
-3. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)**.
+1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
+2. **Secuencias de intro y telon de transicion (Estados 1..4)**.
+3. **Mecanica de division de bola / transformacion de pala en fases avanzadas**.
 
 
 

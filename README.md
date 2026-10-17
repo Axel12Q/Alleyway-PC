@@ -3,10 +3,10 @@
 Laboratorio para investigar Alleyway (Game Boy, 1989) y construir una reimplementacion
 nativa verificable en Windows.
 
-Estado actual: **Fase 1 nativa implementada con renderizado de tiles 2bpp y audio APU Canal 1 (waveOut)**
-(cargando tablas, tiles y efectos de sonido en tiempo de ejecucion desde el volcado local del usuario,
-sin recursos comerciales en el repositorio, y verificado bit a bit frente a PyBoy en logica).
-Fases 2..32, fases de bonificacion y canales adicionales APU siguen pendientes.
+Estado actual: **Fases 1, 2, 3 y Fase 4 Bonus nativas verificadas bit a bit frente a PyBoy en logica**,
+con renderizado de tiles 2bpp planar autentico y audio APU Canal 1 (backend waveOut desacoplado e inyectable)
+cargando tablas, tiles y efectos de sonido en tiempo de ejecucion desde el volcado local del usuario,
+sin recursos comerciales en el repositorio. Fases 5..32, canales adicionales APU y secuencias de intro en progreso.
 
 ## Empezar en Windows
 

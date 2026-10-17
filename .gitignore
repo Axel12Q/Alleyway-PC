@@ -1,0 +1,15 @@
+.venv/
+.tools/
+build/
+local/
+__pycache__/
+*.gb
+*.gbc
+*.rom
+*.sav
+*.state
+*.zip
+*.exe
+*.dll
+.env
+.env.*

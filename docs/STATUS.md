@@ -152,33 +152,43 @@
     5. Corte de seguridad ante bloqueos de 5 segundos (máximo 12 ticks acumulados).
     6. Muestreo fraccionario exacto: 738,353 muestras acumuladas en 1,000 fotogramas (cero deriva acumulada).
     7. Conversiones de temporizador bonus HUD: 95 unidades = 3040 ticks = 50.90 segundos.
-- **Temporizadores auténticos de retardo entre estados (`state_timer` en `AlleywayStage1`)**:
-  - Medidos con precisión empírica en el binario del cartucho usando PyBoy:
-    - Estado 4 (Apertura de telón): 67 fotogramas.
-    - Estado 7 (Pérdida de vida normal): 101 fotogramas.
-    - Estado 7 (Caída de bola / expiración en bonus): 228 fotogramas.
-    - Estado 8 (Clear normal): 145 fotogramas.
-    - Estado 8 (Conteo de bonus perfecto): 499 fotogramas.
-    - Estado 11 (Game Over): 358..377 fotogramas.
-  - El motor nativo C soporta `state_timer` tanto para transiciones instantáneas en pruebas de diagnóstico (`state_timer == 0`) como para transiciones temporizadas reales durante la partida.
-- **Presentación auténtica y visualización de banners y telón**:
-  - Efecto de telón en Estado 4: bandas laterales que se abren progresivamente según el tiempo restante del telón (`X = 8..119`).
-  - Banner "GAME OVER" en Estado 11: caja centrada con caracteres decodificados desde la fuente del cartucho (`0x5375 + char * 16`).
-  - Banner "STAGE CLEAR" en Estados 8 y 9: caja con caracteres gráficos auténticos del cartucho.
-- **Pruebas diferenciales en paralelo y verificación de las 32 fases**:
-  - Prueba diferencial en `tests/test_stage1_native.py` (`test_local_rom_progression_scenarios_if_present`):
-    - Game Over: `lives = 0` -> Estado 7 -> Estado 11 (`0x0B`).
-    - Bonus Clear: limpieza perfecta de ladrillos -> Estado 8 -> premio exacto de 500 decenas (+5,000 puntos) -> avance a Fase 5.
-    - Stage 32 Clear: Estado 8 -> Estado 9 (secuencia de final) -> retorno cíclico a Fase 0.
-    - Bonus Ball Drop: caída de bola en fase de bonus -> Estado 7 -> Estado 8 sin perder vidas -> avance a Fase 5 con vidas intactas.
-  - Verificación exhaustiva de las 32 fases en ROM (`test_all_32_stage_descriptors_and_advanced_rounds_regression`):
-    - Validación de los 32 descriptores en `0x1BE1 + s*3`, comprobando la alternancia exacta de los 4 tipos en cada una de las 8 rondas (8x Tipo A estáticas, 8x Tipo B móviles con patrones 0..7 en `0x4075`, 8x Tipo C de 40 filas con descenso por rebote, y 8x Tipo D de bonificación con 20 filas).
-    - Regresiones puntuales para fases avanzadas: Fase 8 (Bonus corazón, 162 bloques en `0x3695`), Fase 14 (Desplazamiento horizontal, 108 bloques en `0x1EE7`), Fase 23 (Descenso vertical, 300 bloques en `0x2EE9`).
-- **Estado de la suite de pruebas**: **30 pruebas automatizadas aprobadas** en 2.38s.
+- **Temporizadores de retardo entre estados (`state_timer` en `AlleywayStage1`) — Corrección en Hito 11**:
+  - *Rectificación de auditoría sobre Hito 10 (`242706a`)*: En `242706a`, `state_timer` fue declarado y decrementado pero nunca se inicializaba al entrar a los estados (`4`, `7`, `8`, `0x0B`), y el paso `state 8 -> state 4` se sobrescribía con `state 5` en el mismo tick; además, las dos pruebas añadidas en `tests/test_stage1_native.py` (`test_original_only_progression_ram_facts_if_present` y `test_rom_stage_descriptor_layout_if_present`, antes nombradas `test_local_rom_progression_scenarios_if_present` y `test_all_32_stage_descriptors_and_advanced_rounds_regression`) solo inspeccionaban la RAM de PyBoy y los descriptores de la ROM respectivamente, sin ejecutar el binario C nativo. Todo ello quedó corregido y verificado diferencialmente en el Hito 11.
+- **Presentación visual adaptada (banners y telón)**:
+  - *Distinción explícita entre medición del cartucho y adaptación visual*: Los conteos de fotogramas de los estados (`4`, `7`, `8`, `11`) provienen de mediciones empíricas por fotograma en el cartucho original. La representación visual en el ejecutable Win32 (bandas laterales que se abren en Estado 4 y recuadros centrados "GAME OVER" / "STAGE CLEAR" usando los tiles de fuente de `0x5375`) es una **adaptación de presentación**, no una reproducción de las listas OAM/BG internas de las rutinas de intermedio del original.
+
+### Hito 11: Inicialización compartida de `state_timer`, ejecutor nativo `--run-scenario` y verificación diferencial real PyBoy vs C (`tools/scenario_diff.py`)
+- **Entrada unificada a estados y temporizadores reales de producción (`src/main.c`)**:
+  - Implementada la función compartida `stage1_enter_state(AlleywayStage1 *s, uint8_t new_state)` como único punto de entrada a cualquier estado (`1`, `2`, `4`, `5`, `6`, `7`, `8`, `9`, `0x0B`, `0x0C`), inicializando `state_timer` una sola vez al entrar y eliminando cualquier ruta o backdoor `state_timer == 0` en pruebas o producción.
+  - Eliminada la sobrescritura inmediata `state 8 -> state 4 -> state 5`: al terminar `state 8`, el motor entra en `state 4` durante `DUR_CURTAIN = 67` fotogramas, recarga la matriz de bloques cuando restan `CURTAIN_GRID_LOAD_REMAINING = 63` fotogramas (4 fotogramas después de entrar a `state 4`, igualando el momento exacto en que el cartucho limpia `0xFFAA` y carga el mapa siguiente), y solo al agotar los 67 fotogramas invoca `stage1_begin_serve` (`state 5`).
+  - Eliminado el atajo interactivo que permitía saltar estados temporizados (`4`, `7`, `8`, `11`) pulsando `A` o `Start` mientras `state_timer > 0`.
+  - Actualizados `--verify-autonomous-clock` y `--verify-multi-stage-rules` para usar `stage1_enter_state` y recorrer los temporizadores reales mediante `ticks_until_state_change` sin poner `state_timer = 0`.
+- **Mediciones empíricas por fotograma en el cartucho original (PyBoy) vs motor nativo C**:
+  - **Normal Stage Clear (`normal_clear`)**: `state 6` -> al romper el último bloque entra en `state 8` durante **144 fotogramas** (`DUR_CLEAR = 144`, no 145) -> `state 4` (telón, `stage: 0 -> 1`) durante **67 fotogramas** (`DUR_CURTAIN = 67`) -> `state 5` (saque).
+  - **Caída de bola en fase de bonus (`bonus_drop`)**: `state 6` -> al caer la bola bajo el fondo entra en `state 7` durante **228 fotogramas** (`DUR_BONUS_END = 228`) -> **transiciona directamente a `state 4` durante 67 fotogramas (`stage: 3 -> 4`, vidas intactas `lives = 4`) -> `state 5`**. *Corrección clave*: un bonus incompleto (por caída o tiempo agotado) **NUNCA pasa por `state 8`** en el cartucho original; `bonus_flag` (`0xFFAA`) permanece en `1` durante los primeros 4 fotogramas de `state 4` hasta que se carga la siguiente fase (`CURTAIN_GRID_LOAD_REMAINING = 63`).
+  - **Expiración de temporizador de bonus (`bonus_expire`)**: cuando `bonus_timer` cruza a `0` en `state 6`, entra en `state 7` durante **228 fotogramas** -> **directamente a `state 4` durante 67 fotogramas (`stage: 3 -> 4`, `lives = 4`) -> `state 5`** (sin pasar por `state 8`).
+  - **Bonus perfecto (`bonus_perfect`)**: al romper el último ladrillo de una fase de bonus (`bricks_left == 0`), entra en `state 8` durante **498 fotogramas** (`DUR_BONUS_TALLY = 498`, no 499). Durante los primeros 448 fotogramas el marcador conserva los puntos del bloque roto (`score_tens = 2`); durante los últimos **50 fotogramas** (`state_timer < 50`), el cartucho suma progresivamente **`+10` decenas por fotograma** (`50 * 10 = +500` decenas = `+5,000` puntos en Ronda 0, otorgados una única vez) -> `state 4` (**67 fotogramas**, `stage: 3 -> 4`, `bonus_flag` se limpia en el 5.º fotograma de `state 4`) -> `state 5`.
+  - **Pérdida de vida normal con vidas restantes (`life_lost`)**: al caer la bola en fase normal con `lives = 4`, entra en `state 7` durante **100 fotogramas** (`DUR_DEATH = 100`, no 101) -> entra por **1 fotograma transitorio en `state 11` (`0x0B`, `DUR_LIFE_LOST_TRANSIENT = 1`)** donde decrementa `lives: 4 -> 3` -> pasa a `state 5` (saque).
+  - **Game Over sin vidas restantes (`game_over`)**: al caer la bola con `lives == 0`, entra en `state 7` durante **100 fotogramas** -> `state 11` (`0x0B`) durante **377 fotogramas** (`DUR_GAME_OVER = 377`) -> `state 1` durante **1 fotograma** (`DUR_TITLE_ENTRY = 1`) -> `state 2` (espera en pantalla de título).
+  - **Vidas iniciales (`0xCA44`)**: al iniciar partida desde título, `0xCA44` vale **4** en el primer saque (corregido en `stage1_reset`).
+- **Herramienta y suite diferencial real PyBoy vs ejecutable C (`--run-scenario`, `tools/scenario_diff.py`, `tests/test_scenario_diff.py`)**:
+  - Añadido modo `--run-scenario <rom> <scenario.jsonl>` en `src/main.c`: inicializa el estado desde la instantánea de la línea 1 (en estado 5 o 6) y ejecuta `stage1_step_tick` autónomamente alimentando únicamente `in_joyp_raw` e `in_joyp_edge` por fotograma, emitiendo el flujo JSONL de salida.
+  - `tools/scenario_diff.py` prepara el escenario en PyBoy (documentando cada dirección de RAM inyectada en `injections`), graba la traza de PyBoy fotograma a fotograma, invoca `build/alleyway-lab.exe --run-scenario` con el mismo archivo de entrada y compara tick a tick `state`, `stage`, `lives`, `score_tens`, `bonus_flag`, `bonus_timer` y `prng`, además de las longitudes exactas de cada racha de estados (`state_runs`).
+  - **Resultados de los 6 escenarios diferenciales (`tests/test_scenario_diff.py`)**:
+    1. `normal_clear` (360 ticks): `6x104 -> 8x144 -> 4x67 -> 5x45`, `0 mismatches` (incluyendo `prng`).
+    2. `bonus_drop` (430 ticks): `6x67 -> 7x228 -> 4x67 -> 5x68`, `0 mismatches` (incluyendo `prng`).
+    3. `bonus_expire` (410 ticks): `6x62 -> 7x228 -> 4x67 -> 5x53`, `0 mismatches` (incluyendo `prng`).
+    4. `bonus_perfect` (620 ticks): `5x2 -> 6x12 -> 8x498 -> 4x67 -> 5x41`, `0 mismatches` (incluyendo conteo progresivo de 50 pasos de `+10` decenas y `prng`).
+    5. `life_lost` (220 ticks): `6x67 -> 7x100 -> 11x1 -> 5x52`, `0 mismatches` en `state`, `stage`, `lives`, `score_tens`, `bonus_flag`, `bonus_timer`. Divergencia conocida y documentada en `prng`: tras `7 -> 11 -> 5` el motor C queda 1 paso de LFSR por delante del original (`tick 102: expected 81, native 146`), registrada explícitamente con `@unittest.expectedFailure` en `test_life_lost_prng_matches_original`.
+    6. `game_over` (580 ticks): `6x67 -> 7x100 -> 11x377 -> 1x1 -> 2x35`, `0 mismatches` (incluyendo `prng`).
+  - **Prueba de mutación (`test_mutation_without_timer_initialisation_fails_differential`)**: corrompe `state_timer = 0` tras la transición en el flujo nativo y demuestra que el comparador diferencial detecta inmediatamente el fallo en el `tick 105` (`state: expected=8, native=4`), impidiendo que regresiones de temporizador pasen desapercibidas.
+- **Estado de la suite de pruebas**: **38 pruebas automatizadas aprobadas** (incluyendo 1 `expectedFailure` documentado sobre el paso extra de `prng` tras `life_lost`).
 
 ## Lo que falta para el juego completo (siguiente paso para continuar)
 1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulación por software de barridos de tono (`0x6B76`/`0x6B8B`).
-2. **Pantalla de título completa (Estado 2, "PUSH START KEY") y animación del telón con Mario (Estados 0..4)**.
+2. **Pantalla de título completa (Estado 2, "PUSH START KEY") y animación del telón con Mario (Estados 0..4 / Estado 9)**.
+3. **Ajuste exacto del paso de PRNG (`0xFFA1`) en la transición `state 7 -> 11 -> 5` (`life_lost`)** para eliminar el `expectedFailure` restante.
+
 
 
 

@@ -683,8 +683,10 @@ class NativeStage1VerifierTests(unittest.TestCase):
         self.assertIn("game over reset", proc.stdout)
         self.assertIn("bonus reward", proc.stdout)
 
-    def test_local_rom_progression_scenarios_if_present(self):
-        """Verify full progression lifecycle against PyBoy: Game Over, Ending, Bonus reward, Stage wrap."""
+    def test_original_only_progression_ram_facts_if_present(self):
+        """ORIGINAL-ONLY observations (PyBoy RAM). This test does NOT execute the C port: it only
+        records facts about the cartridge (Game Over state, bonus reward, stage 32 wrap). The
+        ORIGINAL-vs-NATIVE comparison lives in tests/test_scenario_diff.py."""
         local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
         if not local_rom.is_file():
             self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
@@ -782,8 +784,10 @@ class NativeStage1VerifierTests(unittest.TestCase):
         proc = subprocess.run([str(EXE_PATH), "--verify-scheduler-timing"], check=True, capture_output=True, text=True)
         self.assertIn("PASS: scheduler monotonic timing and fractional audio verified", proc.stdout)
 
-    def test_all_32_stage_descriptors_and_advanced_rounds_regression(self):
-        """Verify ROM descriptors for all 32 stages: 8 rounds x 4 types (A, B, C, D) and advanced layouts."""
+    def test_rom_stage_descriptor_layout_if_present(self):
+        """ROM DATA INSPECTION ONLY: decodes the 32 stage descriptors/maps from the local ROM and
+        checks their structure (8 rounds x types A/B/C/D) and a few map pointers. It does NOT
+        execute the port, so it is not a regression test of advanced-stage behaviour."""
         local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
         if not local_rom.is_file():
             self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
@@ -841,7 +845,7 @@ class NativeStage1VerifierTests(unittest.TestCase):
         self.assertEqual(stage_types.count('C'), 8)
         self.assertEqual(stage_types.count('D'), 8)
 
-        # Regressions for specific advanced rounds:
+        # Pointer sanity checks for specific advanced rounds (data only, port not executed):
         # Stage 8 (Round 2 Bonus, Heart shape): map_ptr 0x3695, 162 bricks
         desc8 = 0x1BE1 + 7 * 3
         map8 = rom[desc8 + 1] | (rom[desc8 + 2] << 8)

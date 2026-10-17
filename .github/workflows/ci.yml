@@ -1,0 +1,34 @@
+name: CI (Synthetic Fixtures)
+
+on:
+  push:
+    branches:
+      - main
+      - "antigravity/**"
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 and uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        run: |
+          uv venv
+          uv pip sync requirements-dev.lock
+
+      - name: Build native executable and run smoke test
+        run: |
+          .\.venv\Scripts\python.exe tools/build.py
+          .\build\alleyway-lab.exe --smoke-test
+
+      - name: Run synthetic unit test suite
+        run: |
+          .\.venv\Scripts\python.exe -m unittest discover -s tests -v

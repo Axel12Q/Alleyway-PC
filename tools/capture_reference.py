@@ -1,4 +1,4 @@
-"""Capture deterministic reference frames and per-frame traces from a ROM."""
+"""Capture deterministic reference frames and per-frame/per-logic-tick traces from a ROM."""
 import argparse
 import hashlib
 import json
@@ -88,7 +88,7 @@ def parse_watch_spec(watch_spec: dict[str, str] | None) -> dict[str, dict[str, A
 
         width = 2 if fmt in ("u16le", "u16be") else 1
         if address < 0 or (address + width - 1) > 0xFFFF:
-            raise ValueError(f"Watchpoint {name!r}: address { hex(address) } out of 16-bit memory range")
+            raise ValueError(f"Watchpoint {name!r}: address {hex(address)} out of 16-bit memory range")
 
         parsed[name] = {
             "address": address,
@@ -131,12 +131,26 @@ def parse_cli_watch_args(watch_items: list[str] | None, watch_file: Path | None)
     return combined
 
 
+def parse_logic_hooks_arg(raw: str | None) -> tuple[int, int] | None:
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) != 2:
+        raise ValueError("Expected --logic-hooks START_ADDR:END_ADDR (e.g. 0x051F:0x0525)")
+    start_addr = int(parts[0], 0)
+    end_addr = int(parts[1], 0)
+    if not (0 <= start_addr <= 0x7FFF and 0 <= end_addr <= 0x7FFF):
+        raise ValueError("Logic hook addresses must be in ROM range 0x0000..0x7FFF")
+    return (start_addr, end_addr)
+
+
 def run_capture(
     rom_path: Path,
     frames: int = 120,
     inputs: list[dict[str, Any]] | None = None,
     watch_spec: dict[str, str] | None = None,
     out_dir: Path | None = None,
+    logic_hooks: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """Run a deterministic PyBoy capture and write screen.ppm, trace.jsonl, and capture.json."""
     if not rom_path.is_file():
@@ -170,11 +184,39 @@ def run_capture(
 
     held_buttons: set[str] = set()
     trace_lines: list[str] = []
+    logic_lines: list[str] = []
+    current_frame_ref = [0]
+    latched_inputs_ref = [0xFF, 0xFF]
 
     gb = PyBoy(str(rom_path), window="null", sound_emulated=False)
     try:
         gb.set_emulation_speed(0)
+        if logic_hooks is not None:
+            start_pc, end_pc = logic_hooks
+
+            def _on_logic_start(ctx: Any) -> None:
+                latched_inputs_ref[0] = int(ctx.memory[0xFF8C])
+                latched_inputs_ref[1] = int(ctx.memory[0xFF8D])
+
+            def _on_logic_end(ctx: Any) -> None:
+                w_vals = {
+                    wname: read_watch_value(ctx.memory, wdesc["address"], wdesc["type"])
+                    for wname, wdesc in parsed_watches.items()
+                }
+                tick_rec = {
+                    "tick": len(logic_lines),
+                    "frame": current_frame_ref[0],
+                    "in_joyp_raw": latched_inputs_ref[0],
+                    "in_joyp_edge": latched_inputs_ref[1],
+                    "watch": w_vals,
+                }
+                logic_lines.append(json.dumps(tick_rec, sort_keys=True, separators=(",", ":")))
+
+            gb.hook_register(0, start_pc, _on_logic_start, gb)
+            gb.hook_register(0, end_pc, _on_logic_end, gb)
+
         for frame_idx in range(frames):
+            current_frame_ref[0] = frame_idx
             frame_events = events_by_frame.get(frame_idx, [])
             applied_labels: list[str] = []
             for ev in frame_events:
@@ -232,6 +274,12 @@ def run_capture(
     trace_sha256 = hashlib.sha256(trace_payload.encode("utf-8")).hexdigest()
     screen_sha256 = hashlib.sha256(rgba.tobytes()).hexdigest()
 
+    logic_trace_sha256 = None
+    if logic_hooks is not None:
+        logic_payload = "\n".join(logic_lines) + ("\n" if logic_lines else "")
+        (out_dir / "logic_trace.jsonl").write_text(logic_payload, encoding="utf-8")
+        logic_trace_sha256 = hashlib.sha256(logic_payload.encode("utf-8")).hexdigest()
+
     capture_metadata = {
         "schema_version": 2,
         "rom_sha256": digest,
@@ -241,6 +289,9 @@ def run_capture(
         "inputs": normalized_inputs,
         "inputs_sha256": inputs_sha256,
         "watch_spec": {k: v["spec"] for k, v in parsed_watches.items()},
+        "logic_hooks": [f"0x{logic_hooks[0]:04X}", f"0x{logic_hooks[1]:04X}"] if logic_hooks else None,
+        "logic_ticks": len(logic_lines) if logic_hooks else None,
+        "logic_trace_sha256": logic_trace_sha256,
         "pyboy_version": version("pyboy"),
         "screen_sha256": screen_sha256,
         "ppm_sha256": hashlib.sha256(ppm_bytes).hexdigest(),
@@ -283,6 +334,12 @@ def main() -> None:
         help="Optional JSON file mapping watchpoint names to '0xADDR[:type]'",
     )
     parser.add_argument(
+        "--logic-hooks",
+        type=str,
+        default=None,
+        help="Optional START_PC:END_PC hooks to record atomic logic ticks into logic_trace.jsonl (e.g. 0x051F:0x0525)",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=None,
@@ -297,12 +354,14 @@ def main() -> None:
         if args.inputs is not None:
             inputs_data = json.loads(args.inputs.read_text(encoding="utf-8"))
         watch_spec = parse_cli_watch_args(args.watch, args.watch_file)
+        logic_hooks = parse_logic_hooks_arg(args.logic_hooks)
         result = run_capture(
             rom_path=args.rom,
             frames=args.frames,
             inputs=inputs_data,
             watch_spec=watch_spec,
             out_dir=args.out_dir,
+            logic_hooks=logic_hooks,
         )
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
         parser.exit(1, f"Error: {error}\n")

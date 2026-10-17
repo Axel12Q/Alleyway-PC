@@ -1,20 +1,755 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdint.h>
-#include <string.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-/* Infrastructure diagnostic only. No original game logic or graphics. */
+/*
+ * Alleyway PC research & native Stage 1 verifier/player.
+ *
+ * No commercial ROM bytes, graphics, or level data are embedded in this file.
+ * Stage 1 tables and brick layout are loaded at runtime from the user's local
+ * 32 KiB ROM dump (or from an in-memory synthetic test fixture during --smoke-test).
+ */
+
+#define ROM_SIZE_BYTES 32768
+#define GRID_ROWS 60
+#define GRID_COLS 14
+#define GRID_CELLS (GRID_ROWS * GRID_COLS)
+
 static uint32_t pixels[144][160];
+static const uint32_t DMG_SHADES[4] = {0xe0f8d0, 0x88c070, 0x346856, 0x081820};
+
+typedef struct {
+    uint8_t rom[ROM_SIZE_BYTES];
+    bool rom_loaded;
+    uint8_t state;
+    uint8_t prng;
+    uint8_t paddle_x;
+    uint8_t paddle_y;
+    uint8_t paddle_w;
+    uint8_t paddle_shrunk;
+    uint8_t ball_y;
+    uint8_t ball_y_sub;
+    uint8_t ball_x;
+    uint8_t ball_x_sub;
+    uint16_t ball_vy;
+    uint16_t ball_vx;
+    uint8_t ball_prev_y;
+    uint8_t ball_prev_x;
+    uint8_t speed_idx;
+    uint8_t paddle_hits;
+    uint8_t scroll_timer;
+    uint8_t scroll_step;
+    uint8_t indestructible_hits;
+    uint16_t bricks_left;
+    uint16_t score_tens;
+    uint16_t high_score_tens;
+    uint8_t lives;
+    uint8_t stage;
+    uint8_t bonus_flag;
+    uint8_t scroll_flag;
+    uint8_t total_rows;
+    uint8_t row_offset;
+    uint8_t prev_joyp_raw;
+    uint8_t grid_type[GRID_CELLS];
+    uint8_t grid_hp[GRID_CELLS];
+} AlleywayStage1;
+
+static AlleywayStage1 g_sim;
+static bool g_key_left = false;
+static bool g_key_right = false;
+static bool g_key_a = false;
+static bool g_key_b = false;
+static bool g_key_start = false;
+
+static uint16_t neg16(uint16_t val) {
+    return (uint16_t)(((val ^ 0xFFFFu) + 1u) & 0xFFFFu);
+}
+
+static void load_stage_grid(AlleywayStage1 *s) {
+    memset(s->grid_type, 0, sizeof(s->grid_type));
+    memset(s->grid_hp, 0, sizeof(s->grid_hp));
+    uint16_t desc_addr = (uint16_t)(0x1BE1u + (uint16_t)s->stage * 3u);
+    if (desc_addr + 2u >= ROM_SIZE_BYTES) return;
+    uint16_t map_ptr = (uint16_t)s->rom[desc_addr + 1u] | ((uint16_t)s->rom[desc_addr + 2u] << 8);
+    int idx = 0;
+    int rows = 0;
+    uint16_t destructible = 0;
+    while (map_ptr + GRID_COLS <= ROM_SIZE_BYTES && s->rom[map_ptr] != 0xFF && idx + GRID_COLS <= GRID_CELLS) {
+        for (int c = 0; c < GRID_COLS; ++c) {
+            uint8_t t = s->rom[map_ptr + (uint16_t)c];
+            s->grid_type[idx + c] = t;
+            if (t != 0) {
+                uint16_t prop_addr = (uint16_t)(0x1B87u + (uint16_t)(t - 1u) * 6u + 3u);
+                uint8_t hp = (prop_addr < ROM_SIZE_BYTES) ? (uint8_t)(s->rom[prop_addr] & 0x0Fu) : 1u;
+                s->grid_hp[idx + c] = hp;
+                if (hp != 0) {
+                    destructible++;
+                }
+            }
+        }
+        map_ptr = (uint16_t)(map_ptr + GRID_COLS);
+        idx += GRID_COLS;
+        rows++;
+    }
+    s->total_rows = (uint8_t)rows;
+    s->row_offset = (rows >= 20) ? (uint8_t)(rows - 20) : 0u;
+    s->bricks_left = destructible;
+}
+
+static void stage1_reset_for_play(AlleywayStage1 *s) {
+    s->state = 5;
+    s->prng = 43;
+    s->paddle_x = 0x28;
+    s->paddle_y = 0x90;
+    s->paddle_w = 0x18;
+    s->paddle_shrunk = 0;
+    s->ball_y = 0;
+    s->ball_y_sub = 0;
+    s->ball_x = 0;
+    s->ball_x_sub = 0;
+    s->ball_vy = 0;
+    s->ball_vx = 0;
+    s->ball_prev_y = 0;
+    s->ball_prev_x = 0;
+    s->speed_idx = 0;
+    s->paddle_hits = 0;
+    s->scroll_timer = 0;
+    s->scroll_step = 0;
+    s->indestructible_hits = 0;
+    s->score_tens = 0;
+    if (s->high_score_tens < 200) s->high_score_tens = 200;
+    s->lives = 3;
+    s->stage = 0;
+    s->bonus_flag = 0;
+    s->scroll_flag = 0;
+    s->prev_joyp_raw = 0xFF;
+    load_stage_grid(s);
+}
+
+static uint8_t step_prng(AlleywayStage1 *s) {
+    s->prng = (uint8_t)((s->prng + 0x41u) & 0xFFu);
+    return s->prng;
+}
+
+static void load_speed_vector(const AlleywayStage1 *s, uint8_t speed_one_based, uint8_t angle_idx,
+                              uint16_t *out_vy, uint16_t *out_vx) {
+    if (speed_one_based == 0) speed_one_based = 1;
+    uint16_t ptr_addr = (uint16_t)(0x11EEu + (uint16_t)(speed_one_based - 1u) * 2u);
+    uint16_t table_ptr = (uint16_t)s->rom[ptr_addr] | ((uint16_t)s->rom[ptr_addr + 1u] << 8);
+    uint16_t entry = (uint16_t)(table_ptr + (uint16_t)angle_idx * 4u);
+    *out_vy = ((uint16_t)s->rom[entry] << 8) | (uint16_t)s->rom[entry + 1u];
+    *out_vx = ((uint16_t)s->rom[entry + 2u] << 8) | (uint16_t)s->rom[entry + 3u];
+}
+
+static void reindex_velocity_random_angle(AlleywayStage1 *s) {
+    uint8_t rnd = (uint8_t)(step_prng(s) & 0x07u);
+    uint8_t angle_idx = s->rom[0x100Bu + rnd];
+    uint16_t vy = 0, vx = 0;
+    load_speed_vector(s, s->speed_idx, angle_idx, &vy, &vx);
+    if (s->ball_vy & 0x8000u) vy = neg16(vy);
+    s->ball_vy = vy;
+    if (s->ball_vx & 0x8000u) vx = neg16(vx);
+    s->ball_vx = vx;
+}
+
+static void update_paddle(AlleywayStage1 *s, uint8_t joyp_raw) {
+    int speed = 3;
+    if ((joyp_raw & 0x01u) == 0) {
+        speed = 5;
+    } else if ((joyp_raw & 0x02u) == 0) {
+        speed = 1;
+    }
+    uint8_t dpad = (uint8_t)((joyp_raw ^ 0xFFu) & 0x30u);
+    if (dpad == 0) return;
+    if (dpad & 0x20u) {
+        int nx = (int)s->paddle_x - speed;
+        if (nx < 0x0F) nx = 0x0F;
+        s->paddle_x = (uint8_t)nx;
+    } else {
+        int limit = 0x7F - (int)s->paddle_w;
+        int nx = (int)s->paddle_x + speed;
+        if (nx >= limit) nx = limit;
+        s->paddle_x = (uint8_t)nx;
+    }
+}
+
+static void serve_ball(AlleywayStage1 *s) {
+    s->paddle_hits = 0;
+    s->indestructible_hits = 0;
+    if (s->scroll_step < 0x0Au) {
+        uint8_t c = s->scroll_step;
+        s->scroll_step = (uint8_t)(s->scroll_step + 1u);
+        s->scroll_timer = s->rom[0x1B7Du + c];
+    } else {
+        s->scroll_timer = 1u;
+    }
+
+    s->ball_y_sub = 0;
+    s->ball_x_sub = 0;
+    s->speed_idx = 3;
+    if (s->bonus_flag != 0 || s->bricks_left < 0x28u) {
+        s->speed_idx = 7;
+    }
+
+    uint8_t offset_b = 0x18u;
+    uint8_t half_w = (uint8_t)(s->paddle_w >> 1);
+    if ((uint8_t)(s->paddle_x + half_w) >= 0x48u) {
+        offset_b = 0xE8u;
+    }
+    uint8_t bx = (uint8_t)(s->paddle_x + offset_b + half_w);
+    s->ball_x = bx;
+    s->ball_prev_x = bx;
+    uint8_t by = (uint8_t)(0x8Cu - 0x18u);
+    s->ball_y = by;
+    s->ball_prev_y = by;
+
+    uint16_t vy = 0, vx = 0;
+    load_speed_vector(s, 1, 9, &vy, &vx);
+    s->ball_vy = vy;
+    if (offset_b < 0x80u) {
+        vx = neg16(vx);
+    }
+    s->ball_vx = vx;
+    s->state = 6;
+}
+
+static void snap_y_positive(AlleywayStage1 *s) {
+    uint8_t rem = (uint8_t)(s->ball_y & 0x03u);
+    if (rem == 0) return;
+    s->ball_y = (uint8_t)((s->ball_y & 0xFCu) - rem + 1u);
+}
+
+static void snap_y_negative(AlleywayStage1 *s) {
+    uint8_t rem = (uint8_t)(s->ball_y & 0x03u);
+    if (rem == 0) return;
+    s->ball_y = (uint8_t)((s->ball_y & 0xFCu) + 8u - rem - 1u);
+}
+
+static void snap_x_positive(AlleywayStage1 *s) {
+    uint8_t b = (s->ball_x & 0x04u) ? 0x04u : 0xFCu;
+    uint8_t a = (uint8_t)((s->ball_x & 0xF8u) + b);
+    if (a < 0x10u) a = 0x10u;
+    s->ball_x = a;
+}
+
+static void snap_x_negative(AlleywayStage1 *s) {
+    uint8_t a = (uint8_t)((s->ball_x & 0xF8u) + 8u);
+    if (a >= 0x7Cu) a = 0x7Cu;
+    s->ball_x = a;
+}
+
+static void bounce_vertical(AlleywayStage1 *s) {
+    if ((s->ball_vy & 0x8000u) == 0) {
+        snap_y_positive(s);
+    } else {
+        snap_y_negative(s);
+    }
+    s->ball_vy = neg16(s->ball_vy);
+    s->ball_prev_y = s->ball_y;
+}
+
+static void bounce_horizontal(AlleywayStage1 *s) {
+    if ((s->ball_vx & 0x8000u) == 0) {
+        snap_x_positive(s);
+    } else {
+        snap_x_negative(s);
+    }
+    s->ball_vx = neg16(s->ball_vx);
+    s->ball_prev_x = s->ball_x;
+}
+
+static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe) {
+    uint8_t scroll_y = (uint8_t)((s->row_offset << 2) & 0xFFu);
+    uint8_t a1 = (uint8_t)(y_probe - 0x18u);
+    uint16_t a2_full = (uint16_t)a1 + (uint16_t)scroll_y;
+    if (a2_full > 0xFFu) return 0;
+    uint8_t row = (uint8_t)((a2_full & 0xFFu) >> 2);
+    if (row >= GRID_ROWS) return 0;
+
+    uint8_t x_rel = (uint8_t)(x_probe - 0x10u);
+    if (x_rel >= 0x70u) x_rel = (uint8_t)(x_rel - 0x70u);
+    uint8_t col = (uint8_t)(x_rel >> 3);
+    if (col >= GRID_COLS) return 0;
+
+    int idx = (int)row * GRID_COLS + (int)col;
+    uint8_t btype = s->grid_type[idx];
+    if (btype == 0) return 0;
+
+    uint8_t min_spd = s->rom[0x1B87u + (uint16_t)(btype - 1u) * 6u + 4u];
+    if (min_spd != 0 && s->speed_idx < min_spd) {
+        s->speed_idx = min_spd;
+        reindex_velocity_random_angle(s);
+    }
+
+    uint8_t hp = s->grid_hp[idx];
+    if (hp == 0) {
+        s->indestructible_hits = (uint8_t)(s->indestructible_hits + 1u);
+        if (s->indestructible_hits >= 0x0Au) {
+            reindex_velocity_random_angle(s);
+            s->indestructible_hits = 0;
+        }
+        return 1;
+    }
+
+    if (s->bonus_flag == 0) {
+        hp--;
+        s->grid_hp[idx] = hp;
+        if (hp != 0) return 0;
+    }
+
+    s->grid_type[idx] = 0;
+    uint8_t pts = (uint8_t)((s->rom[0x1B87u + (uint16_t)(btype - 1u) * 6u + 3u] >> 4) & 0x0Fu);
+    uint32_t new_score = (uint32_t)s->score_tens + (uint32_t)pts;
+    s->score_tens = (new_score > 0xFFFFu) ? 0xFFFFu : (uint16_t)new_score;
+    if (s->score_tens > s->high_score_tens) {
+        s->high_score_tens = s->score_tens;
+    }
+    if (s->bricks_left > 0) {
+        s->bricks_left--;
+    }
+    if (s->bricks_left == 0) {
+        s->state = 8;
+    }
+    if (s->bonus_flag != 0) return 0;
+    return 1;
+}
+
+static void step_ball_and_collisions(AlleywayStage1 *s) {
+    s->ball_prev_y = s->ball_y;
+    uint16_t y16 = (uint16_t)((((uint16_t)s->ball_y << 8) | (uint16_t)s->ball_y_sub) + s->ball_vy);
+    s->ball_y = (uint8_t)(y16 >> 8);
+    s->ball_y_sub = (uint8_t)(y16 & 0xFFu);
+
+    s->ball_prev_x = s->ball_x;
+    uint16_t x16 = (uint16_t)((((uint16_t)s->ball_x << 8) | (uint16_t)s->ball_x_sub) + s->ball_vx);
+    s->ball_x = (uint8_t)(x16 >> 8);
+    s->ball_x_sub = (uint8_t)(x16 & 0xFFu);
+
+    /* Paddle collision (0x0CB1..0x0CE0) */
+    if ((s->ball_vy & 0x8000u) == 0) {
+        uint8_t c = (uint8_t)(s->ball_y - 0x8Du);
+        if (s->ball_y >= 0x8Du && c < 8u) {
+            uint8_t d = (uint8_t)(s->paddle_w + 5u);
+            uint8_t b = (uint8_t)(s->paddle_x - 3u);
+            uint8_t rel_x = (uint8_t)(s->ball_x - b);
+            if (s->ball_x >= b && rel_x < d) {
+                uint8_t zone = (uint8_t)(rel_x >> 1);
+                if (c < 7u) {
+                    uint16_t table_base = (s->paddle_shrunk == 0) ? 0x1B41u : 0x1B51u;
+                    uint8_t angle_idx = s->rom[table_base + zone];
+                    uint16_t vy = 0, vx = 0;
+                    load_speed_vector(s, s->speed_idx, angle_idx, &vy, &vx);
+                    s->ball_vy = neg16(vy);
+                    uint8_t mid = (s->paddle_shrunk == 0) ? 8u : 6u;
+                    if (zone < mid) {
+                        vx = neg16(vx);
+                    }
+                    s->ball_vx = vx;
+
+                    s->scroll_timer = (uint8_t)(s->scroll_timer - 1u);
+                    if (s->scroll_timer == 0) {
+                        if (s->scroll_step < 0x0Au) {
+                            uint8_t sc = s->scroll_step;
+                            s->scroll_step = (uint8_t)(s->scroll_step + 1u);
+                            s->scroll_timer = s->rom[0x1B7Du + sc];
+                        } else {
+                            s->scroll_timer = 1u;
+                        }
+                    }
+                } else {
+                    bounce_horizontal(s);
+                }
+            }
+        }
+    }
+
+    /* Top ceiling and bottom out-of-bounds (0x0CE1..0x0D14) */
+    if (s->ball_y < 0x18u) {
+        if (s->bonus_flag == 0 && s->paddle_shrunk == 0) {
+            s->paddle_shrunk = 1;
+            s->paddle_w = 0x10;
+            s->paddle_x = (uint8_t)(s->paddle_x + 4u);
+        }
+        bounce_vertical(s);
+    } else if (s->ball_y >= 0xA0u) {
+        s->state = 7;
+        return;
+    }
+
+    /* Left and right walls (0x0D15..0x0D26) */
+    if (s->ball_x < 0x10u || s->ball_x >= 0x7Cu) {
+        bounce_horizontal(s);
+    }
+
+    /* Brick grid collisions (0x0D27..0x0E8C) */
+    if (s->ball_y >= 0x88u) return;
+
+    for (int pass = 0; pass < 2; ++pass) {
+        int hits = 0;
+        if ((s->ball_vx & 0x8000u) == 0) {
+            if (check_brick_point(s, s->ball_prev_y, (uint8_t)(s->ball_x + 3u))) {
+                hits++;
+                bounce_horizontal(s);
+            } else if (check_brick_point(s, s->ball_prev_y, s->ball_x)) {
+                hits++;
+                if ((s->ball_vx & 0x8000u) != 0) snap_x_positive(s);
+                else snap_x_negative(s);
+            }
+        } else {
+            if (check_brick_point(s, s->ball_prev_y, s->ball_x)) {
+                hits++;
+                bounce_horizontal(s);
+            } else if (check_brick_point(s, s->ball_prev_y, (uint8_t)(s->ball_x + 3u))) {
+                hits++;
+                if ((s->ball_vx & 0x8000u) != 0) snap_x_positive(s);
+                else snap_x_negative(s);
+            }
+        }
+
+        if ((s->ball_vy & 0x8000u) == 0) {
+            if (check_brick_point(s, (uint8_t)(s->ball_y + 3u), s->ball_prev_x)) {
+                hits++;
+                bounce_vertical(s);
+            } else if (check_brick_point(s, s->ball_y, s->ball_prev_x)) {
+                hits++;
+            }
+        } else {
+            if (check_brick_point(s, s->ball_y, s->ball_prev_x)) {
+                hits++;
+                bounce_vertical(s);
+            } else if (check_brick_point(s, (uint8_t)(s->ball_y + 3u), s->ball_prev_x)) {
+                hits++;
+            }
+        }
+
+        if (pass == 0 && hits == 0) break;
+    }
+}
+
+static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
+    if (s->state == 5) {
+        update_paddle(s, joyp_raw);
+        if ((joyp_edge & 0x01u) == 0) {
+            serve_ball(s);
+        }
+    } else if (s->state == 6) {
+        step_ball_and_collisions(s);
+        update_paddle(s, joyp_raw);
+        if ((joyp_edge & 0x08u) == 0) {
+            s->state = 0x0C; /* Pause */
+        }
+    } else if (s->state == 0x0C) {
+        if ((joyp_edge & 0x08u) == 0) {
+            s->state = 6;
+        }
+    } else if (s->state == 7) {
+        if (s->lives > 0) {
+            s->lives--;
+        }
+        if (s->lives == 0) {
+            if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
+                stage1_reset_for_play(s);
+            }
+        } else {
+            s->paddle_shrunk = 0;
+            s->paddle_w = 0x18;
+            s->state = 5;
+        }
+    } else if (s->state == 8) {
+        if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
+            stage1_reset_for_play(s);
+        }
+    }
+    step_prng(s);
+}
+
+static void fill_rect_fb(int x0, int y0, int w, int h, uint32_t color) {
+    for (int y = y0; y < y0 + h; ++y) {
+        if (y < 0 || y >= 144) continue;
+        for (int x = x0; x < x0 + w; ++x) {
+            if (x < 0 || x >= 160) continue;
+            pixels[y][x] = color;
+        }
+    }
+}
+
+/* Minimal 3x5 digit font for numeric HUD (0-9) */
+static const uint8_t DIGIT_FONT[10][5] = {
+    {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7}, {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1},
+    {7, 4, 7, 1, 7}, {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7}, {7, 5, 7, 1, 7}
+};
+
+static void draw_number_fb(int x, int y, uint32_t value, int digits, uint32_t color) {
+    for (int i = digits - 1; i >= 0; --i) {
+        int d = (int)(value % 10u);
+        value /= 10u;
+        int dx = x + i * 4;
+        for (int r = 0; r < 5; ++r) {
+            uint8_t row_bits = DIGIT_FONT[d][r];
+            for (int c = 0; c < 3; ++c) {
+                if (row_bits & (1u << (2 - c))) {
+                    if (y + r >= 0 && y + r < 144 && dx + c >= 0 && dx + c < 160) {
+                        pixels[y + r][dx + c] = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void draw_diagnostic(void) {
-    const uint32_t shades[] = {0xe0f8d0, 0x88c070, 0x346856, 0x081820};
     for (int y = 0; y < 144; ++y)
         for (int x = 0; x < 160; ++x)
-            pixels[y][x] = shades[(x / 40 + y / 36) % 4];
+            pixels[y][x] = DMG_SHADES[(x / 40 + y / 36) % 4];
 }
+
+static void render_stage1(const AlleywayStage1 *s) {
+    if (!s->rom_loaded) {
+        draw_diagnostic();
+        return;
+    }
+    /* Clear playfield to lightest DMG shade */
+    fill_rect_fb(0, 0, 160, 144, DMG_SHADES[0]);
+
+    /* Left wall (X=0..7), Right wall & HUD panel (X=120..159) in OAM-adjusted screen coords:
+     * Note: Game Boy OAM X has +8 offset and OAM Y has +16 offset!
+     * Playfield left wall is at OAM X=16 -> screen X=8.
+     * Playfield right wall is at OAM X=128 -> screen X=120.
+     * Top border is at OAM Y=24..31 -> screen Y=8..15 (rows 0..1 of grid!).
+     */
+    fill_rect_fb(0, 0, 8, 144, DMG_SHADES[2]);
+    fill_rect_fb(120, 0, 8, 144, DMG_SHADES[2]);
+    fill_rect_fb(128, 0, 32, 144, DMG_SHADES[3]);
+
+    /* Render 14x20 visible brick cells (each cell is 8x4 pixels at screen X = 8 + col*8, Y = 8 + row*4) */
+    for (int r = 0; r < 20; ++r) {
+        for (int c = 0; c < GRID_COLS; ++c) {
+            uint8_t t = s->grid_type[r * GRID_COLS + c];
+            if (t == 0) continue;
+            int sx = 8 + c * 8;
+            int sy = 8 + r * 4;
+            if (t == 4) {
+                fill_rect_fb(sx, sy, 8, 4, DMG_SHADES[2]);
+            } else {
+                uint32_t fill = (t == 3) ? DMG_SHADES[3] : (t == 2 ? DMG_SHADES[2] : DMG_SHADES[1]);
+                fill_rect_fb(sx, sy, 7, 3, fill);
+                fill_rect_fb(sx, sy + 3, 8, 1, DMG_SHADES[0]);
+            }
+        }
+    }
+
+    /* Render Paddle: OAM[0].X = paddle_x + 1 -> screen X = (paddle_x + 1) - 8 = paddle_x - 7
+     * OAM.Y = 144 -> screen Y = 144 - 16 = 128 */
+    int pad_sx = (int)s->paddle_x - 7;
+    int pad_sy = (int)s->paddle_y - 16;
+    fill_rect_fb(pad_sx, pad_sy, (int)s->paddle_w, 6, DMG_SHADES[3]);
+    fill_rect_fb(pad_sx + 2, pad_sy + 1, (int)s->paddle_w - 4, 2, DMG_SHADES[1]);
+
+    /* Render Ball when active (state == 6 or 0x0C): OAM.X = ball_x -> screen X = ball_x - 8 + 2, Y = ball_y - 16 + 2 */
+    if (s->state == 6 || s->state == 0x0C) {
+        int ball_sx = (int)s->ball_x - 8;
+        int ball_sy = (int)s->ball_y - 16;
+        fill_rect_fb(ball_sx, ball_sy, 4, 4, DMG_SHADES[3]);
+    } else if (s->state == 5) {
+        /* Preview ball resting above paddle before serve */
+        int preview_sx = pad_sx + ((int)s->paddle_w / 2) - 2;
+        int preview_sy = pad_sy - 5;
+        fill_rect_fb(preview_sx, preview_sy, 4, 4, DMG_SHADES[2]);
+    }
+
+    /* HUD numbers on right panel (X = 132..156): High Score, Score, Bricks left, Lives */
+    draw_number_fb(132, 16, (uint32_t)s->high_score_tens * 10u, 6, DMG_SHADES[0]);
+    draw_number_fb(132, 36, (uint32_t)s->score_tens * 10u, 6, DMG_SHADES[0]);
+    draw_number_fb(140, 64, (uint32_t)s->bricks_left, 3, DMG_SHADES[1]);
+    draw_number_fb(144, 88, (uint32_t)s->lives, 2, DMG_SHADES[0]);
+    draw_number_fb(144, 112, (uint32_t)(s->stage + 1u), 2, DMG_SHADES[1]);
+}
+
+static bool try_load_rom_file(AlleywayStage1 *s, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    size_t n = fread(s->rom, 1, ROM_SIZE_BYTES, fp);
+    fclose(fp);
+    if (n != ROM_SIZE_BYTES) return false;
+    uint8_t chk = 0;
+    for (int i = 0x134; i < 0x14D; ++i) {
+        chk = (uint8_t)((chk - s->rom[i] - 1u) & 0xFFu);
+    }
+    if (chk != s->rom[0x14D]) return false;
+    s->rom_loaded = true;
+    stage1_reset_for_play(s);
+    return true;
+}
+
+static void build_synthetic_stage1_rom(AlleywayStage1 *s) {
+    memset(s->rom, 0, sizeof(s->rom));
+    /* Random angle table at 0x100B */
+    const uint8_t rand_angles[8] = {6, 8, 10, 6, 8, 10, 8, 10};
+    memcpy(&s->rom[0x100B], rand_angles, sizeof(rand_angles));
+    /* Speed table pointers at 0x11EE (point speed 1 -> 0x1220, speed 3 -> 0x12B8) */
+    s->rom[0x11EE + 0] = 0x20; s->rom[0x11EE + 1] = 0x12;
+    s->rom[0x11EE + 4] = 0xB8; s->rom[0x11EE + 5] = 0x12;
+    /* Angle 9 at Speed 1 (0x1220 + 9*4 = 0x1244): vy=181, vx=181 */
+    s->rom[0x1244] = 0x00; s->rom[0x1245] = 181; s->rom[0x1246] = 0x00; s->rom[0x1247] = 181;
+    /* Angle 9 at Speed 3 (0x12B8 + 9*4 = 0x12DC): vy=226, vx=226 */
+    s->rom[0x12DC] = 0x00; s->rom[0x12DD] = 226; s->rom[0x12DE] = 0x00; s->rom[0x12DF] = 226;
+    /* Normal paddle angle table at 0x1B41 */
+    for (int i = 0; i < 15; ++i) s->rom[0x1B41 + i] = 9;
+    /* Brick type 1 at 0x1B87: score_tens=1, hp=1, min_spd=0 */
+    s->rom[0x1B87 + 3] = 0x11;
+    s->rom[0x1B87 + 4] = 0x00;
+    /* Stage 0 descriptor at 0x1BE1 -> 0x1C44 */
+    s->rom[0x1BE1] = 0x00; s->rom[0x1BE2] = 0x44; s->rom[0x1BE3] = 0x1C;
+    /* 1 row of brick type 1 at 0x1C44, followed by 0xFF */
+    for (int c = 0; c < GRID_COLS; ++c) s->rom[0x1C44 + c] = 1;
+    s->rom[0x1C44 + GRID_COLS] = 0xFF;
+    s->rom_loaded = true;
+    stage1_reset_for_play(s);
+}
+
+static bool extract_json_int(const char *line, const char *key, int *out_val) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *pos = strstr(line, pattern);
+    if (!pos) return false;
+    pos += strlen(pattern);
+    while (*pos == ' ' || *pos == '\t') pos++;
+    char *end = NULL;
+    long v = strtol(pos, &end, 10);
+    if (end == pos) return false;
+    *out_val = (int)v;
+    return true;
+}
+
+static int run_verify_trace(const char *rom_path, const char *trace_path) {
+    if (!try_load_rom_file(&g_sim, rom_path)) {
+        fprintf(stderr, "Error: failed to load valid 32 KiB ROM from %s\n", rom_path);
+        return 2;
+    }
+    FILE *fp = fopen(trace_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Error: failed to open logic trace file %s\n", trace_path);
+        return 2;
+    }
+
+    char line[4096];
+    bool initialized = false;
+    int ticks_compared = 0;
+    int mismatches = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        int st = -1, prng = 0, pad_x = 0, pad_w = 0;
+        int bx = 0, bx_sub = 0, by = 0, by_sub = 0, bvx = 0, bvy = 0;
+        int spd = 0, bricks = 0, score = 0, lives = 0;
+        int in_raw = 0xFF, in_edge = 0xFF, tick_id = 0;
+
+        if (!extract_json_int(line, "state", &st)) continue;
+        extract_json_int(line, "tick", &tick_id);
+        extract_json_int(line, "prng", &prng);
+        extract_json_int(line, "paddle_x", &pad_x);
+        extract_json_int(line, "paddle_w", &pad_w);
+        extract_json_int(line, "ball_x", &bx);
+        extract_json_int(line, "ball_x_sub", &bx_sub);
+        extract_json_int(line, "ball_y", &by);
+        extract_json_int(line, "ball_y_sub", &by_sub);
+        extract_json_int(line, "ball_vx", &bvx);
+        extract_json_int(line, "ball_vy", &bvy);
+        extract_json_int(line, "speed_idx", &spd);
+        extract_json_int(line, "bricks_left", &bricks);
+        extract_json_int(line, "score_tens", &score);
+        extract_json_int(line, "lives", &lives);
+        extract_json_int(line, "in_joyp_raw", &in_raw);
+        extract_json_int(line, "in_joyp_edge", &in_edge);
+
+        if (!initialized) {
+            if (st == 5) {
+                stage1_reset_for_play(&g_sim);
+                g_sim.state = (uint8_t)st;
+                g_sim.prng = (uint8_t)prng;
+                g_sim.paddle_x = (uint8_t)pad_x;
+                g_sim.paddle_w = (uint8_t)pad_w;
+                g_sim.bricks_left = (uint16_t)bricks;
+                g_sim.score_tens = (uint16_t)score;
+                g_sim.lives = (uint8_t)lives;
+                initialized = true;
+            }
+            continue;
+        }
+
+        if (st != 5 && st != 6 && st != 7 && st != 8) {
+            break;
+        }
+
+        stage1_step_tick(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge);
+        ticks_compared++;
+
+        if ((int)g_sim.state != st || (int)g_sim.prng != prng ||
+            (int)g_sim.paddle_x != pad_x || (int)g_sim.paddle_w != pad_w ||
+            (int)g_sim.ball_x != bx || (int)g_sim.ball_x_sub != bx_sub ||
+            (int)g_sim.ball_y != by || (int)g_sim.ball_y_sub != by_sub ||
+            (int)g_sim.ball_vx != bvx || (int)g_sim.ball_vy != bvy ||
+            (int)g_sim.speed_idx != spd || (int)g_sim.bricks_left != bricks ||
+            (int)g_sim.score_tens != score || (int)g_sim.lives != lives) {
+            fprintf(stderr,
+                "Mismatch at tick=%d: native(st=%u,padX=%u,ball=%u.%u,%u.%u,v=%u,%u,spd=%u,bricks=%u,score=%u) "
+                "!= ref(st=%d,padX=%d,ball=%d.%d,%d.%d,v=%d,%d,spd=%d,bricks=%d,score=%d)\n",
+                tick_id, g_sim.state, g_sim.paddle_x, g_sim.ball_x, g_sim.ball_x_sub,
+                g_sim.ball_y, g_sim.ball_y_sub, g_sim.ball_vx, g_sim.ball_vy,
+                g_sim.speed_idx, g_sim.bricks_left, g_sim.score_tens,
+                st, pad_x, bx, bx_sub, by, by_sub, bvx, bvy, spd, bricks, score);
+            mismatches++;
+            break;
+        }
+    }
+    fclose(fp);
+
+    printf("{\"initialized\":%s,\"ticks_compared\":%d,\"mismatches\":%d,\"bricks_left\":%u,\"score\":%u,\"speed_idx\":%u}\n",
+           initialized ? "true" : "false", ticks_compared, mismatches,
+           (unsigned)g_sim.bricks_left, (unsigned)g_sim.score_tens * 10u, (unsigned)g_sim.speed_idx);
+    return (initialized && ticks_compared > 0 && mismatches == 0) ? 0 : 1;
+}
+
+static void step_window_frame(void) {
+    if (!g_sim.rom_loaded) return;
+    uint8_t joyp_raw = 0xFFu;
+    if (g_key_a)     joyp_raw &= (uint8_t)~0x01u;
+    if (g_key_b)     joyp_raw &= (uint8_t)~0x02u;
+    if (g_key_start) joyp_raw &= (uint8_t)~0x08u;
+    if (g_key_right) joyp_raw &= (uint8_t)~0x10u;
+    if (g_key_left)  joyp_raw &= (uint8_t)~0x20u;
+
+    /* Active-low newly pressed edge: bit is 0 iff currently 0 and previously 1 */
+    uint8_t newly_pressed_high = (uint8_t)((~joyp_raw) & g_sim.prev_joyp_raw);
+    uint8_t joyp_edge = (uint8_t)(~newly_pressed_high);
+    g_sim.prev_joyp_raw = joyp_raw;
+
+    stage1_step_tick(&g_sim, joyp_raw, joyp_edge);
+    render_stage1(&g_sim);
+}
+
+static void handle_key_change(WPARAM vk, bool down, HWND w) {
+    if (vk == VK_ESCAPE && down) { DestroyWindow(w); return; }
+    if (vk == 'R' && down && g_sim.rom_loaded) { stage1_reset_for_play(&g_sim); return; }
+    if (vk == VK_LEFT || vk == 'A')  g_key_left = down;
+    if (vk == VK_RIGHT || vk == 'D') g_key_right = down;
+    if (vk == VK_SPACE || vk == 'Z') g_key_a = down;
+    if (vk == VK_SHIFT || vk == 'X') g_key_b = down;
+    if (vk == VK_RETURN)             g_key_start = down;
+}
+
 static LRESULT CALLBACK window_proc(HWND w, UINT m, WPARAM a, LPARAM b) {
-    if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    if (m == WM_KEYDOWN && a == VK_ESCAPE) { DestroyWindow(w); return 0; }
+    if (m == WM_DESTROY) { KillTimer(w, 1); PostQuitMessage(0); return 0; }
+    if (m == WM_KEYDOWN) { handle_key_change(a, true, w); return 0; }
+    if (m == WM_KEYUP)   { handle_key_change(a, false, w); return 0; }
+    if (m == WM_TIMER && a == 1) {
+        step_window_frame();
+        InvalidateRect(w, NULL, FALSE);
+        return 0;
+    }
     if (m == WM_PAINT) {
         PAINTSTRUCT paint; HDC dc = BeginPaint(w, &paint);
         RECT rect; GetClientRect(w, &rect);
@@ -27,22 +762,51 @@ static LRESULT CALLBACK window_proc(HWND w, UINT m, WPARAM a, LPARAM b) {
             info.bmiHeader.biWidth = 160; info.bmiHeader.biHeight = -144;
             info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
             info.bmiHeader.biCompression = BI_RGB;
-            StretchDIBits(dc, (width-160*scale)/2, (height-144*scale)/2,
-                160*scale, 144*scale, 0, 0, 160, 144, pixels, &info,
+            StretchDIBits(dc, (width - 160 * scale) / 2, (height - 144 * scale) / 2,
+                160 * scale, 144 * scale, 0, 0, 160, 144, pixels, &info,
                 DIB_RGB_COLORS, SRCCOPY);
         }
         EndPaint(w, &paint); return 0;
     }
     return DefWindowProcW(w, m, a, b);
 }
+
 int main(int argc, char **argv) {
     draw_diagnostic();
     if (argc == 2 && strcmp(argv[1], "--smoke-test") == 0) {
         if (pixels[0][0] != 0xe0f8d0 || pixels[0][40] != 0x88c070 ||
             pixels[143][159] != 0x346856) return 1;
-        puts("PASS: native executable and diagnostic framebuffer (not gameplay)");
+        build_synthetic_stage1_rom(&g_sim);
+        if (g_sim.bricks_left != 14 || g_sim.paddle_x != 40) return 1;
+        /* Move right 1 tick (+3 px), then serve with A, then step 1 tick */
+        stage1_step_tick(&g_sim, 0xEFu, 0xEFu);
+        if (g_sim.paddle_x != 43) return 1;
+        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
+        if (g_sim.state != 6 || g_sim.ball_y != 116) return 1;
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.ball_y_sub != 181 || g_sim.ball_x_sub != 75) return 1;
+        puts("PASS: native executable, diagnostic framebuffer and Stage 1 fixed-point engine verified");
         return 0;
     }
+
+    if (argc == 4 && strcmp(argv[1], "--verify-trace") == 0) {
+        return run_verify_trace(argv[2], argv[3]);
+    }
+
+    const char *rom_candidates[] = {
+        (argc == 3 && strcmp(argv[1], "--rom") == 0) ? argv[2] : NULL,
+        "local/roms/Alleyway (USA).gb",
+        "local/roms/alleyway.gb",
+        "../Local-Privado/roms/Alleyway (USA).gb",
+        "../Local-Privado/roms/alleyway.gb",
+    };
+    for (size_t i = 0; i < sizeof(rom_candidates) / sizeof(rom_candidates[0]); ++i) {
+        if (rom_candidates[i] && try_load_rom_file(&g_sim, rom_candidates[i])) {
+            break;
+        }
+    }
+    render_stage1(&g_sim);
+
     HINSTANCE instance = GetModuleHandleW(NULL);
     WNDCLASSW cls = {0}; cls.lpfnWndProc = window_proc;
     cls.style = CS_HREDRAW | CS_VREDRAW;
@@ -50,11 +814,14 @@ int main(int argc, char **argv) {
     cls.hCursor = LoadCursor(NULL, IDC_ARROW);
     if (!RegisterClassW(&cls)) return 2;
     RECT r = {0, 0, 640, 576}; AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND window = CreateWindowW(cls.lpszClassName,
-        L"Alleyway PC research | diagnostic only | Esc to close",
+    const wchar_t *title = g_sim.rom_loaded
+        ? L"Alleyway PC | Stage 1 Native (Arrows: Move, Space/Z: A, Shift/X: B, Enter: Pause, R: Reset)"
+        : L"Alleyway PC research | diagnostic only (no ROM found) | Esc to close";
+    HWND window = CreateWindowW(cls.lpszClassName, title,
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-        r.right-r.left, r.bottom-r.top, NULL, NULL, instance, NULL);
+        r.right - r.left, r.bottom - r.top, NULL, NULL, instance, NULL);
     if (!window) return 3;
+    SetTimer(window, 1, 16, NULL);
     MSG msg; int result;
     while ((result = GetMessageW(&msg, NULL, 0, 0)) > 0) {
         TranslateMessage(&msg); DispatchMessageW(&msg);

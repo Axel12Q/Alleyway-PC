@@ -1,6 +1,6 @@
 # Alleyway: registro de investigacion y desarrollo
 Fecha: 2026-10-17
-Estado: ingenieria inversa de la Fase 1 verificada sobre `../Local-Privado/roms/Alleyway (USA).gb` (fuera de Git); preparando implementacion nativa verificable de la Fase 1.
+Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en Windows y verificada bit a bit frente a PyBoy sobre el volcado local del usuario (`../Local-Privado/roms/Alleyway (USA).gb`, fuera de Git). Fases 2..32, fases de bonificacion, tiles 2bpp y audio siguen pendientes.
 
 ## Copia local del usuario (fuera de Git)
 - Ruta: `../Local-Privado/roms/Alleyway (USA).gb`
@@ -12,38 +12,26 @@ Estado: ingenieria inversa de la Fase 1 verificada sobre `../Local-Privado/roms/
 ## Hito 1 (2026-10-17): Linea temporal determinista, trazas y comparador (`df314f1`)
 - Implementados `tools/synthetic_rom.py`, `tools/inspect_rom.py`, `tools/capture_reference.py`, `tools/compare_traces.py` y 8 pruebas unitarias en `tests/`.
 
-## Hito 2 (2026-10-17): Escaneo de RAM y verificacion de fisica y Fase 1
-### Herramientas anadidas
-- `tools/scan_ram.py`: escaneo diferencial entre dos lineas temporales (`diff_timelines`) y busqueda de correlacion temporal (`find_correlated_addresses`) sobre `WRAM` (`0xC000..0xDFFF`), `OAM` (`0xFE00..0xFE9F`) y `HRAM` (`0xFF80..0xFFFE`).
-- `tests/test_scan_ram.py`: prueba automatizada sobre cartucho sintetico que verifica el descubrimiento automatico de coordenadas y contadores de botones.
-- `tools/alleyway_watchpoints.json`: definicion simbolica de los watchpoints verificados de Alleyway (USA).
+## Hito 2 (2026-10-17): Escaneo de RAM y verificacion de fisica y Fase 1 (`8e1e9a8`)
+- Implementados `tools/scan_ram.py`, `tools/alleyway_watchpoints.json`, `tests/test_scan_ram.py` y documentado el mapa de memoria e ingenieria inversa en `docs/RESEARCH_PROTOCOL.md`.
 
-### Hallazgos verificados sobre `Alleyway (USA).gb`
-1. **Puerto serie y controles (`0x01F0..0x0296`, `0x03C1..0x0415`, `0x10A4..0x10FA`) — VERIFICADO**:
-   - **Observacion**: En VBlank (`0x01F6..0x01FC`) el juego escribe `0x02` en `0xFF90` y `0x81` en `0xFF02` (`SC`). La interrupcion serie (`0x0058 -> 0x0272`) lee dos bytes consecutivos de `0xFF01` (`SB`) hacia `0xFF91` y `0xFF92`/`0xFF93`.
-   - **Verificacion**: En `0x10A4`, el juego compara `0xFF91 < 0xF1`. Si se cumple, interpreta `0xFF91 - 0x30` como posicion absoluta de un controlador rotatorio externo e ignora la cruceta; cuando no hay hardware externo conectado, `SB` recibe `0xFF` (`0xFF91 = 0xFF`), ejecutando la rama de cruceta en `0x10AA..0x10DC`.
-2. **Movimiento de la paleta (`0x10AA..0x10DC`) — VERIFICADO**:
-   - `0xFFC0`: posicion X base (`OAM[0].X = 0xFFC0 + 1`, `OAM[1].X = 0xFFC0 + 9`, `OAM[2].X = 0xFFC0 + 17`).
-   - `0xFFBF`: posicion Y (`144 = 0x90`).
-   - `0xFFC2`: ancho en pixeles (`24` normal; pasa a `16` con `0xFFC1 = 1` y `0xFFC0 += 4` cuando la bola toca el techo `Ball_Y < 24` en `0x0CF2..0x0D11`).
-   - Velocidad por fotograma segun botones mantenidos en `0xFF8C`:
-     - Solo cruceta: **3 px/fotograma**.
-     - Cruceta + `A`: **5 px/fotograma**.
-     - Cruceta + `B` (sin `A`): **1 px/fotograma**.
-   - Limites de `0xFFC0`: minimo `15` (`0x0F`), maximo `127 - 0xFFC2` (`103` normal, `111` encogida).
-3. **Fisica de la bola en punto fijo 8.8 big-endian (`0x0F7C`, `0x0CB0..0x116A`) — VERIFICADO**:
-   - `0xFFB4:0xFFB5` (`Y`), `0xFFB6:0xFFB7` (`X`), `0xFFB8:0xFFB9` (`vy`), `0xFFBA:0xFFBB` (`vx`).
-   - En cada fotograma activo (`state == 6`), `0x0F7C` copia el byte alto actual a `0xFFBC` (`prev_Y`) y `0xFFBD` (`prev_X`) y suma `(vy, vx)` en 16 bits.
-   - Al sacar con `A` (`0x101B..0x108C`), la bola sale desde `Y = 116.0` (`0x7400`) con el vector de `Speed 1`, angulo 9 (`|vx| = 181, vy = +181`, es decir `0.70703125 px/frame` por eje), hacia la izquierda si `paddle_x + paddle_w/2 >= 72` o hacia la derecha si `< 72`, dejando `0xFFBE = 3`.
-   - En el primer rebote con la paleta (`0x1113`), pasa a usar `0xFFBE = 3` (`Speed 3` en `0x12B8`, donde el angulo 9 tiene `|vx| = 226, |vy| = 226`) y selecciona el angulo segun la zona `B = (ball_x - (paddle_x - 3)) >> 1` en `0x1B41` (`[3,6,6,6,9,9,9,9,9,9,9,9,6,6,6]`).
-4. **Geometria y bloques de la Fase 1 (`0x092A..0x0A95`, `0x0D27..0x0E8C`, `0x1BE1 -> 0x1C44`) — VERIFICADO**:
-   - Cada celda de `0xC000` (14 columnas $\times$ 60 filas) representa un bloque de `8 px` de ancho por `4 px` de alto. Cada tile de fondo de `8x8` en VRAM (`0x9821..`) empaqueta verticalmente 2 filas de la matriz (`row` par e impar) usando las 3 variantes graficas de `0x1B87`.
-   - Fase 1 tiene 84 bloques destructibles (`0xFFC8:0xFFC9 = 84`):
-     - Filas `0..1`: 28 celdas tipo 4 (`hp = 0`, muro superior indestructible en `Y = 24..31`).
-     - Filas `6..7`, cols `1..12`: 24 bloques tipo 3 (`30 pts`, `hp = 1`, `min_speed_idx = 7`).
-     - Filas `8..9`, cols `1..12`: 24 bloques tipo 2 (`20 pts`, `hp = 1`, `min_speed_idx = 5`).
-     - Filas `10..12`, cols `1..12`: 36 bloques tipo 1 (`10 pts`, `hp = 1`, `min_speed_idx = 0`).
-   - Experimento de traza de 650 fotogramas (`tools/capture_reference.py` con `tools/alleyway_watchpoints.json`): verificado el saque en `f=476`, rebote en paleta en `f=514`, rebote en pared derecha y destruccion del primer bloque en `f=588` (`bricks_left: 84 -> 83`, `score: 0 -> 10`).
+## Hito 3 (2026-10-17): Motor nativo en C de la Fase 1 y paridad bit a bit
+### Descubrimiento clave sobre el momento de muestreo (`0x051F..0x0525`)
+- **Observado**: Al muestrear la memoria justo al retorno de `gb.tick(1)` (`LY = 0`), existia un desfase aparente de 1 fotograma cuando se activaba el efecto de sonido de rebote en pared (`f=526`, `PC = 0x6F3F`).
+- **Hipotesis**: La rutina de sonido llamada al final de la interrupcion VBlank (`0x0210: CALL 0x7FF0`) consume mas ciclos cuando hay un efecto de sonido activo, haciendo que el final de la ISR cruce la frontera de `LY = 0`.
+- **Experimento y Verificacion**: Registrando hooks en PyBoy al inicio (`0x051F`) y al final (`0x0525`, justo antes de `CALL 0x0221`) del bucle principal de logica (`--logic-hooks 0x051F:0x0525` en `tools/capture_reference.py`), se capturo cada paso de simulacion de forma atomica. Al comparar **5,651 ticks consecutivos de logica** de la Fase 1 (con 59 bloques destruidos, cambios de velocidad `3 -> 5 -> 7` y `1,150` puntos), el numero de discrepancias entre PyBoy y nuestra implementacion fue exactamente **0 (`mismatches = 0`)**.
 
-## Siguiente paso (Hito 3)
-- Construir el simulador/ejecutable nativo en C de la Fase 1 (`src/`) que cargue las tablas y el mapa de la Fase 1 directamente desde la ROM local del usuario (sin empaquetar datos comerciales en el repositorio), permita jugarla en ventana Win32/GDI y verifique paridad exacta de trazas fotograma a fotograma frente a PyBoy.
+### Implementacion realizada
+- `tools/capture_reference.py`: soporte para `--logic-hooks START_PC:END_PC` que genera `logic_trace.jsonl` con las entradas latcheadas (`in_joyp_raw`, `in_joyp_edge`) y los watchpoints al final de cada tick de logica.
+- `src/main.c`:
+  - Motor nativo en C11 (`AlleywayStage1`) que lee tablas y layout de la Fase 1 desde la ROM local del usuario en tiempo de ejecucion.
+  - Modo `--smoke-test`: verifica el framebuffer de diagnostico y un paso de fisica sobre una tabla sintetica en memoria.
+  - Modo `--verify-trace <rom> <logic_trace.jsonl>`: verifica que el ejecutable nativo en C reproduce exactamente cada tick de un `logic_trace.jsonl` en `state`, `prng`, `paddle_x`, `paddle_w`, `ball_x`, `ball_x_sub`, `ball_y`, `ball_y_sub`, `ball_vx`, `ball_vy`, `speed_idx`, `bricks_left`, `score_tens` y `lives`.
+  - Modo interactivo Win32/GDI a 60 Hz (`.\build\alleyway-lab.exe`): permite jugar la Fase 1 nativa en Windows cuando la ROM local esta disponible (o muestra el patron de diagnostico si no hay ROM).
+- `tests/test_stage1_native.py`: pruebas automatizadas del ejecutable C (`--smoke-test`, `--verify-trace` con ROM sintetica + fallo deliberado, y paridad real con `../Local-Privado/roms/Alleyway (USA).gb` cuando esta presente).
+- `.github/workflows/ci.yml`: integracion continua en Windows usando exclusivamente fixtures sinteticos.
+
+## Siguiente paso recomendado para Codex / futuras sesiones
+1. Implementar en `src/main.c` la logica de desplazamiento horizontal de filas (`0x0B21..0x0B66`, configurada por `0x074C` desde la tabla `0x4075`) y el descenso vertical del mural (`0x0BC7..0x0C31`, controlado por `0xFFC4`/`0xFFC5` y `0xFFA9`) para soportar las Fases 2 y 3, verificando sus trazas con `--verify-trace`.
+2. Implementar la regla de bonificacion (`0xFFAA == 1`) y la progresion de fases (`0xCA45 = 0..31`) junto con los umbrales de vida extra (`0x0C71..0x0CA5`, tabla `0x1B5D`).
+3. Decodificar directamente los tiles 2bpp de la ROM local para reemplazar los rectangulos sombreados por los graficos originales del cartucho del usuario en memoria.

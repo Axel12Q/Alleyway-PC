@@ -1,7 +1,12 @@
 # Alleyway PC research
 
-Laboratorio para investigar Alleyway (Game Boy) y construir una reimplementacion
-nativa verificable. Estado: infraestructura; aun no existe un port jugable.
+Laboratorio para investigar Alleyway (Game Boy, 1989) y construir una reimplementacion
+nativa verificable en Windows.
+
+Estado actual: **Fase 1 nativa implementada y verificada bit a bit frente a PyBoy**
+(cargando tablas y mapa en tiempo de ejecucion desde el volcado local del usuario,
+sin recursos comerciales en el repositorio). Fases 2..32, fases de bonificacion,
+audio y animaciones de introduccion siguen pendientes.
 
 ## Empezar en Windows
 
@@ -12,44 +17,47 @@ uv venv
 uv pip sync requirements-dev.lock
 .\.venv\Scripts\python.exe tools/build.py
 .\build\alleyway-lab.exe --smoke-test
-.\build\alleyway-lab.exe
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-La ventana muestra un patron sintetico de 160x144, escalado por enteros;
-Escape la cierra. No contiene graficos, fisica ni niveles del original.
-Usamos Win32/GDI para validar la compilacion sin depender todavia de SDL.
-La futura capa de plataforma podra usar SDL para otras plataformas.
-
-Para descargar SameBoy en otro equipo: `powershell -File tools/setup_sameboy.ps1`.
-Pruebas del inspector: `python -m unittest discover -s tests -v`.
-
-## Copia local del juego
-
-Coloca tu propio volcado en `local/roms/` (ignorado por Git). No se descarga aqui.
+Para ejecutar la ventana nativa (autodecta la ROM local en `local/roms/` o
+`../Local-Privado/roms/`, o muestra el patron de diagnostico si no hay ROM):
 
 ```powershell
-.\.venv\Scripts\python.exe tools/inspect_rom.py local/roms/alleyway.gb
-.\.venv\Scripts\python.exe tools/capture_reference.py local/roms/alleyway.gb --frames 120
+.\build\alleyway-lab.exe
+# O indicando explicitamente la ruta a tu volcado:
+.\build\alleyway-lab.exe --rom "../Local-Privado/roms/Alleyway (USA).gb"
 ```
 
-El inspector informa cabecera y checksums; no certifica autenticidad del juego.
-La captura avanza sin pulsar botones: sirve para registrar arranque, no gameplay.
-Los resultados quedan en `local/captures/`. No subirlos al repositorio.
-SameBoy portable esta en `.tools/sameboy/` en la preparacion local.
+Controles en la ventana nativa (Fase 1):
+- `Izquierda` / `Derecha` (o `A` / `D`): mover paleta (`3 px/frame`).
+- `Espacio` / `Z`: boton `A` (sacar bola y acelerar paleta a `5 px/frame`).
+- `Shift` / `X`: boton `B` (movimiento de precision a `1 px/frame`).
+- `Enter`: `Start` (pausar / continuar / reiniciar al terminar).
+- `R`: reiniciar Fase 1.
+- `Esc`: cerrar ventana.
+
+## Herramientas de inspeccion, captura, escaneo y verificacion
+
+Coloca tu propio volcado en `local/roms/` o `../Local-Privado/roms/` (ignorados por Git):
+
+```powershell
+.\.venv\Scripts\python.exe tools/inspect_rom.py "../Local-Privado/roms/Alleyway (USA).gb"
+.\.venv\Scripts\python.exe tools/capture_reference.py "../Local-Privado/roms/Alleyway (USA).gb" --frames 700 --watch-file tools/alleyway_watchpoints.json --logic-hooks 0x051F:0x0525
+.\build\alleyway-lab.exe --verify-trace "../Local-Privado/roms/Alleyway (USA).gb" local/captures/<hash>/<run>/logic_trace.jsonl
+```
+
+- `tools/inspect_rom.py`: valida cabecera, alineacion de bancos y checksums.
+- `tools/capture_reference.py`: graba `screen.ppm`, `trace.jsonl` (por fotograma) y opcionalmente `logic_trace.jsonl` (por tick atomico de logica `0x051F..0x0525`).
+- `tools/compare_traces.py`: compara dos capturas o archivos `trace.jsonl` separando `logic_match` de `screen_match`.
+- `tools/scan_ram.py`: escaneo diferencial (`diff_timelines`) y correlacion temporal (`find_correlated_addresses`) sobre `WRAM`/`HRAM`/`OAM`.
+- `tools/synthetic_rom.py`: genera cartuchos sinteticos interactivos para pruebas sin ROM comercial.
 
 ## Colaboracion
 
-Lee AGENTS.md, docs/STATUS.md y docs/COLLABORATION.md.
-Primera meta: medir y reproducir una sola fase; nunca sustituir mediciones por
-una fisica generica de Breakout.
-
-Fuentes: https://github.com/LIJI32/SameBoy,
-https://github.com/Baekalfen/PyBoy, https://gbdev.io/pandocs/,
-https://www.nintendo.com/es-es/Juegos/Game-Boy/Alleyway-275451.html.
+Lee `AGENTS.md`, `docs/STATUS.md`, `docs/RESEARCH_PROTOCOL.md`, `docs/COLLABORATION.md`
+y `docs/HANDOFF_ANTIGRAVITY.md`.
+Fuentes: https://github.com/LIJI32/SameBoy, https://github.com/Baekalfen/PyBoy,
+https://gbdev.io/pandocs/, https://www.nintendo.com/es-es/Juegos/Game-Boy/Alleyway-275451.html.
 El nombre Alleyway pertenece a sus titulares. Proyecto experimental no oficial;
 sin ROMs ni recursos comerciales incluidos. Asistencia de IA documentada.
-
-## Trabajo activo
-El proyecto compartido esta en Documents/Alleyway-PC-Trabajo. Antigravity trabaja
-en su propia carpeta y rama antigravity/development. Ver docs/COLLABORATION.md
-y docs/HANDOFF_ANTIGRAVITY.md antes de iniciar otro agente.

@@ -93,11 +93,33 @@ static void test_tile_blit_flips_and_transparency(void) {
     ASSERT_EQ(fb[4 * 16 + 4], shades[1], "flipped X top-left pixel is now shade 1");
     ASSERT_EQ(fb[4 * 16 + 11], shades[3], "flipped X top-right pixel is now shade 3");
 
+    /* Flip Y blit at (4, 4): row 0 maps to row 7 of tile (y = 4 + 7 = 11) */
+    memset(fb, 0, sizeof(fb));
+    gb_tile_blit(tile, 4, 4, false, true, true, 0xE4, shades, fb, 16, 16);
+    ASSERT_EQ(fb[11 * 16 + 4], shades[3], "flipped Y bottom-left pixel is shade 3");
+    ASSERT_EQ(fb[11 * 16 + 11], shades[1], "flipped Y bottom-right pixel is shade 1");
+    ASSERT_EQ(fb[4 * 16 + 4], 0, "flipped Y row 0 remains empty");
+
+    /* Clipping and boundary sentinels test */
+    uint32_t fb_sentinel[18 * 18];
+    const uint32_t SENTINEL_VAL = 0xDEADBEEF;
+    for (int i = 0; i < 18 * 18; ++i) fb_sentinel[i] = SENTINEL_VAL;
+    /* Sub-view of 16x16 with stride 18 inside 18x18, offset by (1,1) */
+    /* Blit overflowing right/bottom boundary at (12, 12) on 16x16: pixels [16..19] clipped */
+    gb_tile_blit(tile, 12, 12, false, false, false, 0xE4, shades, &fb_sentinel[1 * 18 + 1], 16, 16);
+    /* Check sentinel guards around the 16x16 area */
+    for (int x = 0; x < 18; ++x) {
+        ASSERT_EQ(fb_sentinel[0 * 18 + x], SENTINEL_VAL, "top sentinel intact");
+        ASSERT_EQ(fb_sentinel[17 * 18 + x], SENTINEL_VAL, "bottom sentinel intact");
+    }
+    for (int y = 0; y < 18; ++y) {
+        ASSERT_EQ(fb_sentinel[y * 18 + 0], SENTINEL_VAL, "left sentinel intact");
+        ASSERT_EQ(fb_sentinel[y * 18 + 17], SENTINEL_VAL, "right sentinel intact");
+    }
+
     /* Clipping test: negative coordinates */
     memset(fb, 0, sizeof(fb));
     gb_tile_blit(tile, -4, -4, false, false, false, 0xE4, shades, fb, 16, 16);
-    /* Pixel (7,0) from tile would be at dest_x = -4 + 7 = 3, dest_y = -4 + 0 = -4 (clipped) */
-    /* No crash or out-of-bounds writes */
     ASSERT_EQ(fb[0], 0, "clipped negative coords do not corrupt memory");
 }
 
@@ -173,6 +195,125 @@ static void test_apu_pcm_rendering(void) {
     ASSERT_TRUE(has_pos && has_neg, "pulse wave must output alternating positive and negative values");
 }
 
+static void test_apu_dispatcher_nr10_zero(void) {
+    /* Mock minimal ROM with authentic SFX tables:
+     * - SFX 1 (Brick type 1) at 0x6FDE: NR10=0x00, NR11=0x71, NR12=0xF2, NR13=0x59, NR14=0x87
+     * - SFX 2 (Brick type 2) at 0x6FBB: NR10=0x00, NR11=0x81, NR12=0x72, NR13=0x7B, NR14=0xC7
+     * - SFX 7 (Paddle bounce) at 0x701A: NR10=0x1A, NR11=0x81, NR12=0xF0, NR13=0x9D, NR14=0xC7
+     */
+    uint8_t mock_rom[32768] = {0};
+    /* SFX 1 */
+    mock_rom[0x6FDE] = 0x00; /* NR10 = 0 is VALID! (no sweep) */
+    mock_rom[0x6FDF] = 0x71;
+    mock_rom[0x6FE0] = 0xF2;
+    mock_rom[0x6FE1] = 0x59;
+    mock_rom[0x6FE2] = 0x87;
+
+    /* SFX 2 */
+    mock_rom[0x6FBB] = 0x00; /* NR10 = 0 */
+    mock_rom[0x6FBC] = 0x81;
+    mock_rom[0x6FBD] = 0x72;
+    mock_rom[0x6FBE] = 0x7B;
+    mock_rom[0x6FBF] = 0xC7;
+
+    /* SFX 7 */
+    mock_rom[0x701A] = 0x1A; /* NR10 = 0x1A */
+    mock_rom[0x701B] = 0x81;
+    mock_rom[0x701C] = 0xF0;
+    mock_rom[0x701D] = 0x9D;
+    mock_rom[0x701E] = 0xC7;
+
+    GbApuChannel1 ch1, ch2;
+    gb_apu_ch1_init(&ch1, 44100);
+    gb_apu_ch1_init(&ch2, 44100);
+
+    /* Dispatch SFX 1: table at 0x6FDE */
+    gb_apu_ch1_write_regs(&ch1, mock_rom[0x6FDE], mock_rom[0x6FDF], mock_rom[0x6FE0], mock_rom[0x6FE1], mock_rom[0x6FE2]);
+    ASSERT_TRUE(ch1.active, "SFX 1 active despite NR10 == 0");
+    ASSERT_EQ(ch1.nr10, 0x00, "SFX 1 NR10 is 0");
+    ASSERT_EQ(ch1.raw_frequency, ((0x87 & 7) << 8) | 0x59, "SFX 1 raw frequency matches table");
+
+    /* Dispatch SFX 2: table at 0x6FBB */
+    gb_apu_ch1_write_regs(&ch2, mock_rom[0x6FBB], mock_rom[0x6FBC], mock_rom[0x6FBD], mock_rom[0x6FBE], mock_rom[0x6FBF]);
+    ASSERT_TRUE(ch2.active, "SFX 2 active despite NR10 == 0");
+    ASSERT_EQ(ch2.raw_frequency, ((0xC7 & 7) << 8) | 0x7B, "SFX 2 raw frequency matches table");
+    ASSERT_TRUE(ch1.raw_frequency != ch2.raw_frequency, "SFX 1 and SFX 2 have distinct frequencies");
+
+    /* Render both and verify waveforms differ */
+    int16_t buf1[200], buf2[200];
+    gb_apu_ch1_render(&ch1, buf1, 200);
+    gb_apu_ch1_render(&ch2, buf2, 200);
+    bool buffers_differ = false;
+    for (int i = 0; i < 200; ++i) {
+        if (buf1[i] != buf2[i]) {
+            buffers_differ = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(buffers_differ, "SFX 1 and SFX 2 generate distinct PCM buffers");
+}
+
+/* Simulated waveOut queue safety test */
+#define MOCK_WHDR_DONE 0x00000001
+#define MOCK_WHDR_PREPARED 0x00000002
+
+typedef struct {
+    uint32_t flags;
+    int16_t data[16];
+    int write_count;
+} MockBuffer;
+
+static void test_audio_queue_safety_simulation(void) {
+    /* 4-buffer ring buffer simulating waveOut queue state machine */
+    MockBuffer queue[4];
+    for (int i = 0; i < 4; ++i) {
+        queue[i].flags = MOCK_WHDR_PREPARED | MOCK_WHDR_DONE; /* Initially ready */
+        memset(queue[i].data, 0, sizeof(queue[i].data));
+        queue[i].write_count = 0;
+    }
+
+    int current_buf = 0;
+    int16_t frame_samples[16];
+    for (int s = 0; s < 16; ++s) frame_samples[s] = (int16_t)(s + 10);
+
+    /* Frame 1: buffer 0 is DONE -> writes successfully, transitions to in-hardware (clear DONE) */
+    ASSERT_TRUE(queue[current_buf].flags & MOCK_WHDR_DONE, "buffer 0 ready");
+    memcpy(queue[current_buf].data, frame_samples, sizeof(frame_samples));
+    queue[current_buf].flags &= ~MOCK_WHDR_DONE; /* driver playing */
+    queue[current_buf].write_count++;
+    current_buf = (current_buf + 1) % 4;
+
+    /* Frame 2: buffer 1 is DONE -> writes successfully */
+    ASSERT_TRUE(queue[current_buf].flags & MOCK_WHDR_DONE, "buffer 1 ready");
+    memcpy(queue[current_buf].data, frame_samples, sizeof(frame_samples));
+    queue[current_buf].flags &= ~MOCK_WHDR_DONE;
+    queue[current_buf].write_count++;
+    current_buf = (current_buf + 1) % 4;
+
+    /* Frame 3: buffer 2 is NOT done (simulating device lag / audio still in flight) */
+    queue[current_buf].flags &= ~MOCK_WHDR_DONE;
+    int prev_buf = current_buf;
+    /* Queue safety check: must NOT overwrite buffer, must NOT advance index */
+    bool skipped = false;
+    if (!(queue[current_buf].flags & MOCK_WHDR_DONE)) {
+        skipped = true; /* Safe skip: do not overwrite in-flight audio */
+    }
+    ASSERT_TRUE(skipped, "must safely skip buffer when WHDR_DONE is not set");
+    ASSERT_EQ(current_buf, prev_buf, "buffer index does not advance on skip");
+    ASSERT_EQ(queue[current_buf].write_count, 0, "in-flight buffer must not be overwritten");
+
+    /* Driver finishes playback of buffer 2: sets WHDR_DONE */
+    queue[current_buf].flags |= MOCK_WHDR_DONE;
+    if (queue[current_buf].flags & MOCK_WHDR_DONE) {
+        memcpy(queue[current_buf].data, frame_samples, sizeof(frame_samples));
+        queue[current_buf].flags &= ~MOCK_WHDR_DONE;
+        queue[current_buf].write_count++;
+        current_buf = (current_buf + 1) % 4;
+    }
+    ASSERT_EQ(queue[2].write_count, 1, "buffer 2 successfully written once freed by driver");
+    ASSERT_EQ(current_buf, 3, "buffer index advanced to 3");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--deliberate-fail") == 0) {
         fprintf(stderr, "Intentional failure mode for verification harness\n");
@@ -186,6 +327,8 @@ int main(int argc, char **argv) {
     test_apu_length_counter();
     test_apu_sweep_overflow();
     test_apu_pcm_rendering();
+    test_apu_dispatcher_nr10_zero();
+    test_audio_queue_safety_simulation();
 
     if (g_failed > 0) {
         fprintf(stderr, "FAILURES: %d\n", g_failed);

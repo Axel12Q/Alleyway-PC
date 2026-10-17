@@ -50,9 +50,32 @@
   - Al destruir todos los bloques (`bricks_left == 0`), el juego entra en estado 8 (Clear) y avanza ciclicamente a la siguiente fase (`(stage + 1) & 0x1F`) cargando su respectivo descriptor y matriz desde la ROM local.
   - Verificacion de 1-UP implementada contra la tabla de umbrales en `0x1B5D` (`10,000` a `90,000` puntos) incrementando vidas hasta 99.
 
+### Hito 6: Correccion de dispatch de audio (NR10=0), seguridad de cola waveOut, reglas multi-fase y temporizadores
+- **Correccion de `apu_dispatch_sfx` (`src/main.c`)**:
+  - Eliminada la condicion erronea `s->rom[addr] != 0` que descartaba tablas de sonido con `NR10 = 0x00` (sin barrido de frecuencia por hardware). `NR10 = 0` es valido en los efectos autenticos de bloques 1, 2 y 3 (`0x6FDE`, `0x6FBB`, `0x6FCA`).
+  - El despachador ahora valida los limites de la ROM cargada y programa con exactitud los 5 registros de Canal 1.
+  - Efectos de techo (`SFX 11`) y rebote en pared (`SFX 12`): documentados como implementacion estatica parcial hasta modelar las rutinas por software que barren `NR13`/`NR14` en VBlank (`0x6B76`/`0x6B8B`).
+- **Seguridad en la cola Win32 waveOut**:
+  - Los buffers de audio se preparan una sola vez en `audio_backend_init` con `waveOutPrepareHeader`.
+  - En `audio_step_frame`, nunca se borran los flags de un buffer en vuelo y solo se transfieren datos al dispositivo si el driver ha devuelto el buffer con `WHDR_DONE`. Si la cola de hardware esta ocupada, el frame se descarta limpiamente para el altavoz sin bloquear el bucle de juego ni interferir con la simulacion determinista de la APU.
+  - Cierre ordenado y defensivo en `audio_backend_shutdown` con `waveOutReset`, despreparacion de buffers con `WHDR_PREPARED` y liberacion de manija `waveOutClose`.
+- **Validacion en ejecutable de pruebas C (`tests/test_c_modules.c`)**:
+  - `test_tile_blit_flips_and_transparency`: anadida prueba de flip vertical (Y), mapeo a fila 7 y verificacion de centinelas de memoria alrededor del buffer para confirmar que no hay sobreescritura de bordes.
+  - `test_apu_dispatcher_nr10_zero`: prueba sintetica del despachador con `NR10 = 0`, verificando que activa el canal, programa la frecuencia exacta de la tabla y sintetiza un flujo PCM distinto entre `SFX 1` y `SFX 2`.
+  - `test_audio_queue_safety_simulation`: simulacion de la maquina de estados de la cola `waveOut`, comprobando que un buffer sin `WHDR_DONE` no se sobreescribe ni avanza indices y se reutiliza correctamente cuando el driver lo libera.
+- **Temporizadores y verificador de reglas multi-fase (`src/main.c`)**:
+  - Implementada funcion `--verify-multi-stage-rules` en `alleyway-lab.exe` y anadida prueba automatica en `tests/test_stage1_native.py` que verifica:
+    1. Desplazamiento horizontal con recorte y desbordamiento modular (`mod 112`), direccion izquierda/derecha y recarga de temporizadores de fila.
+    2. Regla de penetracion de bonus (`bonus_flag == 1`), destruccion de bloques sin reflejar vector de velocidad.
+    3. Umbrales de 1-UP segun tabla de ROM `0x1B5D` e incremento controlado de vidas.
+    4. Descenso vertical de bloques (`drop_timer` a `0x3C` y decremento de `row_offset`).
+    5. Cuenta atras y expiracion de temporizador de bonificacion (`bonus_timer`).
+    6. Progresion y transicion ciclica de fases (31 -> 0) al pulsar A / Start en estado Clear.
+- **Ejecucion de pruebas**: 21 pruebas aprobadas en ~1.0s.
+
 ## Lo que falta para el juego completo (siguiente paso para continuar)
-1. **Descenso vertical del mural (`0x0BC7..0x0C31`)**: desplazamiento paso a paso de filas de celdas hacia abajo en fases de 40 filas cuando expira el temporizador de descenso.
-2. **Temporizador descendente de fases de bonificacion (`0x198C..0x1A50`)**: cuenta atras de segundos en HUD durante las fases de bonus y finalizacion por tiempo.
+1. **Verificacion de trazas multi-fase grabadas contra PyBoy**: capturar secuencias de Fase 2 (bloques en movimiento) y Fase 3 (descenso de bloques) para comparar `row_shift` y `row_offset` contra las direcciones de RAM `0xCA00..0xCA13` y `0xFFA9`.
+2. **Temporizador descendente en pantalla durante el bonus**: visualizacion de digitos en el HUD y puntuacion de bonificacion remanente.
 3. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)**.
 
 

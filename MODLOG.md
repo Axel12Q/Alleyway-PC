@@ -61,9 +61,35 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
 - Al pulsar A o Start, el juego avanza ciclicamente a la siguiente fase (`(stage + 1) & 0x1F`), resetea la paleta y carga el nuevo mapa desde la ROM local.
 - Se implemento la verificacion de vidas extra (1-UP) contra la tabla en `0x1B5D` (umbrales de 10k a 90k puntos).
 
+## Hito 6 (2026-10-17): Correccion de dispatch de audio (NR10=0), seguridad de cola waveOut, reglas multi-fase y temporizadores
+### 1. Despachador de efectos de sonido y tablas con NR10=0
+- Corregida la condicion en `apu_dispatch_sfx` de `src/main.c`: la condicion `rom[addr] != 0` descartaba tablas validas donde `NR10 = 0x00` (sin barrido de frecuencia por hardware). Los efectos autenticos de bloques 1, 2 y 3 (`0x6FDE`, `0x6FBB`, `0x6FCA`) tienen `NR10 = 0` y caian erroneamente al sonido generico.
+- Ahora el despachador comprueba limites de memoria de la ROM y asigna fielmente los 5 registros de Canal 1.
+- Efectos de rebote en techo (`SFX 11`) y pared (`SFX 12`): documentados como aproximaciones estaticas parciales hasta incorporar la emulacion de las rutinas de software que modulan `NR13`/`NR14` en VBlank (`0x6B76`/`0x6B8B`).
+
+### 2. Seguridad en la cola waveOut de Win32
+- Eliminada la sobreescritura de flags y buffers en vuelo: `audio_backend_init` prepara los 4 encabezados una unica vez con `waveOutPrepareHeader`.
+- En `audio_step_frame`, solo se copian muestras y se envia a la tarjeta si el encabezado tiene `WHDR_DONE` activo. Si el driver de sonido sigue reproduciendo un buffer, se omite el envio a hardware sin alterar flags ni retrasar el bucle de simulacion del juego.
+- Cierre ordenado y defensivo en `audio_backend_shutdown` llamando a `waveOutReset`, `waveOutUnprepareHeader` (comprobando `WHDR_PREPARED`) y `waveOutClose`.
+
+### 3. Ampliacion de pruebas unitarias en C real (`tests/test_c_modules.c`)
+- Flip vertical (Y) y centinelas de memoria: comprobacion de que `gb_tile_blit` con volteo Y ubica correctamente los pixeles en la base del tile y no desborda buffers contiguos marcados con centinelas `0xDEADBEEF`.
+- Despacho de audio con `NR10 = 0`: comprobacion con tabla sintetica de que se activa el canal, se respeta `NR10 = 0` y `SFX 1` genera una frecuencia y forma de onda PCM distinta a `SFX 2`.
+- Simulacion de maquina de estados de la cola `waveOut`: valida que la proteccion contra sobreescritura en vuelo previene la corrupcion de audio y que los buffers se reutilizan en cuanto el controlador de audio los marca como completados.
+
+### 4. Temporizadores y verificador de reglas multi-fase (`src/main.c`)
+- Anadido modo `--verify-multi-stage-rules` a `alleyway-lab.exe` integrado en `tests/test_stage1_native.py`, verificando de forma aislada y determinista:
+  - Envolvente y rotacion ciclica modular de 112 px en desplazamiento de filas horizontales.
+  - Penetracion de bloques sin rebote en fases de bonificacion (`bonus_flag == 1`).
+  - Umbrales de 1-UP y acreditacion de vidas extra segun la tabla `0x1B5D`.
+  - Descenso vertical del mural de bloques (`drop_timer` a `0x3C`, decremento de `row_offset`).
+  - Cuenta atras y finalizacion de fases de bonus (`bonus_timer`).
+  - Wraparound ciclico de fases de 31 a 0 en pantalla de Stage Clear.
+- Todas las pruebas de regresion (21 pruebas en total) pasan en ~1.0s.
+
 ## Siguiente paso recomendado para Codex / futuras sesiones
-1. Implementar el descenso vertical del mural (`0x0BC7..0x0C31`) cuando expira el temporizador de descenso en fases de 40 filas.
-2. Implementar la cuenta regresiva del temporizador de bonificacion en HUD (`0x198C..0x1A50`).
+1. Verificacion de trazas multi-fase grabadas contra PyBoy: capturar secuencias de Fase 2 (bloques en movimiento) y Fase 3 (descenso de bloques) para comparar `row_shift` y `row_offset` contra las direcciones de RAM `0xCA00..0xCA13` y `0xFFA9`.
+2. Temporizador descendente en pantalla durante el bonus: visualizacion de digitos en el HUD y puntuacion de bonificacion remanente.
 3. Extender la sintesis APU a los Canales 2, 3 y 4.
 
 

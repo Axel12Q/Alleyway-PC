@@ -10,7 +10,12 @@ from pyboy import PyBoy
 try:
     from tools.inspect_rom import inspect as inspect_rom_bytes
 except ImportError:
-    from inspect_rom import inspect as inspect_rom_bytes  # type: ignore
+    try:
+        from inspect_rom import inspect as inspect_rom_bytes  # type: ignore
+    except ImportError:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from inspect_rom import inspect as inspect_rom_bytes  # type: ignore
 
 VALID_BUTTONS = frozenset({"a", "b", "start", "select", "up", "down", "left", "right"})
 VALID_ACTIONS = frozenset({"press", "release"})

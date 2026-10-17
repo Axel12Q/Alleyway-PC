@@ -56,6 +56,8 @@ typedef struct {
     uint8_t scroll_flag;
     uint8_t total_rows;
     uint8_t row_offset;
+    uint8_t drop_timer;      /* Stage 3 vertical brick drop timer (0xCA3C) */
+    uint16_t bonus_timer;    /* Bonus stage countdown timer in frames/ticks (0xCA3E) */
     uint8_t prev_joyp_raw;
     uint8_t sfx_trigger; /* Queued SFX ID (0 = none, 7 = paddle bounce, 12 = wall bounce, etc.) */
     uint8_t up_index;    /* Index in 0x1B5D 1-UP score table */
@@ -85,34 +87,47 @@ static bool g_key_start = false;
 
 /*
  * Dispatch sound effect to APU Channel 1 using authentic ROM tables:
- * - SFX 1 (Brick type 1): table at 0x6FDE
- * - SFX 2 (Brick type 2): table at 0x6FBB
- * - SFX 3 (Brick type 3): table at 0x6FCA
- * - SFX 7 (Paddle serve/bounce): table at 0x701A
- * - SFX 11 (Ceiling bounce): table at 0x701A (or NR12=0xF0, NR13/14 high)
- * - SFX 12 (Wall bounce): NR10=0x00, NR11=0x80, NR12=0xF0, NR13=0x85, NR14=0x87
+ * - SFX 1 (Brick type 1): table at 0x6FDE (NR10=0x00, NR11=0x71, NR12=0xF2, NR13=0x59, NR14=0x87)
+ * - SFX 2 (Brick type 2): table at 0x6FBB (NR10=0x00, NR11=0x81, NR12=0x72, NR13=0x7B, NR14=0xC7)
+ * - SFX 3 (Brick type 3): table at 0x6FCA (NR10=0x00, NR11=0x81, NR12=0xC2, NR13=0xAC, NR14=0xC7)
+ * - SFX 7 (Paddle serve/bounce): table at 0x701A (NR10=0x1A, NR11=0x81, NR12=0xF0, NR13=0x9D, NR14=0xC7)
+ * - SFX 11 (Ceiling bounce) & SFX 12 (Wall bounce): In the DMG driver, these are software-swept
+ *   routines (0x6B76 / 0x6B8B) that dynamically write NR13/NR14 in VBlank. They remain partially
+ *   modeled until full driver emulation is integrated.
+ *
+ * NOTE: NR10 = 0 is completely valid (no hardware frequency sweep). We must NOT test s->rom[addr] != 0.
  */
 static void apu_dispatch_sfx(const AlleywayStage1 *s, GbApuChannel1 *ch, uint8_t sfx_id) {
     if (sfx_id == 0) return;
-    if (sfx_id == 7 && 0x701A + 5 <= ROM_SIZE_BYTES && s->rom[0x701A] != 0) {
-        gb_apu_ch1_write_regs(ch, s->rom[0x701A], s->rom[0x701B], s->rom[0x701C], s->rom[0x701D], s->rom[0x701E]);
-    } else if (sfx_id == 1 && 0x6FDE + 5 <= ROM_SIZE_BYTES && s->rom[0x6FDE] != 0) {
-        gb_apu_ch1_write_regs(ch, s->rom[0x6FDE], s->rom[0x6FDF], s->rom[0x6FE0], s->rom[0x6FE1], s->rom[0x6FE2]);
-    } else if (sfx_id == 2 && 0x6FBB + 5 <= ROM_SIZE_BYTES && s->rom[0x6FBB] != 0) {
-        gb_apu_ch1_write_regs(ch, s->rom[0x6FBB], s->rom[0x6FBC], s->rom[0x6FBD], s->rom[0x6FBE], s->rom[0x6FBF]);
-    } else if (sfx_id == 3 && 0x6FCA + 5 <= ROM_SIZE_BYTES && s->rom[0x6FCA] != 0) {
-        gb_apu_ch1_write_regs(ch, s->rom[0x6FCA], s->rom[0x6FCB], s->rom[0x6FCC], s->rom[0x6FCD], s->rom[0x6FCE]);
-    } else if (sfx_id == 11) {
-        /* Ceiling bounce */
-        gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0xC0, 0x87);
-    } else if (sfx_id == 12) {
-        /* Wall bounce */
-        gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0x85, 0x87);
-    } else {
-        /* Generic fallback sound */
-        gb_apu_ch1_write_regs(ch, 0x1A, 0x81, 0xF0, 0x9D, 0x87);
+
+    if (s->rom_loaded) {
+        if (sfx_id == 7 && 0x701A + 5 <= ROM_SIZE_BYTES) {
+            gb_apu_ch1_write_regs(ch, s->rom[0x701A], s->rom[0x701B], s->rom[0x701C], s->rom[0x701D], s->rom[0x701E]);
+            return;
+        } else if (sfx_id == 1 && 0x6FDE + 5 <= ROM_SIZE_BYTES) {
+            gb_apu_ch1_write_regs(ch, s->rom[0x6FDE], s->rom[0x6FDF], s->rom[0x6FE0], s->rom[0x6FE1], s->rom[0x6FE2]);
+            return;
+        } else if (sfx_id == 2 && 0x6FBB + 5 <= ROM_SIZE_BYTES) {
+            gb_apu_ch1_write_regs(ch, s->rom[0x6FBB], s->rom[0x6FBC], s->rom[0x6FBD], s->rom[0x6FBE], s->rom[0x6FBF]);
+            return;
+        } else if (sfx_id == 3 && 0x6FCA + 5 <= ROM_SIZE_BYTES) {
+            gb_apu_ch1_write_regs(ch, s->rom[0x6FCA], s->rom[0x6FCB], s->rom[0x6FCC], s->rom[0x6FCD], s->rom[0x6FCE]);
+            return;
+        } else if (sfx_id == 11) {
+            /* Explicitly partial: static approximation for ceiling bounce */
+            gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0xC0, 0x87);
+            return;
+        } else if (sfx_id == 12) {
+            /* Explicitly partial: static approximation for software-swept wall bounce */
+            gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0x85, 0x87);
+            return;
+        }
     }
+
+    /* Fallback / synthetic tone */
+    gb_apu_ch1_write_regs(ch, 0x1A, 0x81, 0xF0, 0x9D, 0x87);
 }
+
 
 static void audio_backend_init(void) {
     gb_apu_ch1_init(&g_apu_ch1, AUDIO_SAMPLE_RATE);
@@ -135,7 +150,19 @@ static void audio_backend_init(void) {
     for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
         g_wave_hdrs[i].lpData = (LPSTR)g_audio_buffers[i];
         g_wave_hdrs[i].dwBufferLength = AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t);
-        waveOutPrepareHeader(g_h_wave_out, &g_wave_hdrs[i], sizeof(WAVEHDR));
+        MMRESULT prep_res = waveOutPrepareHeader(g_h_wave_out, &g_wave_hdrs[i], sizeof(WAVEHDR));
+        if (prep_res != MMSYSERR_NOERROR) {
+            /* Cleanup already prepared headers and close */
+            for (int j = 0; j < i; ++j) {
+                waveOutUnprepareHeader(g_h_wave_out, &g_wave_hdrs[j], sizeof(WAVEHDR));
+            }
+            waveOutClose(g_h_wave_out);
+            g_h_wave_out = NULL;
+            g_audio_enabled = false;
+            return;
+        }
+        /* Mark buffer initially as DONE so it can be written to on first frame */
+        g_wave_hdrs[i].dwFlags |= WHDR_DONE;
     }
     g_audio_enabled = true;
 }
@@ -158,26 +185,29 @@ static void audio_step_frame(void) {
         apu_dispatch_sfx(&g_sim, &g_apu_ch1, g_sim.sfx_trigger);
     }
 
+    /* Advance simulation audio samples always */
+    int16_t current_samples[AUDIO_SAMPLES_PER_FRAME];
+    gb_apu_ch1_render(&g_apu_ch1, current_samples, AUDIO_SAMPLES_PER_FRAME);
+
     if (!g_audio_enabled || !g_h_wave_out) {
-        /* Headless / device-less mode: advance APU state deterministically */
-        int16_t dummy_buf[AUDIO_SAMPLES_PER_FRAME];
-        gb_apu_ch1_render(&g_apu_ch1, dummy_buf, AUDIO_SAMPLES_PER_FRAME);
         return;
     }
 
+    /* Check if current buffer is available (WHDR_DONE set by driver) */
     WAVEHDR *hdr = &g_wave_hdrs[g_current_audio_buf];
-    if (hdr->dwFlags & WHDR_DONE) {
-        waveOutUnprepareHeader(g_h_wave_out, hdr, sizeof(WAVEHDR));
+    if (!(hdr->dwFlags & WHDR_DONE)) {
+        /* Buffer is still playing in hardware: do NOT overwrite it or block */
+        return;
     }
 
-    int16_t *buf = g_audio_buffers[g_current_audio_buf];
-    gb_apu_ch1_render(&g_apu_ch1, buf, AUDIO_SAMPLES_PER_FRAME);
+    /* Copy synthesized samples into hardware buffer */
+    memcpy(g_audio_buffers[g_current_audio_buf], current_samples, sizeof(current_samples));
 
-    hdr->dwFlags = 0;
-    waveOutPrepareHeader(g_h_wave_out, hdr, sizeof(WAVEHDR));
-    waveOutWrite(g_h_wave_out, hdr, sizeof(WAVEHDR));
-
-    g_current_audio_buf = (g_current_audio_buf + 1) % AUDIO_NUM_BUFFERS;
+    /* Send buffer to waveOut device without clearing WHDR_PREPARED */
+    MMRESULT write_res = waveOutWrite(g_h_wave_out, hdr, sizeof(WAVEHDR));
+    if (write_res == MMSYSERR_NOERROR) {
+        g_current_audio_buf = (g_current_audio_buf + 1) % AUDIO_NUM_BUFFERS;
+    }
 }
 
 static uint16_t neg16(uint16_t val) {
@@ -622,6 +652,34 @@ static void step_horizontal_scroll(AlleywayStage1 *s) {
     }
 }
 
+static void step_stage_timers(AlleywayStage1 *s) {
+    /* Stage 3 vertical brick drop: when active, drop_timer counts down.
+     * When it hits 0, row_offset is decremented (shifting visible brick grid downward)
+     * until row_offset reaches 0 (all rows dropped into playfield).
+     * Reload period is authentic (0x3C = 60 ticks / 1 second).
+     */
+    if (s->drop_timer > 0) {
+        s->drop_timer--;
+        if (s->drop_timer == 0) {
+            if (s->row_offset > 0) {
+                s->row_offset--;
+                s->drop_timer = 0x3C;
+            }
+        }
+    }
+
+    /* Bonus stage timer countdown (0x198C..0x1A50):
+     * bonus_timer counts frames/ticks. When it expires, bonus stage ends (state -> 7/8).
+     */
+    if (s->bonus_flag != 0 && s->bonus_timer > 0) {
+        s->bonus_timer--;
+        if (s->bonus_timer == 0) {
+            /* Bonus time expired: trigger bonus clear/end sequence */
+            s->state = 8;
+        }
+    }
+}
+
 static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
     s->sfx_trigger = 0;
     if (s->state == 5) {
@@ -631,6 +689,7 @@ static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_e
         }
     } else if (s->state == 6) {
         step_horizontal_scroll(s);
+        step_stage_timers(s);
         step_ball_and_collisions(s);
         update_paddle(s, joyp_raw);
         if ((joyp_edge & 0x08u) == 0) {
@@ -1072,6 +1131,96 @@ int main(int argc, char **argv) {
         stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         if (g_sim.ball_y_sub != 181 || g_sim.ball_x_sub != 75) return 1;
         puts("PASS: native executable, diagnostic framebuffer and Stage 1 fixed-point engine verified");
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--verify-multi-stage-rules") == 0) {
+        build_synthetic_stage1_rom(&g_sim);
+
+        /* 1. Verify Horizontal Scroll Rule (wrap mod 112 / 0x70, direction & timer reload) */
+        g_sim.scroll_flag = 1;
+        /* Row 0: scroll right (bit 7 = 0), timer=2 */
+        g_sim.row_pattern[0] = 0x02;
+        g_sim.row_timer[0] = 0x02;
+        g_sim.row_shift[0] = 0x6E; /* 110 */
+        /* Tick 1: timer decrements 2 -> 1, shift unchanged */
+        step_horizontal_scroll(&g_sim);
+        if (g_sim.row_timer[0] != 1 || g_sim.row_shift[0] != 0x6E) return 10;
+        /* Tick 2: timer reaches 0, shift wraps 0x6E + 1 -> 0x6F (111), timer reloaded to 2 */
+        step_horizontal_scroll(&g_sim);
+        if (g_sim.row_timer[0] != 2 || g_sim.row_shift[0] != 0x6F) return 11;
+        /* Tick 3: timer decrements 2 -> 1 */
+        step_horizontal_scroll(&g_sim);
+        /* Tick 4: shift wraps 0x6F + 1 -> 0 (mod 0x70 = 112), timer reloaded to 2 */
+        step_horizontal_scroll(&g_sim);
+        if (g_sim.row_shift[0] != 0 || g_sim.row_timer[0] != 2) return 12;
+
+        /* Row 1: scroll left (bit 7 = 1), pattern=0x83 (period 3), shift=0 */
+        g_sim.row_pattern[1] = 0x83;
+        g_sim.row_timer[1] = 1;
+        g_sim.row_shift[1] = 0;
+        /* Step: shift wraps 0 -> 0x6F (111), timer reloads to 3 */
+        step_horizontal_scroll(&g_sim);
+        if (g_sim.row_shift[1] != 0x6F || g_sim.row_timer[1] != 3) return 13;
+
+        /* 2. Verify Bonus Penetration Rule (bonus_flag == 1 clears brick, returns 0 -> no bounce) */
+        g_sim.bonus_flag = 1;
+        g_sim.grid_type[0] = 1;
+        g_sim.grid_hp[0] = 1;
+        g_sim.bricks_left = 5;
+        g_sim.ball_vy = 0x0100; /* moving down */
+        g_sim.ball_vx = 0x0100; /* moving right */
+        /* Probe row 0, col 0 (x=0x10, y=0x18 -> row 0 in grid) */
+        uint8_t hit_res = check_brick_point(&g_sim, 0x18, 0x10);
+        /* Return value must be 0 (no bounce reflection), but brick is destroyed! */
+        if (hit_res != 0) return 20;
+        if (g_sim.grid_type[0] != 0) return 21;
+        if (g_sim.bricks_left != 4) return 22;
+
+        /* 3. Verify 1-UP score table thresholds (0x1B5D) */
+        /* In our synthetic ROM, inject 1-UP threshold: table entry 0 = 0x03E8 (1000 tens = 10,000 pts) */
+        g_sim.rom[0x1B5D] = 0x03;
+        g_sim.rom[0x1B5E] = 0xE8;
+        g_sim.rom[0x1B5F] = 0xFF; /* end sentinel */
+        g_sim.rom[0x1B60] = 0xFF;
+        g_sim.up_index = 0;
+        g_sim.lives = 3;
+        g_sim.score_tens = 999;
+        /* Destroy one brick giving 1 ten (999 -> 1000) */
+        g_sim.grid_type[1] = 1;
+        g_sim.grid_hp[1] = 1;
+        check_brick_point(&g_sim, 0x18, 0x18);
+        if (g_sim.score_tens != 1000) return 30;
+        if (g_sim.lives != 4 || g_sim.up_index != 1) return 31;
+
+        /* 4. Verify Stage 3 vertical brick drop stepping (drop_timer decrement & reload, row_offset decrement) */
+        g_sim.row_offset = 3;
+        g_sim.drop_timer = 2;
+        /* Step 1 tick */
+        step_stage_timers(&g_sim);
+        if (g_sim.drop_timer != 1 || g_sim.row_offset != 3) return 35;
+        /* Step 2 ticks: timer expires, row_offset decreases 3 -> 2, timer reloads to 0x3C (60) */
+        step_stage_timers(&g_sim);
+        if (g_sim.drop_timer != 0x3C || g_sim.row_offset != 2) return 36;
+
+        /* 5. Verify Bonus Stage countdown timer expiration */
+        g_sim.bonus_flag = 1;
+        g_sim.bonus_timer = 2;
+        g_sim.state = 6;
+        step_stage_timers(&g_sim);
+        if (g_sim.bonus_timer != 1 || g_sim.state != 6) return 37;
+        step_stage_timers(&g_sim);
+        if (g_sim.bonus_timer != 0 || g_sim.state != 8) return 38;
+
+        /* 6. Verify Stage Clear transition 31 -> 0 progression */
+        g_sim.stage = 31;
+        g_sim.state = 8; /* Stage Clear */
+        /* Advance with A button (joyp_edge bit 0 = 0) */
+        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
+        if (g_sim.stage != 0) return 40;
+        if (g_sim.state != 5) return 41;
+
+        puts("PASS: multi-stage rules verified (scroll wrap, bonus penetration, 1-UP threshold, vertical drop, bonus countdown, 31->0 wraparound)");
         return 0;
     }
 

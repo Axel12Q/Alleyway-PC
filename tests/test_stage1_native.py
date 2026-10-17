@@ -62,6 +62,10 @@ class NativeStage1VerifierTests(unittest.TestCase):
         proc = subprocess.run([str(EXE_PATH), "--smoke-test"], check=True, capture_output=True, text=True)
         self.assertIn("PASS:", proc.stdout)
 
+    def test_multi_stage_rules_pass(self):
+        proc = subprocess.run([str(EXE_PATH), "--verify-multi-stage-rules"], check=True, capture_output=True, text=True)
+        self.assertIn("PASS: multi-stage rules verified", proc.stdout)
+
     def test_verify_trace_synthetic_and_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)

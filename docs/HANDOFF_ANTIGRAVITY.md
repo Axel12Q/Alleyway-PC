@@ -48,7 +48,9 @@ accelerate future Game Boy native ports.
 - Reusable 2bpp planar tile decoder (`src/gb_tile.h`) with flips, palettes, transparency, and clipping.
 - Reusable APU Channel 1 synthesizer (`src/gb_apu.h`) with cycle-accurate fixed-point phase accumulator, length/sweep/envelope, and decoupled injectable backend (`src/gb_audio_backend.h`).
 - Reusable monotonic real-time DMG scheduler and fractional audio generator (`src/gb_scheduler.h`) with fixed-step accumulation, 59.7275 Hz exact timing, and zero-drift 44,100 Hz fractional sample synthesis (`738 + 23157/65536`).
-- Presentation adaptation for Game Over and Stage Clear banners using cartridge font tiles (`0x5375`), plus opening curtain effect in State 4 (explicitly documented as visual adaptations rather than original OAM/BG display lists).
+- Authentic ROM-driven presentation for Title (`State 2`), Stage 1 Serve (`State 5`), playfield BG/Window, and OAM sprites decoding the 6 KiB VRAM tilebank from `ROM[0x4B75..0x6374]` via Nintendo display list interpreter (`0x02C1`).
+- Bit-exact visual parity verified shade-by-shade against PyBoy on both Title (`State 2`, 100.00% match) and Stage 1 Serve (`State 5`, 100.00% match) via `tests/test_visual_parity.py`.
+- End-to-end Win32 windowed session verification (`--verify-window-session`) testing CreateWindowW, WM_PAINT, QPC scheduler, keyboard input (Start, Move, Serve, Pause, Resume, Reset, Esc), and safe waveOut audio shutdown.
 - Deterministic input timeline, hardware register/watchpoint tracer (`tools/capture_reference.py`).
 - Trace and metadata comparator (`tools/compare_traces.py`).
 - Differential RAM scanner and time-series correlation finder (`tools/scan_ram.py`).
@@ -57,25 +59,30 @@ accelerate future Game Boy native ports.
 - Cartridge header, size, bank alignment, and checksum inspector (`tools/inspect_rom.py`).
 - GitHub Actions CI workflow running on Windows with synthetic fixtures only.
 - Local user dump verified at `../Local-Privado/roms/Alleyway (USA).gb`.
-- Test suite: **40 automated tests passing (`40 OK, 0 expectedFailure`)**.
+- Test suite: **43 automated tests passing (`43 OK, 0 expectedFailure`)**.
 
 ## Evidence vs Limits
 
-- **Verified by C vs PyBoy differential execution**:
+- **Verified by C vs PyBoy differential execution & visual parity**:
+  - Title Screen (`State 2`): 100.00% bit-exact pixel/shade match (23,040 / 23,040 pixels, 0 diffs).
+  - Stage 1 Serve Screen (`State 5`): 100.00% bit-exact pixel/shade match (23,040 / 23,040 pixels, 0 diffs).
+  - Win32 Window Session (`--verify-window-session`): 100% verified e2e through real window creation, WM_PAINT, scheduler, controls, and audio shutdown.
   - Stages 1..4 active play traces (`--verify-trace`: 5,651 ticks Stage 1, 739 ticks Stage 2, 2,138 ticks Stage 3, 140+ ticks Stage 4).
-  - 12 full differential scenarios (`--run-scenario` via `tests/test_scenario_diff.py` across Stages 1, 4, 8, 12, 14, 16, 23, and 32): `normal_clear` (420f), `bonus_drop` (700f), `bonus_expire` (700f), `bonus_perfect` (800f), `bonus_perfect_r1` (800f), `bonus_perfect_r2` (800f), `bonus_perfect_r3` (850f), `life_lost` (420f), `game_over` (850f), `stage32_ending` (2250f), `stage14_horizontal` (350f), and `stage23_vertical` (450f) — all with `0 mismatches` including `prng`.
+  - 12 full differential scenarios (`--run-scenario` via `tests/test_scenario_diff.py` across Stages 1, 4, 8, 12, 14, 16, 23, and 32) with `0 mismatches` including `prng`.
+  - 32-stage curtain duration model validated against observed PyBoy frames (`diff = 0` across all 32 stages, Title entry 221f, Ending return 66f, and VBlank alignments 0, 7, 16, 31). Note: this validates stage transition and curtain timing, not a full 32-stage active gameplay playthrough.
   - Independent clock timing (`--verify-autonomous-clock`), monotonic QPC scheduler and zero-drift fractional audio (`--verify-scheduler-timing`), and multi-stage synthetic rules (`--verify-multi-stage-rules`).
 - **Verified by ROM / PyBoy inspection only (not C execution)**:
-  - `test_original_only_progression_ram_facts_if_present` (checks original ROM behavior in PyBoy) and `test_rom_stage_descriptor_layout_if_present` (checks the 32 stage descriptors and brick counts in ROM bytes; stages outside 1, 2, 3, 4, 8, 12, 14, 16, 23, 32 are covered structurally by this descriptor test rather than individual full-play traces).
+  - `test_original_only_progression_ram_facts_if_present` and `test_rom_stage_descriptor_layout_if_present` (checking structural descriptor layout and brick counts in ROM bytes for stages without full active play traces).
 - **Known limits & open items**:
-  - State 4 curtain visuals and State 8/9/11 text banners are Win32 presentation adaptations, not tilemap/OAM-accurate reimplementations of the intro/intermission screens.
-  - Intro sequences (States 0..3 title screen and Mario entrance visuals), ending sequence animation visuals (State 9), and APU channels 2, 3, 4 remain in progress.
+  - Full frame-by-frame metasprite animations for Mario entering the paddle (`0x43DC` in State 4) and Mario celebration waving (`0x45BD` in State 9) remain in progress.
+  - Additional APU channels (Channel 2 Square 2, Channel 3 Wave, Channel 4 Noise) and software frequency sweeps (`0x6B76`/`0x6B8B`).
 
 ## Roadmap & Budget Guidelines
 
 - Follow user-authorized model selection; avoid spawning subagents unless explicitly requested.
-- Focus on small, bounded milestones backed by unit and differential tests:
+- Focus on small, bounded milestones backed by unit, visual parity, and differential tests:
   1. Complete APU Channels 2 (Square 2), 3 (Wave), and 4 (Noise) and software frequency sweeps (`0x6B76`/`0x6B8B`).
-  2. Frame-by-frame animated intro/title sequence (States 0..3) and ending sequence visuals (State 9).
-- Update `docs/STATUS.md` and `docs/HANDOFF_ANTIGRAVITY.md` after each verified milestone.
+  2. Frame-by-frame animated intermission sequences (Mario entrance `0x43DC` and ending animation `0x45BD`).
+- Update `docs/STATUS.md`, `MODLOG.md`, and `docs/HANDOFF_ANTIGRAVITY.md` after each verified milestone.
+
 

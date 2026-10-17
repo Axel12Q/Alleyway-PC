@@ -62,6 +62,8 @@ typedef struct {
     uint16_t high_score_tens;
     uint8_t lives;
     uint8_t stage;
+    uint8_t normal_stage_count; /* 1-indexed normal stage counter (0xCA46, 1..24 in a loop) */
+    uint8_t bonus_stage_count;  /* Bonus stage counter (0xCA47, 1..8) */
     uint8_t bonus_flag;
     uint8_t scroll_flag;
     uint8_t total_rows;
@@ -85,10 +87,8 @@ static WAVEHDR g_wave_hdrs[AUDIO_NUM_BUFFERS];
 
 /*
  * Measured state durations (frames) from the original cartridge under PyBoy at the
- * atomic VBlank ISR boundary (0x01EF, LY=144), see docs/STATUS.md Hito 12.
+ * atomic VBlank ISR boundary (0x01EF, LY=144), see docs/STATUS.md Hito 12 & Hito 13.
  * "Frames" = recorded VBlanks in which the state value is observed.
- * Presentation (curtain graphics, banners) is an ADAPTATION; only these durations/transitions
- * and gameplay variables are compared with the original.
  */
 #define DUR_CURTAIN_DEFAULT 66u
 #define DUR_MARIO_ENTRY_EXTRA 155u
@@ -109,6 +109,21 @@ static bool is_timed_state(uint8_t st) {
     return st == 4 || st == 7 || st == 8 || st == 9 || st == 0x0B || st == 1;
 }
 
+/*
+ * State 4 (0x06A2..0x0734) duration model:
+ * In the original DMG ROM, State 4 runs:
+ *   - 0x09BB: 30 VBlanks wiping 30 row-pairs of the BG tilemap
+ *   - 0x0942..0x09E0: unhalted CPU loop unpacking `rows * 14` bytes from ROM into WRAM
+ *     (with multiply/lookup per non-empty cell) and counting 840 cells while LCD/VBlank ISR is active
+ *   - 0x06EE: 1 VBlank setup
+ *   - 0x06FA: +155 VBlanks (0x43DC Mario spacecraft entrance) iff 0xCA46 == 1 (first_curtain)
+ *   - 0x0702/0x0706: 0x4669 (normal banner) or 0x46F7 (+33 VBlanks bonus banner jingle)
+ *   - 0x070F..0x0721: 17 VBlanks banner wait + 10 VBlanks (0x0997 bottom-up brick reveal) + 5 VBlanks cleanup.
+ * The integer formula `(next_bonus ? 98 : 65) + (rows * 14 + nonempty * 5) / 390` is an empirical
+ * linear cycle-budget model of the unhalted 0x0942..0x09E0 unpack loop (not a cycle-by-cycle CPU
+ * emulator). It is verified against PyBoy across all 32 stages in the ROM (66..70 frames for normal
+ * stages, 100..101 for bonus stages, 221 from Title, 66 after Ending) with 0 frames of error.
+ */
 static uint16_t compute_stage_curtain_dur(const AlleywayStage1 *s, uint8_t stage_idx) {
     uint16_t dur = DUR_CURTAIN_DEFAULT;
     uint16_t desc_addr = (uint16_t)(0x1BE1u + (uint16_t)stage_idx * 3u);
@@ -332,6 +347,15 @@ static void load_stage_grid(AlleywayStage1 *s) {
     uint8_t desc0 = s->rom[desc_addr];
     s->bonus_flag = (desc0 & 0x80u) ? 1u : 0u;
     s->scroll_flag = (desc0 & 0x40u) ? 1u : 0u;
+    if (s->state == 4) {
+        /* 0x06C0..0x06CA -> 0x0738 (bonus) / 0x0744 (normal) */
+        if (s->bonus_flag != 0) s->bonus_stage_count++;
+        else s->normal_stage_count++;
+    } else {
+        uint8_t comp = (uint8_t)(s->stage + 1u);
+        s->bonus_stage_count = (uint8_t)(comp >> 2);
+        s->normal_stage_count = (uint8_t)(comp - s->bonus_stage_count);
+    }
 
     /* Initialize horizontal scroll pattern buffer if scrolling is enabled */
     if (s->scroll_flag != 0) {
@@ -427,6 +451,8 @@ static void stage1_reset_for_play(AlleywayStage1 *s) {
     s->bonus_tally_remaining = 0;
     s->bonus_1up_delay = 0;
     s->stage = 0;
+    s->normal_stage_count = 1;
+    s->bonus_stage_count = 0;
     s->bonus_flag = 0;
     s->scroll_flag = 0;
     s->prev_joyp_raw = 0xFF;
@@ -987,6 +1013,8 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
             s->lives = 4;
             s->game_over = 0;
             s->stage = 0;
+            s->normal_stage_count = 0;
+            s->bonus_stage_count = 0;
             s->up_index = 0;
             s->serve_pending = 0;
             s->first_curtain = 1u;
@@ -1015,7 +1043,7 @@ static void fill_rect_fb(int x0, int y0, int w, int h, uint32_t color) {
     }
 }
 
-/* Minimal 3x5 digit font for numeric HUD (0-9) */
+/* Minimal 3x5 digit font for synthetic fallback HUD (0-9) */
 static const uint8_t DIGIT_FONT[10][5] = {
     {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7}, {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1},
     {7, 4, 7, 1, 7}, {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7}, {7, 5, 7, 1, 7}
@@ -1045,68 +1073,122 @@ static void draw_diagnostic(void) {
             pixels[y][x] = DMG_SHADES[(x / 40 + y / 36) % 4];
 }
 
+/*
+ * Authentic ROM-driven BG/Window/OAM presentation helpers:
+ * In Alleyway DMG, the entire 6 KiB VRAM tile bank (0x8000..0x97FF, 384 tiles) is stored
+ * contiguously at ROM[0x4B75..0x6374].
+ * - BG/Window tiles (LCDC bit 4 = 0, signed 0x8800 mode): tile ID `t` maps to
+ *   ROM[0x4B75 + ((t >= 0x80) ? t : (256 + t)) * 16].
+ * - OBJ (OAM) tiles (unsigned 0x8000 mode): tile ID `t` maps to ROM[0x4B75 + t * 16]
+ *   (with `t == 0xFF` used as a blank/transparent sprite sentinel).
+ */
+static void blit_rom_bg_tile(const AlleywayStage1 *s, uint8_t tile_id, int sx, int sy, uint8_t bgp) {
+    uint32_t idx = (tile_id >= 0x80u) ? (uint32_t)tile_id : (256u + (uint32_t)tile_id);
+    uint32_t rom_off = 0x4B75u + idx * 16u;
+    if (rom_off + 16u <= ROM_SIZE_BYTES) {
+        gb_tile_blit(&s->rom[rom_off], sx, sy, false, false, false, bgp, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+    }
+}
+
+static void blit_rom_obj_tile(const AlleywayStage1 *s, uint8_t tile_id, int oam_x, int oam_y, uint8_t flags, uint8_t obp) {
+    if (tile_id == 0xFFu || oam_y <= 0 || oam_y >= 160) return;
+    uint32_t rom_off = 0x4B75u + (uint32_t)tile_id * 16u;
+    if (rom_off + 16u <= ROM_SIZE_BYTES) {
+        bool flip_x = (flags & 0x20u) != 0;
+        bool flip_y = (flags & 0x40u) != 0;
+        gb_tile_blit(&s->rom[rom_off], oam_x - 8, oam_y - 16, flip_x, flip_y, true, obp, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+    }
+}
+
+/*
+ * Decodes a Nintendo DMG VRAM stripe display list (0x02C1 in ROM) into bg_map (0x9800..0x9BFF)
+ * and win_map (0x9C00..0x9FFF).
+ * Format: [vram_hi, vram_lo, (mode << 6) | count, data..., 0x00]
+ *   mode 0: horizontal literal (step +1)
+ *   mode 1: horizontal RLE repeat (step +1)
+ *   mode 2: vertical literal (step +32)
+ *   mode 3: vertical RLE repeat (step +32)
+ */
+static void apply_rom_vram_display_list(const AlleywayStage1 *s, uint16_t list_addr,
+                                        uint8_t bg_map[32][32], uint8_t win_map[32][32]) {
+    uint32_t pos = list_addr;
+    while (pos + 2u < ROM_SIZE_BYTES) {
+        uint8_t hi = s->rom[pos];
+        if (hi == 0x00u) break;
+        uint8_t lo = s->rom[pos + 1u];
+        uint8_t ctrl = s->rom[pos + 2u];
+        pos += 3u;
+        uint16_t vaddr = (uint16_t)(((uint16_t)hi << 8) | (uint16_t)lo);
+        uint8_t count = (uint8_t)(ctrl & 0x3Fu);
+        uint8_t mode = (uint8_t)((ctrl >> 6) & 0x03u);
+        uint16_t step = (mode >= 2u) ? 32u : 1u;
+        bool rle = (mode & 1u) != 0;
+        uint8_t rle_val = 0xFFu;
+        if (rle) {
+            if (pos >= ROM_SIZE_BYTES) break;
+            rle_val = s->rom[pos++];
+        }
+        for (uint8_t i = 0; i < count; ++i) {
+            uint8_t val = rle ? rle_val : ((pos < ROM_SIZE_BYTES) ? s->rom[pos++] : 0xFFu);
+            if (vaddr >= 0x9800u && vaddr < 0x9C00u) {
+                uint16_t off = (uint16_t)(vaddr - 0x9800u);
+                bg_map[(off >> 5) & 31u][off & 31u] = val;
+            } else if (vaddr >= 0x9C00u && vaddr < 0xA000u) {
+                uint16_t off = (uint16_t)(vaddr - 0x9C00u);
+                win_map[(off >> 5) & 31u][off & 31u] = val;
+            }
+            vaddr = (uint16_t)(vaddr + step);
+        }
+    }
+}
+
+/* Renders a 2x2 OAM metasprite from the ROM pointer table at 0x4A8B (0x4A66 in ROM). */
+static void draw_rom_metasprite_2x2(const AlleywayStage1 *s, uint8_t meta_idx, int oam_x, int oam_y, uint8_t obp) {
+    uint32_t ptr_off = 0x4A8Bu + (uint32_t)meta_idx * 2u;
+    if (ptr_off + 1u >= ROM_SIZE_BYTES) return;
+    /* Note: 0x4A6E loads D=(HL), E=(HL+1) big-endian! */
+    uint32_t def_off = ((uint32_t)s->rom[ptr_off] << 8) | (uint32_t)s->rom[ptr_off + 1u];
+    if (def_off + 16u > ROM_SIZE_BYTES) return;
+    for (int i = 0; i < 4; ++i) {
+        int dy = (int)(int8_t)s->rom[def_off + (uint32_t)i * 4u + 0u];
+        int dx = (int)(int8_t)s->rom[def_off + (uint32_t)i * 4u + 1u];
+        uint8_t tile = s->rom[def_off + (uint32_t)i * 4u + 2u];
+        uint8_t flags = s->rom[def_off + (uint32_t)i * 4u + 3u];
+        blit_rom_obj_tile(s, tile, oam_x + dx, oam_y + dy, flags, obp);
+    }
+}
+
+/* Renders the 5 OAM score sprites (4 BCD digits + ten-thousands crown icon) matching 0x481E. */
+static void draw_score_oam_5digits(const AlleywayStage1 *s, uint16_t score_tens, int base_oam_x, int base_oam_y, uint8_t obp) {
+    uint8_t d0 = (uint8_t)(score_tens % 10u);
+    uint8_t d1 = (uint8_t)((score_tens / 10u) % 10u);
+    uint8_t d2 = (uint8_t)((score_tens / 100u) % 10u);
+    uint8_t d3 = (uint8_t)((score_tens / 1000u) % 10u);
+    uint8_t d4 = (uint8_t)(score_tens / 10000u);
+    uint8_t crown_tile = 0xFFu;
+    if (d4 == 1u) crown_tile = 0xBFu;
+    else if (d4 == 2u) crown_tile = 0xBCu;
+    else if (d4 >= 3u) crown_tile = 0xC9u;
+    blit_rom_obj_tile(s, crown_tile, base_oam_x, base_oam_y + 8, 0u, obp);
+    blit_rom_obj_tile(s, (uint8_t)(0x80u + d3), base_oam_x, base_oam_y, 0u, obp);
+    blit_rom_obj_tile(s, (uint8_t)(0x80u + d2), base_oam_x + 8, base_oam_y, 0u, obp);
+    blit_rom_obj_tile(s, (uint8_t)(0x80u + d1), base_oam_x + 16, base_oam_y, 0u, obp);
+    blit_rom_obj_tile(s, (uint8_t)(0x80u + d0), base_oam_x + 24, base_oam_y, 0u, obp);
+}
+
 static void render_stage1(const AlleywayStage1 *s) {
     if (!s->rom_loaded) {
         draw_diagnostic();
         return;
     }
-    /* Clear playfield to lightest DMG shade */
-    fill_rect_fb(0, 0, 160, 144, DMG_SHADES[0]);
 
-    /* Left wall (X=0..7), Right wall & HUD panel (X=120..159) in OAM-adjusted screen coords:
-     * Playfield left wall is at OAM X=16 -> screen X=8.
-     * Playfield right wall is at OAM X=128 -> screen X=120.
-     * Top border is at OAM Y=24..31 -> screen Y=8..15 (rows 0..1 of grid!).
-     */
-    fill_rect_fb(0, 0, 8, 144, DMG_SHADES[2]);
-    fill_rect_fb(120, 0, 8, 144, DMG_SHADES[2]);
-    fill_rect_fb(128, 0, 32, 144, DMG_SHADES[3]);
-
-    /* Render 14x20 visible brick cells.
-     * In Alleyway DMG, background tiles 168..176 are located at ROM offset 0x55F5.
-     * Every 8x8 tile packs TWO 4-pixel rows:
-     * - Both rows present: tile = 168 (type 1), 169 (type 2), 170 (type 3).
-     * - Top row only:      tile = 171 (type 1), 172 (type 2), 173 (type 3).
-     * - Bottom row only:   tile = 174 (type 1), 175 (type 2), 176 (type 3).
-     * - Top wall (type 4): tile 179 at ROM offset 0x56A5.
-     */
-    bool has_rom_tiles = (0x56A5 + 16 <= ROM_SIZE_BYTES && s->rom[0x55F5] != 0);
-
-    if (has_rom_tiles) {
-        /* Render paired 8x8 tile rows (r = 0, 2, 4, ..., 18) */
-        for (int r = 0; r < 20; r += 2) {
-            int shift = (int)s->row_shift[r];
-            for (int c = 0; c < GRID_COLS; ++c) {
-                uint8_t top_t = s->grid_type[(r + s->row_offset) * GRID_COLS + c];
-                uint8_t bot_t = s->grid_type[(r + 1 + s->row_offset) * GRID_COLS + c];
-                if (top_t == 0 && bot_t == 0) continue;
-
-                /* Calculate screen X with horizontal shift wrapped across the 112 px (14 cols) width */
-                int col_pixel = (c * 8 - shift) % 112;
-                if (col_pixel < 0) col_pixel += 112;
-                int sx = 8 + col_pixel;
-                int sy = 8 + r * 4;
-
-                uint8_t tile_id = 0;
-                if (top_t == 4 || bot_t == 4) {
-                    tile_id = 179;
-                } else {
-                    uint8_t ref_t = (top_t != 0) ? top_t : bot_t;
-                    uint8_t base_offset = (ref_t >= 1 && ref_t <= 3) ? (uint8_t)(ref_t - 1) : 0u;
-                    if (top_t != 0 && bot_t != 0) {
-                        tile_id = (uint8_t)(168 + base_offset);
-                    } else if (top_t != 0) {
-                        tile_id = (uint8_t)(171 + base_offset);
-                    } else {
-                        tile_id = (uint8_t)(174 + base_offset);
-                    }
-                }
-                uint32_t rom_addr = (tile_id == 179) ? 0x56A5u : (0x55F5u + (uint32_t)(tile_id - 168) * 16u);
-                gb_tile_blit(&s->rom[rom_addr], sx, sy, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-            }
-        }
-    } else {
-        /* Fallback synthetic / block renderer */
+    bool has_authentic_vram = (s->rom[0x4B75] != 0 || s->rom[0x5375] != 0);
+    if (!has_authentic_vram) {
+        /* Fallback synthetic renderer when running with minimal synthetic test ROMs */
+        fill_rect_fb(0, 0, 160, 144, DMG_SHADES[0]);
+        fill_rect_fb(0, 0, 8, 144, DMG_SHADES[2]);
+        fill_rect_fb(120, 0, 8, 144, DMG_SHADES[2]);
+        fill_rect_fb(128, 0, 32, 144, DMG_SHADES[3]);
         for (int r = 0; r < 20; ++r) {
             int shift = (int)s->row_shift[r];
             for (int c = 0; c < GRID_COLS; ++c) {
@@ -1125,118 +1207,320 @@ static void render_stage1(const AlleywayStage1 *s) {
                 }
             }
         }
-    }
-
-    /* Redraw left and right borders over any wrapped tiles extending into borders */
-    fill_rect_fb(0, 0, 8, 144, DMG_SHADES[2]);
-    fill_rect_fb(120, 0, 8, 144, DMG_SHADES[2]);
-    fill_rect_fb(128, 0, 32, 144, DMG_SHADES[3]);
-
-    /* Render Paddle: OAM[0].X = paddle_x + 1 -> screen X = (paddle_x + 1) - 8 = paddle_x - 7
-     * OAM.Y = 144 -> screen Y = 144 - 16 = 128.
-     * Authentic DMG paddle:
-     * - Normal (24 px): Tile 0 at 0x4B75 (left cap), Tile 1 at 0x4B85 (middle), Tile 0 flipped X (right cap).
-     * - Shrunk (16 px): Tile 0 (left cap), Tile 0 flipped X (right cap).
-     */
-    int pad_sx = (int)s->paddle_x - 7;
-    int pad_sy = (int)s->paddle_y - 16;
-    bool has_paddle_tiles = (0x4B85 + 16 <= ROM_SIZE_BYTES && s->rom[0x4B75] != 0);
-
-    if (has_paddle_tiles) {
-        if (s->paddle_w == 16) {
-            /* Left cap (8x8) */
-            gb_tile_blit(&s->rom[0x4B75], pad_sx, pad_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-            /* Right cap (8x8 flipped X) */
-            gb_tile_blit(&s->rom[0x4B75], pad_sx + 8, pad_sy, true, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-        } else {
-            /* Left cap */
-            gb_tile_blit(&s->rom[0x4B75], pad_sx, pad_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-            /* Middle piece */
-            gb_tile_blit(&s->rom[0x4B85], pad_sx + 8, pad_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-            /* Right cap */
-            gb_tile_blit(&s->rom[0x4B75], pad_sx + 16, pad_sy, true, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-        }
-    } else {
+        fill_rect_fb(0, 0, 8, 144, DMG_SHADES[2]);
+        fill_rect_fb(120, 0, 8, 144, DMG_SHADES[2]);
+        fill_rect_fb(128, 0, 32, 144, DMG_SHADES[3]);
+        int pad_sx = (int)s->paddle_x - 7;
+        int pad_sy = (int)s->paddle_y - 16;
         fill_rect_fb(pad_sx, pad_sy, (int)s->paddle_w, 6, DMG_SHADES[3]);
         fill_rect_fb(pad_sx + 2, pad_sy + 1, (int)s->paddle_w - 4, 2, DMG_SHADES[1]);
+        if (s->state == 6 || s->state == 0x0C) {
+            fill_rect_fb((int)s->ball_x - 8, (int)s->ball_y - 16, 4, 4, DMG_SHADES[3]);
+        }
+        draw_number_fb(132, 16, (uint32_t)s->high_score_tens, 5, DMG_SHADES[0]);
+        draw_number_fb(132, 36, (uint32_t)s->score_tens, 5, DMG_SHADES[0]);
+        draw_number_fb(144, 88, (uint32_t)s->lives, 2, DMG_SHADES[0]);
+        draw_number_fb(144, 112, (uint32_t)s->normal_stage_count, 2, DMG_SHADES[1]);
+        return;
     }
 
-    /* Render Ball: Tile 5 at ROM 0x4BC5
-     * Active (state == 6 or 0x0C): OAM.X = ball_x -> screen X = ball_x - 8, Y = ball_y - 16
-     */
-    bool has_ball_tile = (0x4BC5 + 16 <= ROM_SIZE_BYTES && s->rom[0x4BC5] != 0);
+    uint8_t bg_map[32][32];
+    uint8_t win_map[32][32];
+    memset(bg_map, 0xFF, sizeof(bg_map));
+    memset(win_map, 0xFF, sizeof(win_map));
 
-    if (s->state == 6 || s->state == 0x0C) {
-        int ball_sx = (int)s->ball_x - 8;
-        int ball_sy = (int)s->ball_y - 16;
-        if (has_ball_tile) {
-            gb_tile_blit(&s->rom[0x4BC5], ball_sx, ball_sy, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-        } else {
-            fill_rect_fb(ball_sx, ball_sy, 4, 4, DMG_SHADES[3]);
+    /* 1. Title Screen (State 1 / State 2, 0x055A..0x0604):
+     *    LCDC = 0x83 (Window OFF), BG display list at 0x41CD, High Score OAM[10..14] at (112, 104). */
+    if (s->state == 1 || s->state == 2) {
+        apply_rom_vram_display_list(s, 0x41CDu, bg_map, win_map);
+        for (int r = 0; r < 18; ++r) {
+            for (int c = 0; c < 20; ++c) {
+                blit_rom_bg_tile(s, bg_map[r][c], c * 8, r * 8, 0xE4u);
+            }
         }
-    } else if (s->state == 5) {
-        /* Preview ball resting above paddle before serve */
-        int preview_sx = pad_sx + ((int)s->paddle_w / 2) - 2;
-        int preview_sy = pad_sy - 5;
-        if (has_ball_tile) {
-            gb_tile_blit(&s->rom[0x4BC5], preview_sx - 1, preview_sy - 1, false, false, true, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-        } else {
-            fill_rect_fb(preview_sx, preview_sy, 4, 4, DMG_SHADES[2]);
+        draw_score_oam_5digits(s, s->high_score_tens, 112, 104, 0xE4u);
+        return;
+    }
+
+    /* 2. Game Over Final Screen (State 0x0B with game_over != 0 during last 194 frames, 0x08D9..0x0905):
+     *    After Mario's ejection + 64-frame wait (183 frames elapsed), LCDC turns off Window (0x83),
+     *    clears BG to 0xFF, and 0x498A writes 8 OAM sprites "GAME OVER" at OAM.Y = 80, X = 56..120. */
+    if (s->state == 0x0B && s->game_over != 0 && s->state_timer <= 194u) {
+        fill_rect_fb(0, 0, 160, 144, DMG_SHADES[0]);
+        static const uint8_t go_tiles[8] = {0x90u, 0x8Au, 0x96u, 0x8Eu, 0x98u, 0x9Fu, 0x8Eu, 0x9Bu};
+        static const int go_x[8] = {56, 64, 72, 80, 96, 104, 112, 120};
+        for (int i = 0; i < 8; ++i) {
+            blit_rom_obj_tile(s, go_tiles[i], go_x[i], 80, 0u, 0xE4u);
+        }
+        return;
+    }
+
+    /* 3. Ending Celebration (State 9, 1445 frames after Stage 32, 0x0839..0x08A7):
+     *    Loads Playfield/HUD display list 0x4A3C and Ending portrait display list 0x42B3 ("NICE PLAY!" + Mario),
+     *    fades palette via 0x08C2..0x08C9, animates Mario waving (0x45BD, metasprites at 0x45E6),
+     *    and reveals "TRY AGAIN!" display list 0x1B0D in the final third of the sequence. */
+    if (s->state == 9) {
+        int el = (int)DUR_ENDING - (int)s->state_timer;
+        uint8_t pal = 0xE4u;
+        if (el < 64) {
+            int step = el / 16;
+            if (step > 3) step = 3;
+            pal = s->rom[0x08C2u + (uint32_t)step];
+        } else if (el < 128) {
+            int step = (el - 64) / 16;
+            if (step > 3) step = 3;
+            pal = s->rom[0x08C6u + (uint32_t)step];
+        } else if (el >= 1381) {
+            int step = (el - 1381) / 16;
+            if (step > 3) step = 3;
+            pal = s->rom[0x08C2u + (uint32_t)step];
+        }
+        apply_rom_vram_display_list(s, 0x4A3Cu, bg_map, win_map);
+        uint8_t disp_stg = (s->normal_stage_count > 0u) ? s->normal_stage_count : 24u;
+        win_map[11][2] = (uint8_t)(0x80u + ((disp_stg / 10u) % 10u));
+        win_map[11][3] = (uint8_t)(0x80u + (disp_stg % 10u));
+        win_map[16][4] = (uint8_t)(0x80u + (s->lives % 10u));
+        if (el >= 64 && el < 1381) {
+            apply_rom_vram_display_list(s, 0x42B3u, bg_map, win_map);
+            if (el >= 1020 && el < 1340) {
+                apply_rom_vram_display_list(s, 0x1B0Du, bg_map, win_map);
+            }
+        }
+        for (int r = 0; r < 18; ++r) {
+            for (int c = 0; c < 15; ++c) {
+                blit_rom_bg_tile(s, bg_map[r][c], c * 8, r * 8, pal);
+            }
+            for (int c = 0; c < 5; ++c) {
+                blit_rom_bg_tile(s, win_map[r][c], 120 + c * 8, r * 8, pal);
+            }
+        }
+        draw_score_oam_5digits(s, s->high_score_tens, 136, 32, pal);
+        draw_score_oam_5digits(s, s->score_tens, 136, 56, pal);
+        if (el >= 134 && el < 680) {
+            int wave_step = ((el - 134) / 19) % 29;
+            uint8_t meta_idx = s->rom[0x45E6u + (uint32_t)wave_step];
+            draw_rom_metasprite_2x2(s, meta_idx, 56, 72, pal);
+        }
+        return;
+    }
+
+    /* 4. Playfield + Right HUD Window (States 4, 5, 6, 7, 8, 0x0C, and early 0x0B):
+     *    LCDC = 0xE3 (Window ON at WX=127, WY=0 -> screen X=120..159), display list at 0x4A3C. */
+    apply_rom_vram_display_list(s, 0x4A3Cu, bg_map, win_map);
+    win_map[11][2] = (uint8_t)(0x80u + ((s->normal_stage_count / 10u) % 10u));
+    win_map[11][3] = (uint8_t)(0x80u + (s->normal_stage_count % 10u));
+    win_map[16][4] = (uint8_t)(0x80u + (s->lives % 10u));
+    bool show_bonus_time_hud = (s->bonus_flag != 0) &&
+                               (s->state != 4 || s->state_timer <= 5u);
+    if (show_bonus_time_hud) {
+        /* 0x47E4: writes "TIME" at 0x9DA1..0x9DA4 (Window row 13, cols 1..4) */
+        win_map[13][1] = 0x9Du;
+        win_map[13][2] = 0x92u;
+        win_map[13][3] = 0x96u;
+        win_map[13][4] = 0x8Eu;
+    }
+
+    /* Render BG playfield base (cols 0..14, rows 0..17) */
+    for (int r = 0; r < 18; ++r) {
+        for (int c = 0; c < 15; ++c) {
+            /* In State 4 before brick reveal (0x09BB wipe), row 1 is cleared to 0xFF */
+            uint8_t tid = (s->state == 4 && r >= 1) ? 0xFFu : bg_map[r][c];
+            blit_rom_bg_tile(s, tid, c * 8, r * 8, 0xE4u);
         }
     }
 
-    /* HUD numbers on right panel (X = 132..156): High Score, Score, Bricks/Bonus timer, Lives, Stage */
-    draw_number_fb(132, 16, (uint32_t)s->high_score_tens * 10u, 6, DMG_SHADES[0]);
-    draw_number_fb(132, 36, (uint32_t)s->score_tens * 10u, 6, DMG_SHADES[0]);
-    if (s->bonus_flag != 0) {
-        /* In bonus stages, display remaining countdown seconds in HUD */
-        draw_number_fb(144, 64, (uint32_t)s->bonus_timer, 2, DMG_SHADES[0]);
+    /* Determine visible brick tile rows (0x0997 in State 4 reveals 1 tile row = 2 brick rows
+     * per frame from bottom row_pair=9 up to row_pair=0 over the final 15 frames of State 4,
+     * normalized for any curtain_dur). */
+    int min_row_pair = 0;
+    if (s->state == 4) {
+        int open_start = (s->curtain_dur >= 20u) ? 15 : (int)(s->curtain_dur / 4u);
+        if (open_start < 1) open_start = 1;
+        if ((int)s->state_timer > open_start) {
+            min_row_pair = 10; /* Curtain closed: 0 brick rows visible */
+        } else {
+            int revealed = (open_start + 1 - (int)s->state_timer);
+            if (open_start < 10) {
+                revealed = (revealed * 10) / open_start;
+            }
+            if (revealed > 10) revealed = 10;
+            if (revealed < 0) revealed = 0;
+            min_row_pair = 10 - revealed;
+        }
+    }
+
+    /* Render paired 8x8 brick tile rows (r = 0, 2, ..., 18 -> row_pair = 0..9) using 0x0AC9..0x0B08 lookup */
+    for (int row_pair = min_row_pair; row_pair < 10; ++row_pair) {
+        int r = row_pair * 2;
+        int shift = (int)s->row_shift[r];
+        for (int c = 0; c < GRID_COLS; ++c) {
+            uint8_t top_t = s->grid_type[(r + s->row_offset) * GRID_COLS + c];
+            uint8_t bot_t = s->grid_type[(r + 1 + s->row_offset) * GRID_COLS + c];
+            if (top_t == 0 && bot_t == 0) continue;
+
+            int col_pixel = (c * 8 - shift) % 112;
+            if (col_pixel < 0) col_pixel += 112;
+            int sx = 8 + col_pixel;
+            int sy = 8 + r * 4;
+
+            /* Authentic 0x0AC9..0x0B08 lookup into 0x1B87 brick property table:
+             * When both top_t and bot_t are non-zero, 0x0AE4 overwrites 0xFFB1 with bot_t.
+             * mask = (top_t != 0 ? 1 : 0) | (bot_t != 0 ? 2 : 0) -> offset (mask - 1) in 0..2. */
+            uint8_t btype = (bot_t != 0) ? bot_t : top_t;
+            uint8_t mask = (uint8_t)((top_t != 0 ? 1u : 0u) | (bot_t != 0 ? 2u : 0u));
+            uint8_t tile_id = 0xFFu;
+            uint16_t tbl_off = (uint16_t)(0x1B87u + (uint16_t)(btype - 1u) * 6u + (uint16_t)(mask - 1u));
+            if (btype >= 1u && tbl_off < ROM_SIZE_BYTES) {
+                tile_id = s->rom[tbl_off];
+            }
+            blit_rom_bg_tile(s, tile_id, sx, sy, 0xE4u);
+        }
+    }
+
+    /* Render Left Wall column 0 top corner (0xBD) and OAM[15..31] left-wall pipe sprites (0xB4 at X=8, Y=24..152) */
+    blit_rom_bg_tile(s, bg_map[0][0], 0, 0, 0xE4u);
+    for (int r = 1; r < 18; ++r) {
+        blit_rom_bg_tile(s, 0xFFu, 0, r * 8, 0xE4u);
+        blit_rom_obj_tile(s, 0xB4u, 8, (r + 2) * 8, 0u, 0xE4u);
+    }
+
+    /* Render Right Window (WX=127 -> screen X=120..159, cols 0..4, rows 0..17) */
+    for (int r = 0; r < 18; ++r) {
+        for (int c = 0; c < 5; ++c) {
+            blit_rom_bg_tile(s, win_map[r][c], 120 + c * 8, r * 8, 0xE4u);
+        }
+    }
+
+    /* Render HUD OAM scores: High Score (OAM[10..14] at Y=32) and 1UP Score (OAM[5..9] at Y=56) */
+    draw_score_oam_5digits(s, s->high_score_tens, 136, 32, 0xE4u);
+    draw_score_oam_5digits(s, s->score_tens, 136, 56, 0xE4u);
+
+    /* Render Bonus Countdown Timer OAM[32..33] at (144..152, 128) when active (0x19A2) */
+    if (show_bonus_time_hud) {
+        blit_rom_obj_tile(s, (uint8_t)(0x80u + ((s->bonus_timer / 10u) % 10u)), 144, 128, 0u, 0xE4u);
+        blit_rom_obj_tile(s, (uint8_t)(0x80u + (s->bonus_timer % 10u)), 152, 128, 0u, 0xE4u);
+    }
+
+    /* State-specific OAM composition (Paddle, Ball, Mario entrance/ejection, Stage/Bonus banner, Bonus tally) */
+    if (s->state == 4) {
+        int el = (int)s->curtain_dur - (int)s->state_timer;
+        bool is_first_mario_entry = (s->curtain_dur >= 200u);
+        if (!is_first_mario_entry || el >= 38) {
+            uint8_t hatch = 0u; /* 0x4554: 0=(00,01,00), 1=(00,04,00), 2=(00,03,00), 3=(02,03,02) */
+            if (is_first_mario_entry) {
+                if (el >= 94 && el <= 99) hatch = 1u;
+                else if (el >= 100 && el <= 107) hatch = 2u;
+                else if (el >= 108 && el <= 168) hatch = 3u;
+                else if (el >= 169 && el <= 180) hatch = 2u;
+                else if (el >= 181 && el <= 192) hatch = 1u;
+            }
+            uint16_t p_off = (uint16_t)(0x4554u + (uint16_t)hatch * 3u);
+            int px = (int)s->paddle_x + 1;
+            int py = (int)s->paddle_y;
+            blit_rom_obj_tile(s, s->rom[p_off + 0u], px, py, 0u, 0xE4u);
+            blit_rom_obj_tile(s, s->rom[p_off + 1u], px + 8, py, 0u, 0xE4u);
+            blit_rom_obj_tile(s, s->rom[p_off + 2u], px + 16, py, 0x20u, 0xE4u);
+        }
+        if (is_first_mario_entry) {
+            /* 0x43DC: Mario walks in from X=120 to 68, jumps along 0x44F5 arc into open paddle */
+            if (el >= 38 && el <= 93) {
+                int step = el - 38;
+                uint8_t meta_idx = (uint8_t)((step / 5) % 3);
+                draw_rom_metasprite_2x2(s, meta_idx, 120 - step, 128, 0xE4u);
+            } else if (el >= 94 && el <= 115) {
+                draw_rom_metasprite_2x2(s, 3u, 68, 128, 0xE4u);
+            } else if (el >= 116 && el <= 139) {
+                int step = el - 115;
+                int my = 128;
+                for (int k = 0; k < step && (0x44F5u + (uint32_t)k) < ROM_SIZE_BYTES; ++k) {
+                    my += (int)(int8_t)s->rom[0x44F5u + (uint32_t)k];
+                }
+                draw_rom_metasprite_2x2(s, 4u, 68 - step, my, 0xE4u);
+            } else if (el == 140) {
+                draw_rom_metasprite_2x2(s, 4u, 44, 132, 0xE4u);
+            }
+        }
+        /* 0x4669 ("STAGE XX") / 0x46F7 ("BONUS") OAM banner */
+        if (s->bonus_flag == 0 && s->state_timer <= 28u && s->state_timer >= 1u) {
+            static const uint8_t stg_str[6] = {0x9Cu, 0x9Du, 0x8Au, 0x90u, 0x8Eu, 0x3Eu};
+            for (int i = 0; i < 6; ++i) {
+                blit_rom_obj_tile(s, stg_str[i], 48 + i * 8, 112, 0u, 0xE4u);
+            }
+            blit_rom_obj_tile(s, (uint8_t)(0x80u + ((s->normal_stage_count / 10u) % 10u)), 96, 112, 0u, 0xE4u);
+            blit_rom_obj_tile(s, (uint8_t)(0x80u + (s->normal_stage_count % 10u)), 104, 112, 0u, 0xE4u);
+        } else if (s->bonus_flag != 0 && s->state_timer <= 61u && s->state_timer >= 6u) {
+            static const uint8_t bon_str[5] = {0x8Bu, 0x98u, 0x97u, 0x9Eu, 0x9Cu};
+            for (int i = 0; i < 5; ++i) {
+                blit_rom_obj_tile(s, bon_str[i], 56 + i * 8, 112, 0u, 0xE4u);
+            }
+        }
+        return;
+    }
+
+    if (s->state == 7) {
+        int el = (int)((s->bonus_flag != 0 ? DUR_BONUS_END : DUR_DEATH) - s->state_timer);
+        if (s->bonus_flag == 0) {
+            /* 0x455D: 36-frame paddle explosion using metasprites 7..9 at 0x4599 */
+            if (el >= 0 && el < 36 && (0x4599u + (uint32_t)el) < ROM_SIZE_BYTES) {
+                uint8_t meta_idx = s->rom[0x4599u + (uint32_t)el];
+                draw_rom_metasprite_2x2(s, meta_idx, (int)s->ball_x - 8, 144, 0xE4u);
+            }
+            return;
+        }
+    }
+
+    if (s->state == 0x0B && s->game_over != 0) {
+        /* First 183 frames of Game Over (0x08D1 -> 0x444D): open paddle hatch and eject Mario */
+        int el = (int)DUR_GAME_OVER - (int)s->state_timer;
+        int px = (int)s->paddle_x + 1;
+        int py = (int)s->paddle_y;
+        uint8_t hatch = (el < 8) ? 1u : ((el < 16) ? 2u : 3u);
+        uint16_t p_off = (uint16_t)(0x4554u + (uint16_t)hatch * 3u);
+        blit_rom_obj_tile(s, s->rom[p_off + 0u], px, py, 0u, 0xE4u);
+        blit_rom_obj_tile(s, s->rom[p_off + 1u], px + 8, py, 0u, 0xE4u);
+        blit_rom_obj_tile(s, s->rom[p_off + 2u], px + 16, py, 0x20u, 0xE4u);
+        if (el >= 24 && el < 54) {
+            int step = el - 24;
+            int j_steps = (step < 24) ? step : 24;
+            int my = 136;
+            for (int k = 0; k < j_steps && (0x44F5u + (uint32_t)k) < ROM_SIZE_BYTES; ++k) {
+                my += (int)(int8_t)s->rom[0x44F5u + (uint32_t)k];
+            }
+            if (step >= 24) my += (step - 23) * 4;
+            int dir = (s->paddle_x < 0x4Cu) ? 1 : -1;
+            uint8_t meta_idx = (s->paddle_x < 0x4Cu) ? 5u : 6u;
+            draw_rom_metasprite_2x2(s, meta_idx, (int)s->paddle_x + 4 + dir * j_steps, my, 0xE4u);
+        }
+        return;
+    }
+
+    /* Render Paddle OAM[0..2] (normal 24 px or shrunk 16 px) */
+    int pad_oam_x = (int)s->paddle_x + 1;
+    int pad_oam_y = (int)s->paddle_y;
+    if (s->paddle_w == 16) {
+        blit_rom_obj_tile(s, 0x00u, pad_oam_x, pad_oam_y, 0u, 0xE4u);
+        blit_rom_obj_tile(s, 0x00u, pad_oam_x + 8, pad_oam_y, 0x20u, 0xE4u);
     } else {
-        draw_number_fb(140, 64, (uint32_t)s->bricks_left, 3, DMG_SHADES[1]);
+        blit_rom_obj_tile(s, 0x00u, pad_oam_x, pad_oam_y, 0u, 0xE4u);
+        blit_rom_obj_tile(s, 0x01u, pad_oam_x + 8, pad_oam_y, 0u, 0xE4u);
+        blit_rom_obj_tile(s, 0x00u, pad_oam_x + 16, pad_oam_y, 0x20u, 0xE4u);
     }
-    draw_number_fb(144, 88, (uint32_t)s->lives, 2, DMG_SHADES[0]);
-    draw_number_fb(144, 112, (uint32_t)(s->stage + 1u), 2, DMG_SHADES[1]);
 
-    /* Authentic banners and transitions:
-     * 1. State 4 (Curtains): Draw closing / opening curtain borders across playfield (X = 8..119).
-     * 2. State 8 (Stage Clear): Draw "STAGE CLEAR" banner.
-     * 3. State 9 (Ending Celebration): Draw "CLEAR" banner.
-     * 4. State 0x0B (Game Over): Draw "GAME OVER" banner.
-     */
-    if (s->state == 4 && s->state_timer > 0) {
-        /* Curtains move inwards/outwards: width proportional to remaining timer */
-        int curtain_w = ((int)s->state_timer * 56) / 67;
-        if (curtain_w > 56) curtain_w = 56;
-        fill_rect_fb(8, 8, curtain_w, 128, DMG_SHADES[2]);
-        fill_rect_fb(120 - curtain_w, 8, curtain_w, 128, DMG_SHADES[2]);
-    } else if (s->state == 0x0B) {
-        /* Render GAME OVER box: background plate + authentic font tiles */
-        fill_rect_fb(28, 56, 72, 28, DMG_SHADES[3]);
-        fill_rect_fb(30, 58, 68, 24, DMG_SHADES[0]);
-        /* "GAME" centered at Y=62, "OVER" at Y=70 */
-        static const uint8_t game_str[4] = {0x90, 0x8A, 0x96, 0x8E};
-        static const uint8_t over_str[4] = {0x98, 0x9F, 0x8E, 0x9B};
-        for (int i = 0; i < 4; ++i) {
-            uint32_t g_addr = 0x5375u + (uint32_t)game_str[i] * 16u;
-            uint32_t o_addr = 0x5375u + (uint32_t)over_str[i] * 16u;
-            if (g_addr + 16u <= ROM_SIZE_BYTES) {
-                gb_tile_blit(&s->rom[g_addr], 48 + i * 8, 62, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-            }
-            if (o_addr + 16u <= ROM_SIZE_BYTES) {
-                gb_tile_blit(&s->rom[o_addr], 48 + i * 8, 70, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-            }
-        }
-    } else if (s->state == 8 || s->state == 9) {
-        /* Render STAGE CLEAR / CLEAR box */
-        fill_rect_fb(20, 60, 88, 20, DMG_SHADES[3]);
-        fill_rect_fb(22, 62, 84, 16, DMG_SHADES[0]);
-        static const uint8_t clear_str[10] = {0x9C, 0x9D, 0x8A, 0x90, 0x8E, 0x8C, 0x95, 0x8E, 0x8A, 0x9B};
-        for (int i = 0; i < 10; ++i) {
-            uint32_t c_addr = 0x5375u + (uint32_t)clear_str[i] * 16u;
-            int x_pos = (i < 5) ? (24 + i * 8) : (28 + i * 8);
-            if (c_addr + 16u <= ROM_SIZE_BYTES) {
-                gb_tile_blit(&s->rom[c_addr], x_pos, 66, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
-            }
+    /* Render Ball OAM[3] (tile 0x05): active in States 6, 8, 0x0C, and State 5 during serve_pending */
+    if (s->state == 6 || s->state == 8 || s->state == 0x0C || (s->state == 5 && s->serve_pending != 0)) {
+        blit_rom_obj_tile(s, 0x05u, (int)s->ball_x, (int)s->ball_y, 0u, 0xE4u);
+    }
+
+    /* Render Perfect Bonus Tally OAM[34..37] at (48..72, 120) during tally phase of State 8 (0x4949) */
+    if (s->state == 8 && s->bonus_flag != 0 && s->bricks_left == 0) {
+        uint16_t tally_frames = (uint16_t)(s->bonus_tally_remaining / BONUS_TALLY_STEP_TENS);
+        int pre_left = (int)s->state_timer - (int)tally_frames;
+        if (pre_left <= 130) {
+            uint16_t rem = s->bonus_tally_remaining;
+            blit_rom_obj_tile(s, (uint8_t)(0x80u + ((rem / 1000u) % 10u)), 48, 120, 0u, 0xE4u);
+            blit_rom_obj_tile(s, (uint8_t)(0x80u + ((rem / 100u) % 10u)), 56, 120, 0u, 0xE4u);
+            blit_rom_obj_tile(s, (uint8_t)(0x80u + ((rem / 10u) % 10u)), 64, 120, 0u, 0xE4u);
+            blit_rom_obj_tile(s, (uint8_t)(0x80u + (rem % 10u)), 72, 120, 0u, 0xE4u);
         }
     }
 }
@@ -1536,16 +1820,38 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
     return (initialized && ticks_compared > 0 && mismatches == 0) ? 0 : 1;
 }
 
+static bool write_framebuffer_ppm(const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    fprintf(fp, "P6\n160 144\n255\n");
+    for (int y = 0; y < 144; ++y) {
+        uint8_t row_rgb[160 * 3];
+        for (int x = 0; x < 160; ++x) {
+            uint32_t c = pixels[y][x];
+            row_rgb[x * 3 + 0] = (uint8_t)((c >> 16) & 0xFFu);
+            row_rgb[x * 3 + 1] = (uint8_t)((c >> 8) & 0xFFu);
+            row_rgb[x * 3 + 2] = (uint8_t)(c & 0xFFu);
+        }
+        if (fwrite(row_rgb, 1, sizeof(row_rgb), fp) != sizeof(row_rgb)) {
+            fclose(fp);
+            return false;
+        }
+    }
+    fclose(fp);
+    return true;
+}
+
 /*
- * --run-scenario <rom> <scenario.jsonl>
+ * --run-scenario <rom> <scenario.jsonl> [--dump-ppm <tick> <out.ppm>]
  * Autonomous native run for ORIGINAL-vs-NATIVE differential tests.
  * Line 1: snapshot of the original taken at a VBlank boundary (same keys as logic trace).
  * Lines 2..N: ONLY inputs (in_joyp_raw / in_joyp_edge) latched by the original. No expected
  * values are read, so the native clock, timers and state machine run on their own.
  * Output: one JSON line per tick with state/stage/lives/score_tens/bonus_flag/bonus_timer/prng
- * and ball/paddle/scroll fields.
+ * and ball/paddle/scroll fields. When --dump-ppm is specified, invokes the production
+ * render_stage1(&g_sim) function at the target tick (-1 for initial snapshot, >=0 for step tick).
  */
-static int run_scenario(const char *rom_path, const char *scenario_path) {
+static int run_scenario(const char *rom_path, const char *scenario_path, int dump_tick, const char *dump_ppm_path) {
     if (!try_load_rom_file(&g_sim, rom_path)) {
         fprintf(stderr, "Error: failed to load valid 32 KiB ROM from %s\n", rom_path);
         return 2;
@@ -1566,6 +1872,19 @@ static int run_scenario(const char *rom_path, const char *scenario_path) {
             stage1_reset_for_play(&g_sim);
             if (extract_json_int(line, "stage", &v)) g_sim.stage = (uint8_t)v;
             load_stage_grid(&g_sim);
+            /* Initialize stage progression counters (0xCA46 / 0xCA47) from stage index unless overridden */
+            if (st == 2) {
+                g_sim.normal_stage_count = 0;
+                g_sim.bonus_stage_count = 0;
+            } else {
+                uint8_t completed = (uint8_t)((g_sim.stage & 0x1Fu) + 1u);
+                uint8_t bon_cnt = (uint8_t)(completed / 4u);
+                g_sim.normal_stage_count = (uint8_t)(completed - bon_cnt);
+                g_sim.bonus_stage_count = bon_cnt;
+            }
+            if (extract_json_int(line, "normal_stage_count", &v)) g_sim.normal_stage_count = (uint8_t)v;
+            if (extract_json_int(line, "bonus_stage_count", &v)) g_sim.bonus_stage_count = (uint8_t)v;
+            if (extract_json_int(line, "high_score_tens", &v)) g_sim.high_score_tens = (uint16_t)v;
             g_sim.state = (uint8_t)st;
             g_sim.state_timer = 0;
             if (extract_json_int(line, "prng", &v)) g_sim.prng = (uint8_t)v;
@@ -1595,19 +1914,33 @@ static int run_scenario(const char *rom_path, const char *scenario_path) {
                 if (extract_json_int(line, key_s, &v)) g_sim.row_shift[r] = (uint8_t)v;
                 if (extract_json_int(line, key_t, &v)) g_sim.row_timer[r] = (uint8_t)v;
             }
-            /* A snapshot taken inside a timed state has no meaningful entry; scenarios snapshot in state 5/6 only. */
-            if (st != 5 && st != 6) {
-                fprintf(stderr, "Error: scenario snapshot must be taken in state 5 or 6\n");
+            /* Snapshots are taken at interactive waiting states: Title wait (2), Serve (5), or Active play (6). */
+            if (st != 2 && st != 5 && st != 6) {
+                fprintf(stderr, "Error: scenario snapshot must be taken in state 2, 5, or 6\n");
                 fclose(fp);
                 return 2;
             }
             initialized = true;
+            if (dump_ppm_path && dump_tick == -1) {
+                render_stage1(&g_sim);
+                if (!write_framebuffer_ppm(dump_ppm_path)) {
+                    fclose(fp);
+                    return 3;
+                }
+            }
             continue;
         }
         if (!extract_json_int(line, "in_joyp_raw", &in_raw)) continue;
         extract_json_int(line, "in_joyp_edge", &in_edge);
         stage1_step_tick(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge);
-        printf("{\"tick\":%d,\"state\":%u,\"stage\":%u,\"lives\":%u,\"score_tens\":%u,\"bonus_flag\":%u,\"bonus_timer\":%u,\"prng\":%u,\"bricks_left\":%u,\"paddle_x\":%u,\"paddle_w\":%u,\"ball_x\":%u,\"ball_x_sub\":%u,\"ball_y\":%u,\"ball_y_sub\":%u,\"ball_vx\":%u,\"ball_vy\":%u,\"speed_idx\":%u,\"row_offset\":%u,\"scroll_timer\":%u,\"scroll_step\":%u,\"row_shift_0\":%u,\"row_shift_6\":%u}\n",
+        if (dump_ppm_path && tick == dump_tick) {
+            render_stage1(&g_sim);
+            if (!write_framebuffer_ppm(dump_ppm_path)) {
+                fclose(fp);
+                return 3;
+            }
+        }
+        printf("{\"tick\":%d,\"state\":%u,\"stage\":%u,\"lives\":%u,\"score_tens\":%u,\"bonus_flag\":%u,\"bonus_timer\":%u,\"prng\":%u,\"bricks_left\":%u,\"paddle_x\":%u,\"paddle_w\":%u,\"ball_x\":%u,\"ball_x_sub\":%u,\"ball_y\":%u,\"ball_y_sub\":%u,\"ball_vx\":%u,\"ball_vy\":%u,\"speed_idx\":%u,\"row_offset\":%u,\"scroll_timer\":%u,\"scroll_step\":%u,\"row_shift_0\":%u,\"row_shift_6\":%u,\"state_timer\":%u,\"curtain_dur\":%u}\n",
                tick, (unsigned)g_sim.state, (unsigned)g_sim.stage, (unsigned)g_sim.lives,
                (unsigned)g_sim.score_tens, (unsigned)g_sim.bonus_flag, (unsigned)g_sim.bonus_timer,
                (unsigned)g_sim.prng, (unsigned)g_sim.bricks_left,
@@ -1617,7 +1950,8 @@ static int run_scenario(const char *rom_path, const char *scenario_path) {
                (unsigned)g_sim.ball_vx, (unsigned)g_sim.ball_vy,
                (unsigned)g_sim.speed_idx, (unsigned)g_sim.row_offset,
                (unsigned)g_sim.scroll_timer, (unsigned)g_sim.scroll_step,
-               (unsigned)g_sim.row_shift[0], (unsigned)g_sim.row_shift[6]);
+               (unsigned)g_sim.row_shift[0], (unsigned)g_sim.row_shift[6],
+               (unsigned)g_sim.state_timer, (unsigned)g_sim.curtain_dur);
         tick++;
     }
     fclose(fp);
@@ -1646,12 +1980,21 @@ static void step_window_frame(void) {
 static void handle_key_change(WPARAM vk, bool down, HWND w) {
     if (vk == VK_ESCAPE && down) { DestroyWindow(w); return; }
     if (vk == 'R' && down && g_sim.rom_loaded) { stage1_reset_for_play(&g_sim); return; }
+    if (vk == 'T' && down && g_sim.rom_loaded) {
+        stage1_reset_for_play(&g_sim);
+        g_sim.state = 2;
+        g_sim.normal_stage_count = 0;
+        g_sim.bonus_stage_count = 0;
+        return;
+    }
     if (vk == VK_LEFT || vk == 'A')  g_key_left = down;
     if (vk == VK_RIGHT || vk == 'D') g_key_right = down;
     if (vk == VK_SPACE || vk == 'Z') g_key_a = down;
     if (vk == VK_SHIFT || vk == 'X') g_key_b = down;
     if (vk == VK_RETURN)             g_key_start = down;
 }
+
+static uint32_t g_paint_count = 0;
 
 static LRESULT CALLBACK window_proc(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m == WM_DESTROY) { audio_backend_shutdown(); PostQuitMessage(0); return 0; }
@@ -1672,6 +2015,7 @@ static LRESULT CALLBACK window_proc(HWND w, UINT m, WPARAM a, LPARAM b) {
             StretchDIBits(dc, (width - 160 * scale) / 2, (height - 144 * scale) / 2,
                 160 * scale, 144 * scale, 0, 0, 160, 144, pixels, &info,
                 DIB_RGB_COLORS, SRCCOPY);
+            g_paint_count++;
         }
         EndPaint(w, &paint); return 0;
     }
@@ -1685,6 +2029,126 @@ static int ticks_until_state_change(AlleywayStage1 *s, uint8_t from_state) {
         n++;
     }
     return n;
+}
+
+static void pump_window_messages(HWND window) {
+    MSG msg = {0};
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (IsWindow(window)) {
+        InvalidateRect(window, NULL, FALSE);
+        UpdateWindow(window);
+    }
+}
+
+/*
+ * --verify-window-session <rom> [out_dir]
+ * End-to-end verification of the real Win32 windowed executable path:
+ * Creates the actual HWND window, initializes waveOut audio, renders Title (State 2) via WM_PAINT,
+ * sends real WM_KEYDOWN/WM_KEYUP events for Start (Title -> Mario entrance State 4 -> Serve State 5),
+ * Right/Left movement, Space (Serve -> Active Play State 6 + SFX 7), Enter (Pause State 0x0C / Resume),
+ * 'R' (Reset), and Escape (DestroyWindow + audio_backend_shutdown).
+ */
+static int run_verify_window_session(const char *rom_path, const char *out_dir) {
+    if (!try_load_rom_file(&g_sim, rom_path)) {
+        fprintf(stderr, "Error: failed to load valid 32 KiB ROM from %s\n", rom_path);
+        return 2;
+    }
+    /* Start at authentic Title screen (State 2) */
+    g_sim.state = 2;
+    g_sim.normal_stage_count = 0;
+    g_sim.bonus_stage_count = 0;
+    render_stage1(&g_sim);
+    audio_backend_init();
+
+    HINSTANCE instance = GetModuleHandleW(NULL);
+    WNDCLASSW cls = {0}; cls.lpfnWndProc = window_proc;
+    cls.style = CS_HREDRAW | CS_VREDRAW;
+    cls.hInstance = instance; cls.lpszClassName = L"AlleywayVerifyWindow";
+    cls.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassW(&cls);
+    RECT r = {0, 0, 640, 576}; AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND window = CreateWindowW(cls.lpszClassName, L"Alleyway PC | Window Session Verification",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+        r.right - r.left, r.bottom - r.top, NULL, NULL, instance, NULL);
+    if (!window) { audio_backend_shutdown(); return 3; }
+
+    pump_window_messages(window);
+    if (g_sim.state != 2 || g_paint_count == 0) { DestroyWindow(window); audio_backend_shutdown(); return 4; }
+    if (out_dir) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/win_01_title.ppm", out_dir);
+        write_framebuffer_ppm(path);
+    }
+
+    /* 1. Press Enter (VK_RETURN) on Title -> 3-tick start delay -> 221-tick Mario curtain -> Serve (State 5) */
+    SendMessageW(window, WM_KEYDOWN, VK_RETURN, 0);
+    step_window_frame();
+    SendMessageW(window, WM_KEYUP, VK_RETURN, 0);
+    for (int i = 0; i < 3; ++i) step_window_frame();
+    if (g_sim.state != 4 || g_sim.curtain_dur != 221) { DestroyWindow(window); audio_backend_shutdown(); return 5; }
+
+    /* Advance 85 frames into Mario entrance (Mario walking & paddle waiting) and paint */
+    for (int i = 0; i < 85; ++i) step_window_frame();
+    pump_window_messages(window);
+    if (out_dir) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/win_02_mario_entry.ppm", out_dir);
+        write_framebuffer_ppm(path);
+    }
+
+    /* Finish remaining 136 frames of State 4 -> arrives at State 5 (Serve) */
+    for (int i = 0; i < 136; ++i) step_window_frame();
+    if (g_sim.state != 5 || g_sim.stage != 0 || g_sim.lives != 4) { DestroyWindow(window); audio_backend_shutdown(); return 6; }
+
+    /* 2. Move paddle right for 5 frames via WM_KEYDOWN(VK_RIGHT) -> paddle_x: 40 -> 55 */
+    SendMessageW(window, WM_KEYDOWN, VK_RIGHT, 0);
+    for (int i = 0; i < 5; ++i) step_window_frame();
+    SendMessageW(window, WM_KEYUP, VK_RIGHT, 0);
+    if (g_sim.paddle_x != 55) { DestroyWindow(window); audio_backend_shutdown(); return 7; }
+
+    /* 3. Serve ball with Space (VK_SPACE) -> 2 frames to reach State 6 + triggers SFX 7 */
+    SendMessageW(window, WM_KEYDOWN, VK_SPACE, 0);
+    step_window_frame();
+    SendMessageW(window, WM_KEYUP, VK_SPACE, 0);
+    step_window_frame();
+    if (g_sim.state != 6) { DestroyWindow(window); audio_backend_shutdown(); return 8; }
+    for (int i = 0; i < 12; ++i) step_window_frame();
+    pump_window_messages(window);
+    if (out_dir) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/win_03_active_play.ppm", out_dir);
+        write_framebuffer_ppm(path);
+    }
+
+    /* 4. Pause with Enter (VK_RETURN) -> State 0x0C, verify ball stays frozen for 5 frames, then Resume */
+    SendMessageW(window, WM_KEYDOWN, VK_RETURN, 0);
+    step_window_frame();
+    SendMessageW(window, WM_KEYUP, VK_RETURN, 0);
+    if (g_sim.state != 0x0C) { DestroyWindow(window); audio_backend_shutdown(); return 9; }
+    uint8_t bx_before = g_sim.ball_x, by_before = g_sim.ball_y;
+    for (int i = 0; i < 5; ++i) step_window_frame();
+    if (g_sim.ball_x != bx_before || g_sim.ball_y != by_before) { DestroyWindow(window); audio_backend_shutdown(); return 10; }
+    SendMessageW(window, WM_KEYDOWN, VK_RETURN, 0);
+    step_window_frame();
+    SendMessageW(window, WM_KEYUP, VK_RETURN, 0);
+    if (g_sim.state != 6) { DestroyWindow(window); audio_backend_shutdown(); return 11; }
+
+    /* 5. Press 'R' to reset to Stage 1 Serve (State 5, paddle_x = 40), then Esc to close window */
+    SendMessageW(window, WM_KEYDOWN, 'R', 0);
+    SendMessageW(window, WM_KEYUP, 'R', 0);
+    step_window_frame();
+    if (g_sim.state != 5 || g_sim.paddle_x != 40) { DestroyWindow(window); audio_backend_shutdown(); return 12; }
+
+    SendMessageW(window, WM_KEYDOWN, VK_ESCAPE, 0);
+    pump_window_messages(window);
+    audio_backend_shutdown();
+
+    printf("{\"window_verified\":true,\"paint_count\":%u,\"final_state\":%u,\"paddle_x\":%u}\n",
+           (unsigned)g_paint_count, (unsigned)g_sim.state, (unsigned)g_sim.paddle_x);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -2001,8 +2465,18 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (argc == 4 && strcmp(argv[1], "--run-scenario") == 0) {
-        return run_scenario(argv[2], argv[3]);
+    if ((argc == 4 || argc == 7) && strcmp(argv[1], "--run-scenario") == 0) {
+        int dump_tick = -999;
+        const char *dump_ppm = NULL;
+        if (argc == 7 && strcmp(argv[4], "--dump-ppm") == 0) {
+            dump_tick = atoi(argv[5]);
+            dump_ppm = argv[6];
+        }
+        return run_scenario(argv[2], argv[3], dump_tick, dump_ppm);
+    }
+
+    if ((argc == 3 || argc == 4) && strcmp(argv[1], "--verify-window-session") == 0) {
+        return run_verify_window_session(argv[2], (argc == 4) ? argv[3] : NULL);
     }
 
     if (argc == 4 && strcmp(argv[1], "--verify-trace") == 0) {
@@ -2018,6 +2492,10 @@ int main(int argc, char **argv) {
     };
     for (size_t i = 0; i < sizeof(rom_candidates) / sizeof(rom_candidates[0]); ++i) {
         if (rom_candidates[i] && try_load_rom_file(&g_sim, rom_candidates[i])) {
+            /* Start interactive window sessions at Title Screen ("PUSH START", State 2) */
+            g_sim.state = 2;
+            g_sim.normal_stage_count = 0;
+            g_sim.bonus_stage_count = 0;
             break;
         }
     }
@@ -2032,7 +2510,7 @@ int main(int argc, char **argv) {
     if (!RegisterClassW(&cls)) { audio_backend_shutdown(); return 2; }
     RECT r = {0, 0, 640, 576}; AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     const wchar_t *title = g_sim.rom_loaded
-        ? L"Alleyway PC | Stage 1 Native (Arrows: Move, Space/Z: A, Shift/X: B, Enter: Pause, R: Reset)"
+        ? L"Alleyway PC | Native DMG Port (Enter/Space: Start/Serve, Arrows: Move, R: Stage 1, T: Title)"
         : L"Alleyway PC research | diagnostic only (no ROM found) | Esc to close";
     HWND window = CreateWindowW(cls.lpszClassName, title,
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,

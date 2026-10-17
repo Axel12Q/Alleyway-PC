@@ -225,7 +225,40 @@
   - Tienen verificación diferencial de ejecución real PyBoy vs C las **Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32**. Las restantes fases de las 32 están cubiertas por inspección estructural de sus descriptores y mapas en ROM (`test_rom_stage_descriptor_layout_if_present`), sin afirmar que las 32 fases individuales tengan trazas de juego completas.
 - **Estado de la suite de pruebas**: **40 pruebas automatizadas ejecutadas y aprobadas (`40 OK, 0 expectedFailure`)** en ~9.0s.
 
+### Hito 13: Presentación visual 100% fiel desde ROM (Título y Saque Fase 1), verificación de ventana Win32 e2e y medición de telón en las 32 fases
+- **Renderizado visual auténtico desde ROM local (`render_stage1` en `src/main.c`)**:
+  - Reconstrucción de la presentación visual original leyendo directamente los 6 KiB de VRAM (`0x8000..0x97FF`, 384 patrones de 8x8) decodificados desde `ROM[0x4B75..0x6374]`.
+  - Intérprete nativo de listas de despliegue VRAM tipo Nintendo DMG (`0x02C1`):
+    - **Pantalla de Título (`State 1 / State 2`, `0x41CD`)**: mapa BG de 20x18 baldosas (`LCDC = 0x83`, Window desactivada), más 5 sprites OAM (`OAM[10..14]`) en `(112, 104)` formateando el récord de puntuación en BCD (`0200` para `high_score_tens = 200`).
+    - **Tubo superior y Ventana lateral HUD (`0x4A3C`)**: baldosas de borde superior (`0xBD`, `0xB5`x20) y ventana derecha (`0x9C00` en `WX = 127`, screen `X = 120..159`): pared derecha (`0xBE`/`0xB4`), títulos `"TOP"` y `"1UP"`, marcador BCD de 5 dígitos (con corona `0xBF`/`0xBC`/`0xC9` para >= 10,000 pts), letrero `"STAGE XX"` (`0xC0..0xC3` y número de fase en fila 11), icono de pala (`0xB1`, `0xB2`) y vidas en fila 16.
+    - **Pared izquierda (Sprites OAM `OAM[15..31]`)**: 17 sprites del tubo izquierdo (`0xB4`) situados en `oam_x = 8` (`screen_x = 0`) y `oam_y = 24..152` (`screen_y = 8..136`).
+    - **Pala y Bola (`OAM[0..2]` y `OAM[3]`)**: pala de 24 px (`0x00, 0x01, 0x00` con flip horizontal) o 16 px encogida (`0x00, 0x00` flip), bola (`0x05`) visible en estados 6, 8, 12 y durante `serve_pending` de estado 5.
+    - **Mapeo de baldosas de ladrillos (`0x0AC9..0x0B08` en `0x1B87`)**: renderizado de pares de filas de ladrillos de 8x8 según tipo superior/inferior, desplazamiento horizontal de fila (`row_shift`) y máscara de combinación.
+  - El mismo renderizador productivo alimenta tanto el volcado headless (`--dump-ppm`) como la ventana Win32 interactiva (`WM_PAINT` con `StretchDIBits`).
+- **Verificación de paridad visual bit-a-bit contra PyBoy (`tests/test_visual_parity.py`)**:
+  - **Pantalla de Título (`State 2`, `test_title_screen_bit_exact_visual_parity`)**: **100.00% de coincidencia** (23,040 de 23,040 píxeles idénticos tono a tono, 0 diferencias).
+  - **Pantalla de Saque Fase 1 (`State 5`, `test_stage1_serve_bit_exact_visual_parity`)**: **100.00% de coincidencia** (23,040 de 23,040 píxeles idénticos tono a tono, 0 diferencias).
+- **Sesión de ventana Win32 verificada de extremo a extremo (`--verify-window-session`)**:
+  - Crea ventana real HWND (`CreateWindowW`, `ShowWindow`, `PeekMessageW`/`DispatchMessageW`), inicializa audio `waveOut`, renderiza Pantalla de Título mediante `WM_PAINT`, envía eventos reales `WM_KEYDOWN`/`WM_KEYUP` para:
+    1. Enter (`VK_RETURN`, Start): delay de 3 fotogramas -> telón de entrada de Mario (`221` fotogramas) -> Saque (`State 5`, vidas 4, stage 0).
+    2. Flecha derecha (`VK_RIGHT` durante 5 fotogramas): movimiento de pala (`paddle_x: 40 -> 55`).
+    3. Espacio (`VK_SPACE`): saque a juego activo (`State 6`) disparando efecto de sonido SFX 7.
+    4. Enter (`VK_RETURN`): pausa a `State 0x0C` (verifica que la bola queda congelada 5 fotogramas) y reanudación a `State 6`.
+    5. Tecla `R`: reinicio directo a saque de Fase 1 (`paddle_x = 40`).
+    6. Tecla `Esc`: cierre ordenado (`DestroyWindow`) y apagado seguro de audio (`audio_backend_shutdown`).
+- **Validación de la duración de telón (`State 4`) en las 32 fases (`tools/scenario_diff.py`)**:
+  - **Modelo lineal de presupuesto de ciclos (`compute_stage_curtain_dur`)**: en el original, el desempaquetado de mapa (`0x0942..0x09E0`) corre con la pantalla activa y dura `(next_bonus ? 98 : 65) + (rows * 14 + nonempty * 5) / 390` fotogramas. Se documenta explícitamente que es una aproximación empírica lineal del bucle de CPU (no un emulador ciclo a ciclo de hardware).
+  - **Tabla de mediciones en PyBoy (fotogramas observados en frontera atómica VBlank 0x01EF) vs Modelo**:
+    - Fases normales (1..3, 5..7, 9..11, 13..15, 17..19, 21..23, 25..27, 29..31): `66..70` fotogramas observados (`diff = 0` fotogramas frente al modelo en todas las fases cuando no hay Mario entrance).
+    - Fases de bonus (4, 8, 12, 16, 20, 24, 28, 32): `100..101` fotogramas observados (`diff = 0`).
+    - Entrada desde Título a Fase 1: `221` fotogramas observados (`66 + 155` de entrada de Mario `0x43DC`).
+    - Retorno tras Ending (Fase 32 -> 1): `66` fotogramas observados (`diff = 0`).
+    - Alineaciones de VBlank (`vblank_count = 0, 7, 16, 31`): `diff = 0`.
+  - *Límite documentado*: este test valida las transiciones y cadencia del telón de las 32 fases, no una partida jugada completa de las 32 fases.
+- **Estado de la suite de pruebas**: **43 pruebas automatizadas ejecutadas y aprobadas (`43 OK, 0 expectedFailure`)** en ~6.3s.
+
 ## Lo que falta para el juego completo (siguiente paso para continuar)
 1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulación por software de barridos de tono (`0x6B76`/`0x6B8B`).
-2. **Presentación visual completa de la pantalla de título (Estados 0..3) y animaciones de OAM/BG del telón con Mario (Estado 4) y celebración del final (Estado 9)** (cuyas duraciones y transiciones lógicas ya están verificadas al fotograma).
+2. **Animaciones intermedias completas de OAM en el telón (caminata y salto de Mario 0x43DC en State 4) y celebración animada del final (Mario saludando 0x45BD en State 9)**.
+
 

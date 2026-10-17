@@ -77,7 +77,7 @@ class OriginalVsNativeDifferentialTests(unittest.TestCase):
 
     def test_bonus_expire_keeps_lives(self):
         expected, native = self._assert_identical("bonus_expire")
-        self.assertEqual(sd.state_runs(expected)[:4], [(6, 29), (7, 229), (4, 66), (5, 376)])
+        self.assertEqual(sd.state_runs(expected)[:4], [(6, 24), (7, 229), (4, 66), (5, 381)])
         self.assertEqual({r["lives"] for r in native}, {4})
 
     def test_bonus_perfect_reward_exactly_once(self):

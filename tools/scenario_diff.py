@@ -39,12 +39,14 @@ def _boot_past_title(rom_path):
 
 
 def _fast_forward_to_stage(gb, stage_idx):
-    """PRIVATE INJECTION: set stage = stage_idx-1, bonus_count (0xCA47) = stage_idx // 4,
-    bricks_left = 0, state = 8 so the original itself plays state 8 -> 4 -> 5 into the target
-    stage (no native involvement)."""
+    """PRIVATE INJECTION: set stage = stage_idx-1, prior normal_stage_count (0xCA46) and
+    bonus_stage_count (0xCA47) for stages 0..stage_idx-1, bricks_left = 0, state = 8 so the
+    original itself plays state 8 -> 4 -> 5 into the target stage (no native involvement)."""
     m = gb.memory
     m[0xCA45] = stage_idx - 1
-    m[0xCA47] = stage_idx // 4
+    prior_bonus = stage_idx // 4
+    m[0xCA46] = stage_idx - prior_bonus
+    m[0xCA47] = prior_bonus
     m[0xFFAA] = 0
     m[0xFFC8] = 0
     m[0xFFC9] = 0
@@ -78,6 +80,7 @@ def _record(gb, latched):
         "speed_idx": m[0xFFBE], "bricks_left": (m[0xFFC8] << 8) | m[0xFFC9],
         "score_tens": m[0xFFCA] | (m[0xFFCB] << 8),
         "lives": m[0xCA44], "stage": m[0xCA45],
+        "normal_stage_count": m[0xCA46], "bonus_stage_count": m[0xCA47],
         "scroll_flag": m[0xFFAB], "bonus_flag": m[0xFFAA],
         "bonus_timer": m[0xCA48], "row_offset": m[0xFFA9],
         "scroll_timer": m[0xFFC4], "scroll_step": m[0xFFC5],
@@ -355,4 +358,101 @@ def run_differential(exe, rom_path, name, workdir=None, check_prng=True):
         check_prng=check_prng,
         compare_play=sc.get("compare_play", False),
     )
+
+
+def run_stage_curtain_transition_diff(exe, rom_path, from_stage, vblank_offset=None, workdir=None):
+    """Run ORIGINAL (PyBoy) and NATIVE (`--run-scenario`) for a single stage transition
+    (`from_stage` -> `(from_stage + 1) & 0x1F`) triggered by breaking the last brick in State 6.
+    Note: This tests the transition/curtain timing (`State 8 -> [State 9] -> State 4 -> State 5`),
+    not a full active playthrough of all 32 stages.
+    """
+    gb = _boot_past_title(rom_path)
+    try:
+        if from_stage > 0:
+            _fast_forward_to_stage(gb, from_stage)
+        _serve(gb)
+        if gb.memory[0xFFA4] != 6:
+            raise RuntimeError(f"original not in state 6 at stage {from_stage}")
+
+        state = {"snap": None, "logic_fired": False, "vblank_rec": None}
+        records = []
+
+        def on_logic_start(_ctx):
+            state["logic_fired"] = True
+
+        def on_vblank(_ctx):
+            latched = (int(gb.memory[0xFF8C]), int(gb.memory[0xFF8D]))
+            if state["snap"] is None:
+                if state["logic_fired"]:
+                    if vblank_offset is not None:
+                        gb.memory[0xFFA2] = vblank_offset & 0xFF
+                    snap = _record(gb, latched)
+                    _inject_bricks_one(gb.memory, snap)
+                    state["snap"] = snap
+            else:
+                rec = _record(gb, latched)
+                rec["logic_fired"] = 1 if state["logic_fired"] else 0
+                state["vblank_rec"] = rec
+            state["logic_fired"] = False
+
+        gb.hook_register(0, HOOK_LOGIC_START, on_logic_start, None)
+        gb.hook_register(0, HOOK_VBLANK, on_vblank, None)
+
+        for _ in range(5):
+            gb.tick()
+            if state["snap"] is not None:
+                break
+        if state["snap"] is None:
+            raise RuntimeError(f"snapshot failed for stage {from_stage}")
+
+        next_stage = (from_stage + 1) & 0x1F
+        max_frames = 2250 if from_stage == 31 else 800
+        for _ in range(max_frames):
+            state["vblank_rec"] = None
+            gb.tick()
+            if state["vblank_rec"] is not None:
+                records.append(state["vblank_rec"])
+            else:
+                rec = _record(gb, (0xFF, 0xFF))
+                rec["logic_fired"] = 0
+                records.append(rec)
+            if records[-1]["state"] == 5 and records[-1]["stage"] == next_stage:
+                break
+    finally:
+        gb.stop()
+
+    inputs = [(r["in_joyp_raw"], r["in_joyp_edge"]) for r in records]
+    native = run_native(exe, rom_path, state["snap"], inputs, workdir)
+    mismatch = compare(records, native, check_prng=True, compare_play=False)
+    exp_curtain = sum(1 for r in records if r["state"] == 4)
+    nat_curtain = sum(1 for r in native if r["state"] == 4)
+    return {
+        "from_stage": from_stage,
+        "next_stage": next_stage,
+        "vblank_offset": vblank_offset,
+        "expected_curtain_frames": exp_curtain,
+        "native_curtain_frames": nat_curtain,
+        "expected_runs": state_runs(records),
+        "native_runs": state_runs(native),
+        "mismatch": mismatch,
+    }
+
+
+def verify_all_32_curtain_transitions(exe, rom_path, workdir=None):
+    """Validate `compute_stage_curtain_dur` across all 32 stages (`next_stage = 0..31` via
+    `from_stage = 0..31`, including `from_stage = 31` Ending return to Stage 1), plus
+    different initial VBlank alignments (`0, 7, 16, 31`) on normal and bonus curtain entries."""
+    results = []
+    for from_stage in range(32):
+        res = run_stage_curtain_transition_diff(exe, rom_path, from_stage, vblank_offset=None, workdir=workdir)
+        results.append(res)
+    # Test explicit VBlank alignments (0, 7, 16, 31) entering a normal stage (from_stage=0 -> next_stage=1)
+    # and entering a bonus stage (from_stage=2 -> next_stage=3)
+    alignment_results = []
+    for from_stage in (0, 2, 13, 22):
+        for vb in (0, 7, 16, 31):
+            res = run_stage_curtain_transition_diff(exe, rom_path, from_stage, vblank_offset=vb, workdir=workdir)
+            alignment_results.append(res)
+    return results, alignment_results
+
 

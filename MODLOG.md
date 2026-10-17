@@ -191,6 +191,30 @@ Estado: Hito 12 completado — Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verifica
   12. `stage23_vertical` (450f, `compare_play=True`, Fase 23): `[(6, 450)]`
 - Total de la suite automatizada: **40 pruebas ejecutadas y aprobadas (`40 OK, 0 expectedFailure`)** en ~9.0s.
 
+## Hito 13 (2026-10-17): Presentacion visual fiel desde ROM (Titulo y Saque), verificacion e2e de ventana Win32 y medicion de telon en 32 fases
+- **Renderizado visual con listas de despliegue VRAM tipo Nintendo DMG (`0x02C1`) en `src/main.c`**:
+  - Reemplazadas las barras grises y cajas inventadas por la reconstruccion fiel de los mapas BG y Window y sprites OAM desde la ROM local:
+    - **Pantalla de Titulo (`State 2`, `0x41CD`)**: mapa BG de 20x18 baldosas decodificando baldosas 2bpp desde `ROM[0x4B75..0x6374]`, mas 5 sprites OAM (`OAM[10..14]`) en `(112, 104)` con el record formateado en BCD (`0200` para 2,000 pts).
+    - **Tubo superior y Ventana lateral HUD (`0x4A3C`)**: baldosas de borde superior (`0xBD`, `0xB5`x20) y ventana derecha (`0x9C00` en `WX = 127`, screen `X = 120..159`): pared derecha (`0xBE`/`0xB4`), titulos `"TOP"` y `"1UP"`, marcador BCD de 5 digitos, letrero `"STAGE XX"` (`0xC0..0xC3` y numero de fase en fila 11), icono de pala (`0xB1`, `0xB2`) y vidas en fila 16.
+    - **Pared izquierda (Sprites OAM `OAM[15..31]`)**: 17 sprites del tubo izquierdo (`0xB4`) situados en `oam_x = 8` (`screen_x = 0`) y `oam_y = 24..152`.
+    - **Pala y Bola (`OAM[0..2]` y `OAM[3]`)**: pala de 24 px (`0x00, 0x01, 0x00` con flip horizontal) o 16 px encogida (`0x00, 0x00` flip), bola (`0x05`).
+    - **Mapeo de baldosas de ladrillos (`0x0AC9..0x0B08` en `0x1B87`)**: renderizado de pares de filas de ladrillos de 8x8 segun tipo superior/inferior, desplazamiento horizontal de fila (`row_shift`) y mascara de combinacion.
+  - La misma funcion de renderizado (`render_stage1`) alimenta tanto el volcado headless (`--dump-ppm`) como la ventana Win32 interactiva (`WM_PAINT` con `StretchDIBits`).
+- **Verificacion de paridad visual automatizada tono a tono frente a PyBoy (`tests/test_visual_parity.py`)**:
+  - **Pantalla de Titulo (`State 2`)**: **100.00% de coincidencia** (23,040 de 23,040 pixeles identicos, 0 diferencias).
+  - **Pantalla de Saque Fase 1 (`State 5`)**: **100.00% de coincidencia** (23,040 de 23,040 pixeles identicos, 0 diferencias).
+- **Sesion de ventana Win32 verificada de extremo a extremo (`--verify-window-session`)**:
+  - Prueba automatizada que crea la ventana real `HWND`, procesa mensajes Win32, despacha `WM_PAINT`, ejecuta eventos `WM_KEYDOWN`/`WM_KEYUP` para Start (`VK_RETURN`), movimiento (`VK_RIGHT`), saque (`VK_SPACE`), pausa/reanudacion (`VK_RETURN`), reinicio (`R`) y cierre (`Esc`), comprobando el cierre ordenado y el apagado seguro de audio `waveOut`.
+- **Medicion de duraciones de telon en las 32 fases (`tools/scenario_diff.py`)**:
+  - Modelo lineal de ciclos `(next_bonus ? 98 : 65) + (rows * 14 + nonempty * 5) / 390` evaluado frente a fotogramas observados en PyBoy:
+    - Fases normales: `66..70` fotogramas observados (`0` fotogramas de discrepancia frente al modelo).
+    - Fases de bonus: `100..101` fotogramas observados (`0` fotogramas de discrepancia).
+    - Entrada desde Titulo (Fase 1): `221` fotogramas observados (`66 + 155` de entrada de Mario `0x43DC`).
+    - Retorno de Ending: `66` fotogramas observados (`0` discrepancias).
+    - Alineaciones de VBlank (`0, 7, 16, 31`): `0` discrepancias.
+- Total de la suite automatizada: **43 pruebas ejecutadas y aprobadas (`43 OK, 0 expectedFailure`)** en ~6.3s.
+
 ## Siguiente paso recomendado para Codex / futuras sesiones
 1. Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido) y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
-2. Secuencias graficas completas de intro, animacion de apertura de telon (Estados 0..4) y celebracion del final (Estado 9).
+2. Animaciones intermedias completas de metasprites OAM (entrada de Mario `0x43DC` en Estado 4 y celebracion animada del final `0x45BD` en Estado 9).
+

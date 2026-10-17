@@ -23,9 +23,22 @@ accelerate future Game Boy native ports.
 
 ## What exists and was verified
 
-- Stage 1 Native C playable engine in `src/main.c` (Win32/GDI at 60 Hz).
+- Stage 1, 2, 3, and Stage 4 Bonus Native C playable engine in `src/main.c` (Win32/GDI at 60 Hz).
 - Bit-exact trace verification (`--verify-trace`) comparing native C simulation
-  against PyBoy logic ticks (`0x051F..0x0525`) for 5,651 consecutive ticks (0 mismatches).
+  against PyBoy logic ticks (`0x051F..0x0525`):
+  - Stage 1: 5,651 consecutive ticks (0 mismatches).
+  - Stage 2: 739 consecutive ticks of horizontal scrolling (0 mismatches).
+  - Stage 3: 2,138 consecutive ticks of vertical brick drops on paddle bounce (0 mismatches).
+  - Stage 4: 140+ ticks of continuous brick penetration, authentic countdown cadence, and zero-expiration without life loss (0 mismatches).
+- Independent autonomous clock verification (`--verify-autonomous-clock`) without per-tick oracle resets across Serve, Active play, Pause, and Expiration.
+- Full 32-stage progression and Game Over state machine (`0x054C`):
+  - Normal clear -> Stage clear -> Curtain intro -> Serve advancing stage.
+  - Bonus ball drop / timer expiration -> Stage 8 preserving lives intact.
+  - Perfect bonus clear -> 500 tens (+5,000 pts) from table `0x1B71`.
+  - Last life lost -> State 0x0B (Game Over) -> reset.
+  - Stage 32 clear -> State 9 (Ending celebration) -> Stage 1 loop.
+- Reusable 2bpp planar tile decoder (`src/gb_tile.h`) with flips, palettes, transparency, and clipping.
+- Reusable APU Channel 1 synthesizer (`src/gb_apu.h`) with cycle-accurate fixed-point phase accumulator, length/sweep/envelope, and decoupled injectable backend (`src/gb_audio_backend.h`).
 - Deterministic input timeline, hardware register/watchpoint tracer (`tools/capture_reference.py`).
 - Trace and metadata comparator (`tools/compare_traces.py`).
 - Differential RAM scanner and time-series correlation finder (`tools/scan_ram.py`).
@@ -33,21 +46,17 @@ accelerate future Game Boy native ports.
 - Cartridge header, size, bank alignment, and checksum inspector (`tools/inspect_rom.py`).
 - GitHub Actions CI workflow running on Windows with synthetic fixtures only.
 - Local user dump verified at `../Local-Privado/roms/Alleyway (USA).gb`.
+- Test suite: **28 automated tests passing in ~2.2s**.
 
 ## Evidence vs Limits
 
-- Verified: Stage 1 paddle movement speeds (1, 3, 5 px/tick), ball 8.8 big-endian launch
-  and bounce vectors, paddle zone table lookup, wall rebounds, 4-probe brick collision,
-  durability and score calculations.
-- Limits: 5651 ticks of verified parity on Stage 1 do NOT prove that all game paths or all
-  32 stages are complete. Moving brick scrolls, bonus stages, full 1-UP progression,
-  authentic 2bpp tile decoding, and APU audio remain to be implemented.
+- Verified: Stages 1..4 mechanics (static, horizontal scrolling, vertical paddle-bounce drop, bonus penetration and timer), independent clock timing, 32-stage classification matrix, Game Over and Stage 32 wrap transitions.
+- Limits: Intro sequences (States 0..4 animations) and ending sequence animation (State 9) are currently handled as direct state transitions rather than full frame-by-frame sprite animations. APU channels 2, 3, 4 remain in progress.
 
 ## Roadmap & Budget Guidelines
 
 - Maintain Gemini 3.8 Flash (Medium) as active model; avoid heavy multi-agent spawns.
 - Focus on small, bounded milestones backed by synthetic unit tests:
-  1. Reusable 2bpp tile decoding module + connection to local Alleyway rendering.
-  2. Horizontal/vertical brick scrolling and bonus stage mechanics.
-  3. Reusable Game Boy APU research, license evaluation, and first synchronized audio event.
+  1. Complete APU Channels 2 (Square 2), 3 (Wave), and 4 (Noise) for polyphonic music and jingles.
+  2. Frame-by-frame animated intro sequence (curtains opening, Mario entry) and ending sequence.
 - Update `docs/STATUS.md` and `MODLOG.md` after each verified milestone.

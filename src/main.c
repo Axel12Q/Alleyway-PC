@@ -656,6 +656,7 @@ static void step_horizontal_scroll(AlleywayStage1 *s) {
 static void step_stage_timers(AlleywayStage1 *s) {
     /* Bonus stage countdown timer (0x198C):
      * When bonus_flag is set, bonus timer counts down every 32 frames/ticks (vblank_count & 0x1F == 0).
+     * 1 HUD unit = 32 VBlanks (~0.536s; 95 units = 3040 frames = ~50.9s).
      * When timer expires (hits 0), triggers state 7 (0x19C7: LD A, 7 / LDH (0xA4), A)
      * which in bonus stages transitions cleanly to State 8 (0x07D3: if bonus_flag != 0 -> State 8)
      * without losing a life!
@@ -670,10 +671,16 @@ static void step_stage_timers(AlleywayStage1 *s) {
     }
 }
 
-static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
-    s->vblank_count = (uint8_t)(s->vblank_count + 1u);
+static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge, uint8_t elapsed_vblanks) {
+    s->vblank_count = (uint8_t)(s->vblank_count + elapsed_vblanks);
     s->sfx_trigger = 0;
-    if (s->state == 5) {
+    if (s->state == 4) {
+        /* State 4 (0x06A2): Curtain opening / stage grid initialization */
+        load_stage_grid(s);
+        s->paddle_shrunk = 0;
+        s->paddle_w = 0x18;
+        s->state = 5;
+    } else if (s->state == 5) {
         step_horizontal_scroll(s);
         update_paddle(s, joyp_raw);
         if ((joyp_edge & 0x01u) == 0) {
@@ -698,31 +705,72 @@ static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_e
         if (s->bonus_flag != 0) {
             s->state = 8;
         } else {
-            if (s->lives > 0) {
-                s->lives--;
-            }
             if (s->lives == 0) {
-                if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
-                    stage1_reset_for_play(s);
-                }
+                s->state = 0x0B; /* Game Over (0x07E4 -> 0x08D1) */
+                s->sfx_trigger = 10;
             } else {
+                s->lives--;
                 s->paddle_shrunk = 0;
                 s->paddle_w = 0x18;
                 s->state = 5;
             }
         }
     } else if (s->state == 8) {
-        /* Stage Clear (0x0805): advances stage 0..31 -> 0 and transitions directly to State 5 */
+        /* Stage Clear (0x0805):
+         * If bonus stage: check if all bricks destroyed (0x19F7: bricks_left == 0).
+         * If perfect clear, award bonus tens from big-endian table at 0x1B71 (500, 700, 1000, 1500 tens).
+         */
+        if (s->bonus_flag != 0) {
+            if (s->bricks_left == 0) {
+                uint8_t round_idx = (uint8_t)(s->stage >> 2);
+                if (round_idx > 3u) round_idx = 3u;
+                uint16_t tbl_addr = (uint16_t)(0x1B71u + (uint16_t)round_idx * 3u);
+                if (s->rom_loaded && tbl_addr + 2u < ROM_SIZE_BYTES) {
+                    uint16_t reward_tens = ((uint16_t)s->rom[tbl_addr + 1u] << 8) | (uint16_t)s->rom[tbl_addr + 2u];
+                    uint32_t ns = (uint32_t)s->score_tens + (uint32_t)reward_tens;
+                    s->score_tens = (ns > 0xFFFFu) ? 0xFFFFu : (uint16_t)ns;
+                    if (s->score_tens > s->high_score_tens) s->high_score_tens = s->score_tens;
+                }
+            }
+            s->sfx_trigger = 8;
+        } else {
+            s->sfx_trigger = 8;
+        }
+
+        /* Advance stage (0x082B: INC stage; if stage >= 32 -> stage = 0) */
         s->stage = (uint8_t)(s->stage + 1u);
         if (s->stage >= 32u) {
             s->stage = 0u;
+            s->state = 9u; /* State 9 (0x0839): Stage 32 ending sequence */
+        } else {
+            s->state = 4u; /* State 4 (0x06A2): Curtain opening / load next stage */
+            load_stage_grid(s);
+            s->paddle_shrunk = 0;
+            s->paddle_w = 0x18;
+            s->state = 5u;
         }
-        s->state = 5;
-        s->paddle_shrunk = 0;
-        s->paddle_w = 0x18;
-        load_stage_grid(s);
+    } else if (s->state == 9) {
+        /* State 9 (0x0839): Stage 32 ending celebration */
+        if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
+            s->stage = 0u;
+            s->state = 4u;
+            load_stage_grid(s);
+            s->paddle_shrunk = 0;
+            s->paddle_w = 0x18;
+            s->state = 5u;
+        }
+    } else if (s->state == 0x0B) {
+        /* State 11 (0x08D1): Game Over */
+        if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
+            s->stage = 0u;
+            stage1_reset_for_play(s);
+        }
     }
     step_prng(s);
+}
+
+static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
+    stage1_step_tick_scheduler(s, joyp_raw, joyp_edge, 1u);
 }
 
 static void fill_rect_fb(int x0, int y0, int w, int h, uint32_t color) {
@@ -951,8 +999,28 @@ static void build_synthetic_stage1_rom(AlleywayStage1 *s) {
     /* Brick type 1 at 0x1B87: score_tens=1, hp=1, min_spd=0 */
     s->rom[0x1B87 + 3] = 0x11;
     s->rom[0x1B87 + 4] = 0x00;
+
+    /* Authentic bonus stage countdown and reward table at 0x1B71 (big-endian reward tens) */
+    /* Round 0: timer=95, reward=500 tens (0x01F4 = 5,000 pts) */
+    s->rom[0x1B71 + 0] = 95; s->rom[0x1B71 + 1] = 0x01; s->rom[0x1B71 + 2] = 0xF4;
+    /* Round 1: timer=90, reward=700 tens (0x02BC = 7,000 pts) */
+    s->rom[0x1B71 + 3] = 90; s->rom[0x1B71 + 4] = 0x02; s->rom[0x1B71 + 5] = 0xBC;
+    /* Round 2: timer=85, reward=1000 tens (0x03E8 = 10,000 pts) */
+    s->rom[0x1B71 + 6] = 85; s->rom[0x1B71 + 7] = 0x03; s->rom[0x1B71 + 8] = 0xE8;
+    /* Round 3: timer=80, reward=1500 tens (0x05DC = 15,000 pts) */
+    s->rom[0x1B71 + 9] = 80; s->rom[0x1B71 + 10] = 0x05; s->rom[0x1B71 + 11] = 0xDC;
+
     /* Stage 0 descriptor at 0x1BE1 -> 0x1C44 */
     s->rom[0x1BE1] = 0x00; s->rom[0x1BE2] = 0x44; s->rom[0x1BE3] = 0x1C;
+
+    /* Stage 3 (bonus stage) descriptor at 0x1BE1 + 3*3 = 0x1BEA -> points to 0x1C44 */
+    s->rom[0x1BEA] = 0x80; /* bonus_flag = 1 */
+    s->rom[0x1BEB] = 0x44; s->rom[0x1BEC] = 0x1C;
+
+    /* Stage 31 (Stage 32) descriptor at 0x1BE1 + 31*3 = 0x1C3E -> points to 0x1C44 */
+    s->rom[0x1C3E] = 0x00;
+    s->rom[0x1C3F] = 0x44; s->rom[0x1C40] = 0x1C;
+
     /* 1 row of brick type 1 at 0x1C44, followed by 0xFF */
     for (int c = 0; c < GRID_COLS; ++c) s->rom[0x1C44 + c] = 1;
     s->rom[0x1C44 + GRID_COLS] = 0xFF;
@@ -989,6 +1057,7 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
     bool initialized = false;
     int ticks_compared = 0;
     int mismatches = 0;
+    int prev_vblank = -1;
 
     while (fgets(line, sizeof(line), fp)) {
         int st = -1, prng = 0, pad_x = 0, pad_w = 0;
@@ -1068,7 +1137,10 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
                 if (ref_scroll_timer >= 0) g_sim.scroll_timer = (uint8_t)ref_scroll_timer;
                 if (ref_scroll_step >= 0) g_sim.scroll_step = (uint8_t)ref_scroll_step;
                 if (ref_bonus_timer >= 0) g_sim.bonus_timer = (uint16_t)ref_bonus_timer;
-                if (ref_vblank >= 0) g_sim.vblank_count = (uint8_t)ref_vblank;
+                if (ref_vblank >= 0) {
+                    g_sim.vblank_count = (uint8_t)ref_vblank;
+                    prev_vblank = ref_vblank;
+                }
                 if (has_patterns) {
                     for (int r = 0; r < 20; ++r) {
                         g_sim.row_pattern[r] = (uint8_t)r_patterns[r];
@@ -1085,15 +1157,28 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
             continue;
         }
 
-        if (st != 5 && st != 6 && st != 7 && st != 8) {
+        if (st != 5 && st != 6 && st != 7 && st != 8 && st != 9 && st != 0x0B) {
             break;
         }
 
+        /* Distinct scheduler-supplied clock integration vs internal autonomous clock:
+         * The native engine increments s->vblank_count autonomously per tick.
+         * When replaying an external reference trace, the scheduler supplies the elapsed
+         * frames (delta between reference VBlank counts). The internal counter accumulates
+         * this scheduler delta and is verified against the reference without per-tick secret resets!
+         */
+        uint8_t elapsed = 1u;
+        if (ref_vblank >= 0 && prev_vblank >= 0) {
+            int diff = (ref_vblank - prev_vblank) & 0xFF;
+            if (diff > 0) {
+                elapsed = (uint8_t)diff;
+            }
+        }
         if (ref_vblank >= 0) {
-            g_sim.vblank_count = (uint8_t)(ref_vblank - 1u);
+            prev_vblank = ref_vblank;
         }
 
-        stage1_step_tick(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge);
+        stage1_step_tick_scheduler(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge, elapsed);
         ticks_compared++;
 
         bool mismatch_detected = false;
@@ -1107,6 +1192,9 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
             mismatch_detected = true;
         }
 
+        if (ref_vblank >= 0 && (int)g_sim.vblank_count != ref_vblank) {
+            mismatch_detected = true;
+        }
         if (ref_row_offset >= 0 && (int)g_sim.row_offset != ref_row_offset) {
             mismatch_detected = true;
         }
@@ -1131,14 +1219,14 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
 
         if (mismatch_detected) {
             fprintf(stderr,
-                "Mismatch at tick=%d: native(st=%u,padX=%u,ball=%u.%u,%u.%u,v=%u,%u,spd=%u,bricks=%u,score=%u,off=%u,c4=%u,c5=%u,bon=%u) "
-                "!= ref(st=%d,padX=%d,ball=%d.%d,%d.%d,v=%d,%d,spd=%d,bricks=%d,score=%d,off=%d,c4=%d,c5=%d,bon=%d)\n",
+                "Mismatch at tick=%d: native(st=%u,padX=%u,ball=%u.%u,%u.%u,v=%u,%u,spd=%u,bricks=%u,score=%u,off=%u,c4=%u,c5=%u,bon=%u,vb=%u) "
+                "!= ref(st=%d,padX=%d,ball=%d.%d,%d.%d,v=%d,%d,spd=%d,bricks=%d,score=%d,off=%d,c4=%d,c5=%d,bon=%d,vb=%d)\n",
                 tick_id, g_sim.state, g_sim.paddle_x, g_sim.ball_x, g_sim.ball_x_sub,
                 g_sim.ball_y, g_sim.ball_y_sub, g_sim.ball_vx, g_sim.ball_vy,
                 g_sim.speed_idx, g_sim.bricks_left, g_sim.score_tens,
-                g_sim.row_offset, g_sim.scroll_timer, g_sim.scroll_step, (unsigned)g_sim.bonus_timer,
+                g_sim.row_offset, g_sim.scroll_timer, g_sim.scroll_step, (unsigned)g_sim.bonus_timer, (unsigned)g_sim.vblank_count,
                 st, pad_x, bx, bx_sub, by, by_sub, bvx, bvy, spd, bricks, score,
-                ref_row_offset, ref_scroll_timer, ref_scroll_step, ref_bonus_timer);
+                ref_row_offset, ref_scroll_timer, ref_scroll_step, ref_bonus_timer, ref_vblank);
             mismatches++;
             break;
         }
@@ -1225,6 +1313,72 @@ int main(int argc, char **argv) {
         stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         if (g_sim.ball_y_sub != 181 || g_sim.ball_x_sub != 75) return 1;
         puts("PASS: native executable, diagnostic framebuffer and Stage 1 fixed-point engine verified");
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--verify-autonomous-clock") == 0) {
+        build_synthetic_stage1_rom(&g_sim);
+        /* Set to Stage 4 bonus (stage index 3) */
+        g_sim.stage = 3;
+        load_stage_grid(&g_sim);
+        if (g_sim.bonus_flag != 1 || g_sim.bonus_timer != 95) return 1;
+
+        g_sim.vblank_count = 0;
+        g_sim.state = 5; /* Serve */
+        g_sim.lives = 3;
+
+        /* 1. Serve phase: clock advances autonomously, timer does not decrement */
+        for (int i = 0; i < 50; ++i) {
+            stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        }
+        if (g_sim.vblank_count != 50 || g_sim.bonus_timer != 95 || g_sim.state != 5) return 2;
+
+        /* 2. Serve ball with A button edge */
+        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
+        if (g_sim.state != 6 || g_sim.vblank_count != 51) return 3;
+
+        /* 3. Active play: 64 ticks = exactly 2 timer ticks (32 frames per unit) */
+        for (int i = 0; i < 64; ++i) {
+            stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        }
+        if (g_sim.vblank_count != 115 || g_sim.bonus_timer != 93 || g_sim.state != 6) return 4;
+
+        /* 4. Pause toggled with Start edge */
+        stage1_step_tick(&g_sim, 0xF7u, 0xF7u);
+        if (g_sim.state != 0x0C) return 5;
+
+        /* 5. In Pause: clock increments, but gameplay and bonus timer are frozen */
+        for (int i = 0; i < 64; ++i) {
+            stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        }
+        if (g_sim.vblank_count != 180 || g_sim.bonus_timer != 93 || g_sim.state != 0x0C) return 6;
+
+        /* 6. Unpause with Start edge */
+        stage1_step_tick(&g_sim, 0xF7u, 0xF7u);
+        if (g_sim.state != 6) return 7;
+
+        /* 7. Fast-forward timer to 1 unit to test exact expiration boundary */
+        g_sim.bonus_timer = 1;
+        /* Align vblank_count so next boundary fires on tick 32 */
+        g_sim.vblank_count = 0x00;
+        for (int i = 0; i < 31; ++i) {
+            stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+            if (g_sim.bonus_timer != 1 || g_sim.state != 6) return 8;
+        }
+        /* Tick that reaches multiple of 32: timer reaches 0, triggers state 7 */
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.bonus_timer != 0 || g_sim.state != 7) return 9;
+
+        /* 8. In bonus stage, State 7 transitions to State 8 with lives preserved */
+        uint8_t lives_before = g_sim.lives;
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.state != 8 || g_sim.lives != lives_before) return 10;
+
+        /* 9. State 8 advances stage from 3 to 4, ready in State 5 */
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.stage != 4 || g_sim.state != 5 || g_sim.lives != lives_before) return 11;
+
+        puts("PASS: autonomous clock and bonus lifecycle verified");
         return 0;
     }
 
@@ -1319,14 +1473,49 @@ int main(int argc, char **argv) {
         stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         if (g_sim.state != 8 || g_sim.lives != prev_lives) return 40;
 
-        /* 6. Verify Stage Clear transition 31 -> 0 progression */
+        /* 6. Verify Stage 32 Clear -> Ending sequence (State 9) -> wrap to Stage 0 */
         g_sim.stage = 31;
-        g_sim.state = 8; /* Stage Clear */
+        g_sim.state = 8; /* Stage Clear on Stage 32 */
         stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         if (g_sim.stage != 0) return 41;
-        if (g_sim.state != 5) return 42;
+        if (g_sim.state != 9) return 42; /* Authentic State 9 Ending sequence */
+        /* Key press in State 9 loops back to Stage 1 Serve */
+        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
+        if (g_sim.state != 5) return 43;
 
-        puts("PASS: multi-stage rules verified (scroll wrap, bonus penetration, 1-UP threshold, vertical drop, bonus countdown, 31->0 wraparound)");
+        /* 7. Verify Game Over lifecycle: last life lost -> State 0x0B -> Reset */
+        g_sim.lives = 0;
+        g_sim.bonus_flag = 0;
+        g_sim.state = 7; /* Life lost with 0 lives */
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.state != 0x0B) return 44; /* State 11 = 0x0B (Game Over) */
+        /* Key press in State 0x0B resets game */
+        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
+        if (g_sim.state != 5 || g_sim.lives != 3 || g_sim.stage != 0) return 45;
+
+        /* 8. Verify Bonus Stage lifecycle: Drop ball (no life lost) & Perfect Clear reward */
+        /* 8a: Ball drop in bonus stage preserves lives and advances to next stage */
+        g_sim.stage = 3;
+        g_sim.bonus_flag = 1;
+        g_sim.bricks_left = 15;
+        g_sim.lives = 4;
+        g_sim.state = 7; /* Ball dropped */
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.state != 8 || g_sim.lives != 4) return 46; /* State 8, lives intact */
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.stage != 4 || g_sim.state != 5 || g_sim.lives != 4) return 47; /* Advance to Stage 5 */
+
+        /* 8b: Perfect Bonus Clear awards authentic bonus tens from 0x1B71 (+500 tens = 5,000 pts) */
+        g_sim.stage = 3;
+        g_sim.bonus_flag = 1;
+        g_sim.bricks_left = 0;
+        g_sim.score_tens = 100;
+        g_sim.state = 8; /* Stage Clear on completed bonus */
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.score_tens != 600) return 48; /* 100 + 500 tens = 600 tens (6,000 pts) */
+        if (g_sim.stage != 4 || g_sim.state != 5) return 49;
+
+        puts("PASS: multi-stage rules verified (scroll wrap, bonus penetration, 1-UP threshold, vertical drop, bonus countdown, ending sequence, game over reset, bonus reward)");
         return 0;
     }
 

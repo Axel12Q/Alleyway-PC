@@ -37,10 +37,24 @@ def build_synthetic_stage1_rom_bytes() -> bytes:
     rom[0x1B41:0x1B41 + 15] = bytes([9] * 15)
     # Brick type 1 at 0x1B87: score_tens=1, hp=1, min_spd=0
     rom[0x1B87 + 3] = 0x11
-    rom[0x1B87 + 4] = 0x00
+    # Authentic bonus table at 0x1B71: 4 rounds of (timer, reward_tens big endian)
+    rom[0x1B71:0x1B71 + 3] = bytes([95, 0x01, 0xF4])
+    rom[0x1B74:0x1B74 + 3] = bytes([90, 0x02, 0xBC])
+    rom[0x1B77:0x1B77 + 3] = bytes([85, 0x03, 0xE8])
+    rom[0x1B7A:0x1B7A + 3] = bytes([80, 0x05, 0xDC])
+
     # Stage 0 descriptor at 0x1BE1 -> 0x1C44
     rom[0x1BE1] = 0x00
     rom[0x1BE2:0x1BE4] = (0x1C44).to_bytes(2, "little")
+
+    # Stage 3 descriptor at 0x1BEA -> 0x1C44 (bonus_flag = 1)
+    rom[0x1BEA] = 0x80
+    rom[0x1BEB:0x1BED] = (0x1C44).to_bytes(2, "little")
+
+    # Stage 31 descriptor at 0x1C3E -> 0x1C44
+    rom[0x1C3E] = 0x00
+    rom[0x1C3F:0x1C41] = (0x1C44).to_bytes(2, "little")
+
     rom[0x1C44:0x1C44 + 14] = bytes([1] * 14)
     rom[0x1C44 + 14] = 0xFF
 
@@ -655,6 +669,90 @@ class NativeStage1VerifierTests(unittest.TestCase):
             self.assertEqual(records[-1]["bonus_timer"], 0, "Timer did not expire to 0")
             self.assertEqual(records[-1]["state"], 7, "Did not transition to State 7 upon expiration")
             self.assertEqual(lives_after_expire, lives_before_expire, "Lives were incorrectly lost during bonus stage expiration")
+
+    def test_autonomous_clock_and_bonus_lifecycle_passes(self):
+        """Verify native simulation runs on independent clock without per-tick oracle resets."""
+        proc = subprocess.run([str(EXE_PATH), "--verify-autonomous-clock"], check=True, capture_output=True, text=True)
+        self.assertIn("PASS: autonomous clock and bonus lifecycle verified", proc.stdout)
+
+    def test_game_progression_lifecycle_synthetic(self):
+        """Verify progression transitions via synthetic multi-stage verifier."""
+        proc = subprocess.run([str(EXE_PATH), "--verify-multi-stage-rules"], check=True, capture_output=True, text=True)
+        self.assertIn("PASS: multi-stage rules verified", proc.stdout)
+        self.assertIn("ending sequence", proc.stdout)
+        self.assertIn("game over reset", proc.stdout)
+        self.assertIn("bonus reward", proc.stdout)
+
+    def test_local_rom_progression_scenarios_if_present(self):
+        """Verify full progression lifecycle against PyBoy: Game Over, Ending, Bonus reward, Stage wrap."""
+        local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
+        if not local_rom.is_file():
+            self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
+        from pyboy import PyBoy
+
+        def _spawn_past_title():
+            gb = PyBoy(str(local_rom), window="null", sound_emulated=False)
+            for f in range(346):
+                if f == 120: gb.button_press("start")
+                elif f == 125: gb.button_release("start")
+                gb.tick()
+            return gb
+
+        # 1. Test Game Over: lives = 0, trigger State 7 -> verify State 11 (0x0B)
+        gb1 = _spawn_past_title()
+        try:
+            gb1.memory[0xCA44] = 0
+            gb1.memory[0xFFAA] = 0
+            gb1.memory[0xFFA4] = 7
+            for _ in range(120): gb1.tick()
+            self.assertEqual(gb1.memory[0xFFA4], 11, "Did not transition to State 11 (Game Over) on last life loss")
+        finally:
+            gb1.stop()
+
+        # 2. Test Bonus Stage clear and authentic reward (500 tens = 5,000 pts)
+        gb2 = _spawn_past_title()
+        try:
+            # Advance to Stage 4 (stage = 3)
+            gb2.memory[0xCA45] = 2; gb2.memory[0xFFAA] = 0
+            gb2.memory[0xFFC8] = 0; gb2.memory[0xFFC9] = 0; gb2.memory[0xFFA4] = 8
+            for _ in range(500):
+                if gb2.memory[0xCA45] == 3 and gb2.memory[0xFFA4] == 5:
+                    break
+                gb2.tick()
+            self.assertEqual(gb2.memory[0xCA45], 3, "Failed to enter Stage 4 (bonus)")
+            self.assertEqual(gb2.memory[0xFFAA], 1, "bonus_flag != 1 in Stage 4")
+
+            # Clear all bonus bricks and trigger State 8
+            score_before = gb2.memory[0xFFCA] | (gb2.memory[0xFFCB] << 8)
+            gb2.memory[0xFFC8] = 0; gb2.memory[0xFFC9] = 0; gb2.memory[0xFFA4] = 8
+            for _ in range(600):
+                if gb2.memory[0xCA45] == 4:
+                    break
+                gb2.tick()
+            score_after = gb2.memory[0xFFCA] | (gb2.memory[0xFFCB] << 8)
+            delta_tens = score_after - score_before
+            self.assertEqual(delta_tens, 500, f"Expected 500 tens (+5,000 pts) bonus reward, got {delta_tens}")
+            self.assertEqual(gb2.memory[0xCA45], 4, "Did not advance to Stage 5 (stage = 4)")
+        finally:
+            gb2.stop()
+
+        # 3. Test Stage 32 clear -> State 9 (Ending sequence) -> Stage 0 wraparound
+        gb3 = _spawn_past_title()
+        try:
+            gb3.memory[0xCA45] = 31 # Stage 32
+            gb3.memory[0xFFAA] = 0
+            gb3.memory[0xFFC8] = 0; gb3.memory[0xFFC9] = 0
+            gb3.memory[0xFFA4] = 8
+            states_seen = []
+            for _ in range(300):
+                st = gb3.memory[0xFFA4]
+                if not states_seen or states_seen[-1] != st:
+                    states_seen.append(st)
+                gb3.tick()
+            self.assertIn(9, states_seen, "Did not enter State 9 (Ending sequence) on Stage 32 clear")
+            self.assertEqual(gb3.memory[0xCA45], 0, "Stage counter did not wrap from 31 to 0")
+        finally:
+            gb3.stop()
 
 
 if __name__ == "__main__":

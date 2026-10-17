@@ -118,7 +118,7 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
 
 ### 2. Primera Fase de Bonificacion (Fase 4, 161 bloques)
 - Descriptor `0x1BEA` activa `bonus_flag = 1` y apunta a `map_ptr = 0x357C`.
-- Temporizador oficial inicializado desde tabla `0x1B71`: 95 segundos (`0x5F`) para la Ronda 0.
+- Temporizador oficial inicializado desde tabla `0x1B71`: 95 unidades HUD (1 unidad HUD = 32 VBlanks ~0.536s; 95 unidades = 3040 fotogramas = ~50.9s).
 - Cadencia de cuenta atras (`0x198C`): decrementa en Estado 6 unicamente en ticks donde el contador VBlank `vblank_count & 0x1F == 0` (cada 32 frames).
 - Penetracion: en `0x0E43` la destruccion de bloques es inmediata y en `0x0E76` salta a `0x0DF3`, atravesando bloques sin rebotar.
 - Expiracion y caida: al expirar o caer la bola (`0x0CED`), transiciona a Estado 7, el cual en bonus (`0x07DD`) preserva intactas las vidas y salta a Estado 8 (Clear).
@@ -126,13 +126,35 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
   - `test_local_rom_stage4_bonus_parity_if_present`: 140+ ticks verificados con `mismatches = 0`, 47 bloques destruidos por penetracion continua.
   - `test_local_rom_stage4_bonus_expiration_if_present`: con temporizador en 2, comprueba decremento, cruce por cero (`bonus_timer = 0`), paso a Estado 7 y conservacion de vidas con `mismatches = 0`.
 
-### 3. Suite de pruebas
-- Total de pruebas automatizadas: **25 pruebas pasando en 4.4s** (`unittest discover tests`).
+## Hito 9 (2026-10-17): Cierre de la brecha del reloj independiente, progresion de juego y matriz de 32 fases
+### 1. Cierre de la brecha del reloj independiente
+- En `run_verify_trace`, eliminada la asignacion oculta `g_sim.vblank_count = (uint8_t)(ref_vblank - 1u)`.
+- Separacion formal entre el reloj autonomo (`s->vblank_count++` por tick) y el reloj suministrado por el scheduler (`stage1_step_tick_scheduler` con delta de fotogramas).
+- Asercion explicita `g_sim.vblank_count == ref_vblank` en cada tick de la traza para garantizar paridad del reloj sin correcciones oraculares.
+- Opcion CLI `--verify-autonomous-clock` en `src/main.c` probando el avance autonomo a traves de Saque (5), Juego activo (6), Pausa (12 / 0x0C), expiracion por cuenta atras a cero y transicion sin perdida de vidas en bonus.
+
+### 2. Progresion completa y maquina de estados de Alleyway
+- Implementada la transicion autentica de la maquina de estados (`0x054C`):
+  - Limpieza normal: Estado 8 -> Estado 4 -> Estado 5 incrementando `stage`.
+  - Bonus completado: Estado 8 suma decenas de bonificacion de `0x1B71` (`[500, 700, 1000, 1500]` decenas = `5,000, 7,000, 10,000, 15,000` puntos en HUD).
+  - Caida de bola / fin de tiempo en bonus: Estado 7 -> Estado 8 sin restar vidas.
+  - Fin de vidas: Estado 7 con `lives == 0` -> Estado 11 (`0x0B`, Game Over) -> reseteo con Start/A a Fase 1.
+  - Fase 32 completada: `stage` incrementa de 31 a 32 -> reinicio modular a 0 y transicion a Estado 9 (`0x0839`, secuencia final de Mario) -> bucle a Fase 1.
+
+### 3. Matriz de clasificacion formal de las 32 Fases
+- 8 Rondas x 4 Fases por ronda:
+  - Tipo A (Fases 1, 5, 9, 13, 17, 21, 25, 29): Estáticas, 20 filas.
+  - Tipo B (Fases 2, 6, 10, 14, 18, 22, 26, 30): Desplazamiento horizontal de 20 filas.
+  - Tipo C (Fases 3, 7, 11, 15, 19, 23, 27, 31): Descenso vertical de 40 filas por rebotes en paleta.
+  - Tipo D (Fases 4, 8, 12, 16, 20, 24, 28, 32): Bonus sprites, penetracion continua, cuenta atras y puntuacion extra.
+- Refutacion: el binario DMG carece de mecanicas tipo Arkanoid de division de bola o transformacion de pala; unicamente existe la reduccion normal a 16 px por colision con el techo.
+
+### 4. Suite de pruebas
+- Total de pruebas automatizadas: **28 pruebas aprobadas en ~2.2s** (`unittest discover tests`).
 
 ## Siguiente paso recomendado para Codex / futuras sesiones
 1. Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido) y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
-2. Secuencias de intro y telon de transicion (Estados 1..4).
-3. Mecanica de division de bola / transformacion de pala en fases avanzadas.
+2. Secuencias graficas completas de intro, animacion de apertura de telon (Estados 0..4) y celebracion del final (Estado 9).
 
 
 

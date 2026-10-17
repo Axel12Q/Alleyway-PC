@@ -104,23 +104,44 @@
     - **Eventos observados y verificados**: 2 descensos completos (`row_offset: 20 -> 19 -> 18`), colisiones continuas de la bola con las filas desplazadas y destruccion de 24 bloques (`bricks_left: 84 -> 60`, puntuacion 270, aceleracion `speed_idx: 3 -> 5`).
 - **Mecanica autentica de la Primera Fase de Bonificacion (Fase 4, `0x1BEA`)**:
   - Descriptor en `0x1BEA`: `desc0 = 0x80` (`bonus_flag = 1`), `map_ptr = 0x357C` (161 bloques con el sprite de Mario).
-  - Temporizador oficial de bonificacion: leido de tabla `0x1B71` segun la ronda (`stage >> 2`). En Ronda 0 (Fase 4): 95 segundos (`0x5F`).
-  - Cadencia del temporizador (`0x198C`): solo avanza en Estado 6 (juego activo). En cada tick donde el contador de cuadros VBlank `vblank_count & 0x1F == 0` (cada 32 fotogramas, ~1.86 Hz), `bonus_timer` decrementa en 1.
+  - Temporizador oficial de bonificacion: leido de tabla `0x1B71` segun la ronda (`stage >> 2`). En Ronda 0 (Fase 4): 95 unidades HUD. Unidades exactas: 1 unidad de HUD = 32 VBlanks (~0.536 s; 95 unidades = 3040 fotogramas = ~50.9 s).
+  - Cadencia del temporizador (`0x198C`): solo avanza en Estado 6 (juego activo). En cada tick donde el contador de cuadros VBlank `vblank_count & 0x1F == 0` (cada 32 fotogramas, ~1.86 Hz), `bonus_timer` decrementa en 1. En Saque (Estado 5) y Pausa (Estado 12 / 0x0C) el temporizador permanece congelado.
   - Penetracion completa de bloques: en `0x0E43`, `bonus_flag != 0` destruye el bloque de inmediato sin decrementar HP; en `0x0E76` salta a `0x0DF3`, suprimiendo la reflexion de velocidad para que la bola atraviese formaciones densas sin rebotar.
   - Caida de bola y expiracion: cuando la bola cae (`0x0CED`) o el tiempo se agota (`0x1996: bonus_timer == 0`), se activa el Estado 7. En Estado 7 (`0x07DD`), las fases de bonus saltan la rutina de decremento de vidas y transicionan a Estado 8 (Clear) sin perder vidas.
-  - Recompensa y transicion (`0x0805`): si `bricks_left == 0`, se otorgan 500 puntos de bonificacion (`0x01F4` decenas) de la tabla `0x1B71`. Se incrementa `stage` (3 -> 4) y se pasa al telon de intro (Estado 4).
+  - Recompensa y transicion (`0x0805`): si `bricks_left == 0`, se otorgan 500 decenas de bonificacion (`0x01F4` decenas big-endian = 5,000 puntos en HUD) de la tabla `0x1B71`. Se incrementa `stage` (3 -> 4) y se pasa al telon de intro (Estado 4).
   - **Validacion de paridad bit a bit frente al cartucho (`test_local_rom_stage4_bonus_parity_if_present` y `test_local_rom_stage4_bonus_expiration_if_present`)**:
     - Prueba 1 (penetracion y cadencia): 140+ ticks verificados con `mismatches = 0`, 47 bloques penetrados y destruidos continuamente (`bricks_left: 161 -> 114`), puntuacion 1,040 y decremento de temporizador observado.
     - Prueba 2 (expiracion y conservacion de vidas): simulacion con temporizador preparado cerca de cero (`bonus_timer = 2`), verificando 62 ticks de logica, cruce por cero (`bonus_timer = 0`), transicion a Estado 7 y preservacion intacta de vidas (`lives = 4`).
-- **Aserciones de cobertura y suite de pruebas**:
-  - Anadidas aserciones explicitas en `test_local_rom_stage2_parity_if_present` (`stage == 1`, `scroll_flag == 1`, avance y rotacion modular de `row_shift`).
-  - Actualizado `--verify-multi-stage-rules` en `src/main.c` para verificar de forma aislada el descenso vertical por rebote y la cadencia de cuenta atras y transicion sin perdida de vidas en bonus.
-  - Total de pruebas automatizadas: **25 pruebas aprobadas** en ~4.4s.
+
+### Hito 9: Cierre de la brecha del reloj independiente, progresion completa (Game Over, Bonus, Final) y matriz de 32 fases
+- **Cierre de la brecha del reloj independiente (`src/main.c`, `run_verify_trace` y `--verify-autonomous-clock`)**:
+  - Eliminada en `run_verify_trace` la sobreescritura oculta `g_sim.vblank_count = (uint8_t)(ref_vblank - 1u)` que corregia el reloj nativo antes de cada tick.
+  - Separacion estricta y documentada entre reloj suministrado por el scheduler (`stage1_step_tick_scheduler`) y avance autonomo (`stage1_step_tick`): el simulador nativo acumula el delta de VBlanks del planificador y valida `(int)g_sim.vblank_count == ref_vblank` como asercion en cada tick.
+  - Implementado `--verify-autonomous-clock` que inicializa el reloj nativo una sola vez (`vblank_count = 0`) y ejecuta el ciclo de vida integro sin oraculo:
+    1. Saque (Estado 5): 50 ticks -> reloj avanza a 50, temporizador bonus congelado en 95.
+    2. Saque con boton A -> Estado 6, reloj avanza a 51.
+    3. Juego activo (Estado 6): 64 ticks -> reloj avanza a 115, temporizador bonus decrementa exactamente 2 unidades (32 ticks por unidad: 95 -> 93).
+    4. Pausa (Estado 12 / 0x0C): 64 ticks -> reloj avanza a 179, temporizador bonus y fisica completamente congelados.
+    5. Reanudacion a Estado 6.
+    6. Expiracion exacta en frontera de 32 ticks (cruce por cero) -> transicion a Estado 7 sin perdida de vidas.
+    7. Estado 7 transiciona a Estado 8 con vidas preservadas.
+    8. Estado 8 avanza fase de 3 a 4 y prepara Estado 5.
+- **Progresion real de fases y cierre de partida (maquina de estados DMG `0x054C`)**:
+  - Estado 7 (`0x07D3`): si `bonus_flag != 0`, transiciona a Estado 8 sin restar vidas; si `bonus_flag == 0` y `lives == 0`, transiciona a Estado 11 (`0x0B`, Game Over); si `lives > 0`, resta 1 vida y vuelve a Estado 5.
+  - Estado 8 (`0x0805`): si `bonus_flag != 0` y `bricks_left == 0`, suma las decenas de bonificacion de `0x1B71` (`[500, 700, 1000, 1500]` decenas = `5,000, 7,000, 10,000, 15,000` puntos); incrementa `stage`; si `stage >= 32`, reinicia a 0 y transiciona a Estado 9 (`0x0839`, secuencia de final de juego); en caso contrario carga la matriz y pasa a Estado 4 (telon) -> Estado 5 (saque).
+  - Estado 9 (`0x0839`): celebracion de fin de juego (Fase 32 completada); con entrada o fin de secuencia pasa a Estado 4/5 con `stage = 0` (bucle de partida conservando puntuacion).
+  - Estado 11 (`0x0B`, `0x08D1`): Game Over; reproduce jingle y tras tiempo/entrada reinicia partida (`lives = 3, score = 0, stage = 0, state = 5`).
+- **Matriz de clasificacion formal de las 32 Fases (8 Rondas x 4 Tipos)**:
+  - **Tipo A (Fases 1, 5, 9, 13, 17, 21, 25, 29)**: Estáticas, 20 filas (`bonus_flag = 0`, `scroll_flag = 0`).
+  - **Tipo B (Fases 2, 6, 10, 14, 18, 22, 26, 30)**: Desplazamiento horizontal de 20 filas (`bonus_flag = 0`, `scroll_flag = 1`, patrones 0..7 en `0x4075`).
+  - **Tipo C (Fases 3, 7, 11, 15, 19, 23, 27, 31)**: Descenso vertical de 40 filas (`bonus_flag = 0`, `scroll_flag = 0`, `row_offset = 20` decrementado por rebotes de paleta segun tabla `0x1B7D`).
+  - **Tipo D (Fases 4, 8, 12, 16, 20, 24, 28, 32)**: Fases de bonificacion (`bonus_flag = 1`, `scroll_flag = 0`, bola penetra bloques sin rebotar, cuenta atras desde tabla `0x1B71` [95, 90, 85, 80 unidades de 32 VBlanks], premio por destruccion total `[500, 700, 1000, 1500]` decenas [5,000, 7,000, 10,000, 15,000 puntos], caida o expiracion sin perdida de vidas).
+  - *Aclaracion sobre mecanicas*: Se refuta formalmente cualquier especulacion sobre "division de bola" o "transformaciones de paleta" al estilo Arkanoid; el binario oficial DMG de Alleyway carece por completo de tales rutinas (unicamente existen paleta normal de 24 px y paleta reducida a 16 px al tocar el techo).
+- **Ejecucion de pruebas**: **28 pruebas aprobadas** en ~2.2s.
 
 ## Lo que falta para el juego completo (siguiente paso para continuar)
 1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
-2. **Secuencias de intro y telon de transicion (Estados 1..4)**.
-3. **Mecanica de division de bola / transformacion de pala en fases avanzadas**.
+2. **Secuencias de intro y animacion del telon (Estados 0..4) y secuencia grafica del final (Estado 9)**.
 
 
 

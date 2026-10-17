@@ -3,12 +3,12 @@
 Laboratorio para investigar Alleyway (Game Boy, 1989) y construir una reimplementacion
 nativa verificable en Windows.
 
-Estado actual: **Fases 1, 2, 3 y Fase 4 Bonus nativas verificadas bit a bit frente a PyBoy en logica y secuencias de transicion de estados (`--verify-trace` y `--run-scenario`)**,
+Estado actual: **Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verificadas bit a bit frente a PyBoy en logica y secuencias de transicion de estados (`--verify-trace` y `--run-scenario`, 40/40 pruebas OK sin `expectedFailure`)**,
 con scheduler monotonico Win32 (`QueryPerformanceCounter` a ~59.7275 Hz), audio fraccionario sin deriva (`738 + 23157/65536` muestras/frame a 44,100 Hz) y decodificacion de tiles 2bpp planar
 cargando tablas, mapas y efectos de sonido en tiempo de ejecucion desde el volcado local del usuario,
 sin recursos comerciales en el repositorio.
-- **Probado diferencialmente contra el cartucho original (`tests/test_scenario_diff.py`)**: final normal (`8 -> 4 -> 5`), caida/expiracion en bonus sin perder vidas (`7 -> 4 -> 5`, sin estado 8 intermedio), bonus perfecto con conteo progresivo (+500 decenas exactamente una vez en 50 pasos de 10 decenas), perdida de vida normal (`7 -> 11 -> 5`, con divergencia conocida de +1 paso de PRNG documentada como `expectedFailure`) y Game Over (`7 -> 11 -> 1 -> 2`).
-- **Alcance e hipotesis/limites**: los descriptores y mapas de las 32 fases en ROM estan inspeccionados estructuralmente, pero las fases 5..32 aun no tienen trazas diferenciales de ejecucion completa; la presentacion visual del telon y banners es una adaptacion grafica sobre el framebuffer nativo; canales APU 2..4 y pantalla de titulo/final animados siguen en progreso.
+- **Probado diferencialmente contra el cartucho original (`tests/test_scenario_diff.py`, 12 escenarios con `0 mismatches` incluyendo `prng`)**: final normal (`8 -> 4 -> 5`), caida/expiracion en bonus sin perder vidas (`7 -> 4 -> 5`, sin estado 8 intermedio), bonus perfecto multi-ronda desde `0x1B71` (Rondas 0..3: +500/+700/+1000/+1500 decenas a +10 decenas/frame y VBlank extra en 1-UP), perdida de vida normal con nuevo saque y juego activo (`7 -> 11 -> 5 -> 6`), Game Over con reinicio `Start` desde titulo (`State 2`), telon inicial de 221 frames, segunda partida y Pausa/Reanudacion (`State 12`), final tras Fase 32 (`8 -> 9 [1445f] -> 4 -> 5` a `stage = 0`), y fases avanzadas horizontal (Fase 14) y vertical (Fase 23).
+- **Alcance e hipotesis/limites**: los descriptores y mapas de las 32 fases en ROM estan inspeccionados estructuralmente (`test_rom_stage_descriptor_layout_if_present`), pero las fases fuera de 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 aun no tienen trazas diferenciales de ejecucion completa; la presentacion visual del telon y banners es una adaptacion grafica sobre el framebuffer nativo; canales APU 2..4 y animacion grafica de pantalla de titulo/final siguen en progreso.
 
 ## Empezar en Windows
 

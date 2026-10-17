@@ -1,6 +1,6 @@
 # Alleyway: registro de investigacion y desarrollo
 Fecha: 2026-10-17
-Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en Windows y verificada bit a bit frente a PyBoy sobre el volcado local del usuario (`../Local-Privado/roms/Alleyway (USA).gb`, fuera de Git). Fases 2..32, fases de bonificacion, tiles 2bpp y audio siguen pendientes.
+Estado: Hito 12 completado — Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verificadas bit a bit frente a PyBoy (trazas de logica `--verify-trace` y 12 escenarios diferenciales completos `--run-scenario`, 40/40 pruebas OK sin `expectedFailure`) sobre el volcado local del usuario (`../Local-Privado/roms/Alleyway (USA).gb`, fuera de Git). Canales APU 2..4 y secuencias visuales animadas de titulo/final siguen en progreso.
 
 ## Copia local del usuario (fuera de Git)
 - Ruta: `../Local-Privado/roms/Alleyway (USA).gb`
@@ -152,9 +152,45 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
 ### 4. Suite de pruebas
 - Total de pruebas automatizadas: **28 pruebas aprobadas en ~2.2s** (`unittest discover tests`).
 
+## Hito 10 (2026-10-17): Scheduler monotonico QPC y audio fraccionario sin deriva (`242706a`)
+- Implementado `src/gb_scheduler.h` con reloj monotonico `QueryPerformanceCounter` a la frecuencia exacta de DMG (`70,224 / 4,194,304` s/frame, ~59.7275 Hz) y sintesis fraccionaria de audio a 44,100 Hz (`738 + 23157/65536` muestras/frame, 738,353 muestras en 1,000 fotogramas con cero deriva).
+- Nota de auditoria: en `242706a`, `state_timer` no se inicializaba al entrar en estados y las pruebas de progresion solo inspeccionaban PyBoy/ROM sin ejecutar el binario C; corregido en Hito 11.
+
+## Hito 11 (2026-10-17): Inicializacion productiva de `state_timer` y verificacion diferencial PyBoy vs C (`dcb47f0`)
+- Implementada `stage1_enter_state` en `src/main.c` como unico punto de entrada a estados y anadido el modo `--run-scenario <rom> <scenario.jsonl>`.
+- Creados `tools/scenario_diff.py` y `tests/test_scenario_diff.py` ejecutando en paralelo PyBoy y `alleyway-lab.exe --run-scenario` sobre 6 escenarios de transicion (`normal_clear`, `bonus_drop`, `bonus_expire`, `bonus_perfect`, `life_lost`, `game_over`) mas prueba de mutacion de `state_timer`.
+- Suite en `dcb47f0`: **38 pruebas ejecutadas (37 OK + 1 `expectedFailure` en `test_life_lost_prng_matches_original`)**.
+
+## Hito 12 (2026-10-17): Cierre de PRNG en `life_lost`, reinicio desde Titulo + 2.a partida + Pausa/Reanudacion, Bonus multi-ronda (`0x1B71`), Fase 32 -> Ending y Fases 14/23
+### 1. Muestreo atomico en VBlank (`0x01EF`, `LY = 144`) y orden real de PRNG
+- `tools/scenario_diff.py` registra un hook de PyBoy en la entrada de la ISR de VBlank (`0x01EF`, `LY = 144`), muestreando cada fotograma de forma 100% atomica tras `0x0522: CALL 0x0505` (mientras la CPU espera en `0x0221: HALT`).
+- Desensamblado de `State 7` (`0x07D3..0x0804`): `0x07ED: RET Z` solo retorna a `0x0522` en `7 -> 11` cuando `lives == 0` (`game_over`). Cuando `lives > 0` (`life_lost`), espera 1 VBlank dentro de `State 11` (`0x07F3: CALL 0x47C7`) sin avanzar PRNG, restablece `paddle_shrunk = 0`, `paddle_w = 0x18`, `scroll_step = 2` (`0x07FC`), asigna `state = 5` y retorna a `0x0522` en `11 -> 5`.
+- En `State 5` (`0x0773..0x07A5`), pulsar `A` llama a `0x101B` (`serve_ball`) y espera 1 VBlank en `0x0794: CALL 0x47C7` permaneciendo en `State 5` sin avanzar PRNG (`serve_pending = 1`), pasando a `State 6` en el siguiente VBlank.
+- Eliminados `@unittest.expectedFailure` y `KNOWN_PRNG_DIVERGENCE`: `prng` coincide en todos los fotogramas de los 12 escenarios.
+
+### 2. Reinicio desde Titulo (`State 2`), duracion exacta de `State 4`, Bonus multi-ronda (`0x1B71`), Ending (`State 9`) y limpieza vertical (`0x0BF2`)
+- En `State 2` (`0x0582..0x0604`), pulsar `Start` reinicia `stage = 0, score_tens = 0, lives = 4, up_index = 0` (conservando `prng`, `vblank_count`, `scroll_timer`) y tras `3` fotogramas entra en `State 4` con `+155` fotogramas adicionales de la secuencia de entrada de Mario (`0x43DC`, total `221` fotogramas en Fase 1).
+- En `State 4` (`0x06A2..0x0734`), la duracion del desempaquetado `0x092A` se calcula por descriptor (`(next_bonus ? 98 : 65) + (rows * 14 + nonempty * 5) / 390`), restableciendo paleta (`0x28`, `0x18`) y limpiando `scroll_step = 0` al salir.
+- En `State 8` (`0x19F7..0x1A68`), el conteo de bonus perfecto espera `449` fotogramas, lee el premio de la ronda desde `0x1B71` (`500, 700, 1000, 1500` decenas = `50, 70, 100, 150` pasos de `+10` decenas/fotograma) y contabiliza el VBlank extra (`0x47C7`) cuando `0x0C71` otorga un 1-UP (`550` fotogramas en Ronda 2, `600` en Ronda 3 y Fase 32).
+- Al completar la Fase 32 (`stage: 31 -> 0`), `State 8` pasa a `State 9` (`0x0839`, `DUR_ENDING = 1445` fotogramas) -> `State 4` (`66` fotogramas) -> `State 5` en `stage = 0` conservando puntos y vidas.
+- En el descenso vertical (`0x0BC7 -> 0x0BF2`), al decrementar `row_offset` se limpia en memoria la fila `row_offset + 20` que sale por el fondo de las 20 filas visibles y se descuentan sus bloques de `bricks_left`.
+
+### 3. Suite diferencial ampliada (12 escenarios PyBoy vs C, `40/40` tests OK)
+- Escenarios verificados con `mismatch = None` en `tests/test_scenario_diff.py`:
+  1. `normal_clear` (420f): `[(6, 103), (8, 145), (4, 66), (5, 106)]`
+  2. `bonus_drop` (700f): `[(7, 229), (4, 66), (5, 405)]`
+  3. `bonus_expire` (700f): `[(6, 29), (7, 229), (4, 66), (5, 376)]`
+  4. `bonus_perfect` (800f, Ronda 0): `[(6, 61), (8, 499), (4, 66), (5, 174)]`
+  5. `bonus_perfect_r1` (800f, Ronda 1): `[(6, 80), (8, 519), (4, 67), (5, 134)]`
+  6. `bonus_perfect_r2` (800f, Ronda 2 + 1-UP): `[(6, 66), (8, 550), (4, 66), (5, 118)]`
+  7. `bonus_perfect_r3` (850f, Ronda 3 + 1-UP): `[(6, 67), (8, 600), (4, 66), (5, 117)]`
+  8. `life_lost` (420f, `compare_play=True`, re-saque + juego activo): `[(7, 101), (11, 1), (5, 15), (6, 303)]`
+  9. `game_over` (850f, `compare_play=True`, Start en Titulo -> 2.a partida -> Pausa/Reanudacion): `[(7, 101), (11, 377), (1, 1), (2, 25), (4, 221), (5, 7), (6, 29), (12, 20), (6, 34), (7, 35)]`
+  10. `stage32_ending` (2250f, Fase 32 -> State 9 Ending -> Fase 1): `[(6, 73), (8, 600), (9, 1445), (4, 66), (5, 66)]`
+  11. `stage14_horizontal` (350f, `compare_play=True`, Fase 14): `[(6, 350)]`
+  12. `stage23_vertical` (450f, `compare_play=True`, Fase 23): `[(6, 450)]`
+- Total de la suite automatizada: **40 pruebas ejecutadas y aprobadas (`40 OK, 0 expectedFailure`)** en ~9.0s.
+
 ## Siguiente paso recomendado para Codex / futuras sesiones
 1. Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido) y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
 2. Secuencias graficas completas de intro, animacion de apertura de telon (Estados 0..4) y celebracion del final (Estado 9).
-
-
-

@@ -182,13 +182,50 @@
     5. `life_lost` (220 ticks): `6x67 -> 7x100 -> 11x1 -> 5x52`, `0 mismatches` en `state`, `stage`, `lives`, `score_tens`, `bonus_flag`, `bonus_timer`. Divergencia conocida y documentada en `prng`: tras `7 -> 11 -> 5` el motor C queda 1 paso de LFSR por delante del original (`tick 102: expected 81, native 146`), registrada explícitamente con `@unittest.expectedFailure` en `test_life_lost_prng_matches_original`.
     6. `game_over` (580 ticks): `6x67 -> 7x100 -> 11x377 -> 1x1 -> 2x35`, `0 mismatches` (incluyendo `prng`).
   - **Prueba de mutación (`test_mutation_without_timer_initialisation_fails_differential`)**: corrompe `state_timer = 0` tras la transición en el flujo nativo y demuestra que el comparador diferencial detecta inmediatamente el fallo en el `tick 105` (`state: expected=8, native=4`), impidiendo que regresiones de temporizador pasen desapercibidas.
-- **Estado de la suite de pruebas**: **38 pruebas automatizadas aprobadas** (incluyendo 1 `expectedFailure` documentado sobre el paso extra de `prng` tras `life_lost`).
+  - **Estado de la suite de pruebas en Hito 11 (`dcb47f0`)**: **38 pruebas ejecutadas (37 OK + 1 `expectedFailure` documentado sobre el paso extra de `prng` tras `life_lost`)**. *(Nota: en `dcb47f0`, `tools/scenario_diff.py` muestreaba al retorno de `gb.tick(1)` en `LY = 0` en lugar del inicio atómico de la ISR de VBlank `0x01EF` en `LY = 144`, produciendo un desplazamiento de 1 fotograma en las fronteras `6->8`/`8->4`/`6->7`/`7->11`; esto y la divergencia de `prng` quedaron resueltos en el Hito 12).*
+
+### Hito 12: Cierre del desfase PRNG en `life_lost`, reinicio desde Título + 2.ª partida + Pausa/Reanudación, Bonus multi-ronda (`0x1B71`) + 1-UP, Fase 32 -> Ending (`State 9`) y Fases avanzadas (14 y 23)
+- **Muestreo atómico en el punto de entrada de la ISR de VBlank (`0x01EF`, `LY = 144`) en `tools/scenario_diff.py`**:
+  - Al retornar `gb.tick(1)` (`LY = 0`), la rutina de sonido de final de VBlank (`0x0210: CALL 0x7FF0`) o el bucle principal pueden haber cruzado la línea 0. Registrando un hook de PyBoy en `0x01EF` (`LY = 144`, inicio de la ISR de VBlank), cada fotograma se muestrea de forma 100% atómica después de que el bucle principal ejecutó el manejador de estado y el avance `0x0522: CALL 0x0505` (PRNG) y se detuvo en `0x0221` (`HALT`).
+  - Con ello, `prng` (`0xFFA1`) se compara ahora en **todos los fotogramas de todos los estados** sin excepciones, eliminando `KNOWN_PRNG_DIVERGENCE` y `@unittest.expectedFailure`.
+- **Causas raíz medidas en el desensamblado DMG y corregidas en `src/main.c`**:
+  1. **Orden real de PRNG en `State 7 -> 11 -> 5` (`0x07D3..0x0804`)**:
+     - En `State 7` (`0x07D3`), tras 101 VBlanks de espera (`DUR_DEATH = 101`), `0x07EA` comprueba `lives` (`0xCA44`).
+     - Solo cuando `lives == 0` (`game_over`), `0x07ED: RET Z` retorna al bucle principal (`0x0522: CALL 0x0505`), avanzando el PRNG en la transición `7 -> 11`.
+     - Cuando `lives > 0` (`life_lost`), la CPU **no retorna** en `7 -> 11`: decrementa `lives`, entra en `State 11` y espera 1 VBlank interno (`0x07F3: CALL 0x47C7`) **sin** llamar a `0x0505`; en el siguiente VBlank (`0x07F6..0x0804`), restablece la paleta (`paddle_shrunk = 0`, `paddle_w = 0x18`), fija `scroll_step = 2` (`0x07FC: LD A, 2; LDH (0xFFC5), A`), asigna `state = 5` y ejecuta `RET` hacia `0x0522: CALL 0x0505` en la transición `11 -> 5`. (En Hito 11 se suprimía el PRNG en `11 -> 5` en lugar de `7 -> 11`).
+  2. **Secuencia de 2 VBlanks al sacar en `State 5` (`0x0773..0x07A5`)**:
+     - Al pulsar `A` en `State 5`, `0x078E` llama a `0x101B` (`serve_ball`, que consume `prng` para elegir el ángulo inicial) y luego ejecuta `0x0794: CALL 0x47C7`, esperando 1 VBlank dentro de `State 5` **sin** retornar a `0x0522` (`serve_pending = 1`, sin paso de PRNG en ese fotograma). En el segundo VBlank (`0x0797..0x07A5`), dispara `SFX 7`, cambia a `State 6` y retorna a `0x0522` (1 paso de PRNG).
+  3. **Restablecimiento de paleta/scroll y duración exacta de `State 4` (`0x06A2..0x0734`, `0x092A`, `0x43DC`)**:
+     - Al cargar la fase en `State 4` (`0x06AE..0x06D8`), el cartucho restablece `paddle_shrunk = 0`, `paddle_w = 0x18`, `paddle_x = 0x28`, `paddle_y = 0x90`, y al salir a `State 5` (`0x0730`) limpia `scroll_step = 0` (`0xFFC5`).
+     - El desempaquetado del mapa (`0x092A`) consume un número determinista de VBlanks según las filas y celdas no vacías del descriptor: `(next_bonus ? 98 : 65) + (rows * 14 + nonempty * 5) / 390` (`66..70` fotogramas en fases normales, `99..100` en fases de bonus).
+     - Además, cuando se entra a `State 4` desde la pantalla de título (`State 2`, `first_curtain == 1`), `0x06F7` ejecuta la animación de entrada de la nave de Mario (`0x43DC`), añadiendo exactamente **`+155` fotogramas** (`66 + 155 = 221` fotogramas en Fase 1).
+  4. **Reinicio desde Pantalla de Título (`State 2`, `0x0582..0x0604`)**:
+     - Al pulsar `Start` en `State 2`, el original espera `DUR_TITLE_START_DELAY = 3` fotogramas antes de cambiar a `State 4` (`221` fotogramas), reiniciando `stage = 0`, `score_tens = 0`, `lives = 4`, `up_index = 0` pero **preservando intactos `prng`, `vblank_count` y `scroll_timer`**.
+  5. **Conteo de Bonus multi-ronda desde ROM (`0x19F7..0x1A68`, `0x1B71`) y VBlank extra por 1-UP (`0x0C71`)**:
+     - Eliminada la constante fija de 50 pasos: `State 8` espera `DUR_BONUS_PRE_TALLY = 449` fotogramas previos al conteo y lee en tiempo de ejecución el premio de la ronda desde `0x1B71 + round_idx * 3 + 1` (`500, 700, 1000, 1500` decenas para Rondas 0, 1, 2 y >=3), sumando `+10` decenas por fotograma durante `reward_tens / 10` pasos (`50, 70, 100, 150` fotogramas).
+     - En cada paso de `+10` decenas, `0x1A59` invoca `CALL 0x0C71` (`check_1up_threshold`). Cuando se cruza un umbral de 1-UP (`1,000` decenas = `10,000` puntos), `0x0C9F` llama a `0x47C7` (`JP 0x0221`), consumiendo **1 VBlank adicional** dentro de `State 8` (`449 + 100 + 1 = 550` fotogramas en Ronda 2; `449 + 150 + 1 = 600` fotogramas en Ronda 3 y Fase 32).
+  6. **Secuencia de Final tras Fase 32 (`State 9`, `0x0839`)**:
+     - Al completar la Fase 32 (`stage == 31 -> 0`), tras `State 8` (`600` fotogramas) el juego entra en `State 9` durante exactamente **`DUR_ENDING = 1445` fotogramas**, tras lo cual pasa a `State 4` (`66` fotogramas) -> `State 5` en `stage = 0` conservando la puntuación y vidas acumuladas.
+  7. **Limpieza de la fila inferior al descender el mural vertical (`0x0BC7 -> 0x0BF2`)**:
+     - Cuando `row_offset` (`0xFFA9`) decrementa tras alcanzar el umbral de rebotes de paleta, `0x0BF2` borra en memoria (`grid_type = 0`) la fila `row_offset + 20` que acaba de salir por la parte inferior de las 20 filas visibles y resta de `bricks_left` (`0xCA46`) los bloques destructibles presentes en esa fila.
+- **Resultados verificados de los 12 escenarios diferenciales PyBoy vs C (`tests/test_scenario_diff.py`, `mismatch = None` en los 12)**:
+  1. `normal_clear` (420f): `state_runs = [(6, 103), (8, 145), (4, 66), (5, 106)]`, `stage: 0 -> 1`, `score_tens = 1`, `lives = 4`.
+  2. `bonus_drop` (700f): `state_runs = [(7, 229), (4, 66), (5, 405)]`, `stage: 3 -> 4`, `lives = 4` (sin pasar por `state 8`).
+  3. `bonus_expire` (700f): `state_runs = [(6, 29), (7, 229), (4, 66), (5, 376)]`, `stage: 3 -> 4`, `lives = 4` (sin pasar por `state 8`).
+  4. `bonus_perfect` (800f, Fase 4 / Ronda 0, `+500` decenas en 50 pasos): `state_runs = [(6, 61), (8, 499), (4, 66), (5, 174)]`, `score_tens: 2 -> 502`, `stage: 3 -> 4`.
+  5. `bonus_perfect_r1` (800f, Fase 8 / Ronda 1, `+700` decenas en 70 pasos): `state_runs = [(6, 80), (8, 519), (4, 67), (5, 134)]`, `score_tens: 2 -> 702`, `stage: 7 -> 8`.
+  6. `bonus_perfect_r2` (800f, Fase 12 / Ronda 2, `+1000` decenas en 100 pasos + 1-UP): `state_runs = [(6, 66), (8, 550), (4, 66), (5, 118)]`, `score_tens: 2 -> 1002`, `lives: 4 -> 5`, `stage: 11 -> 12`.
+  7. `bonus_perfect_r3` (850f, Fase 16 / Ronda 3, `+1500` decenas en 150 pasos + 1-UP): `state_runs = [(6, 67), (8, 600), (4, 66), (5, 117)]`, `score_tens: 2 -> 1502`, `lives: 4 -> 5`, `stage: 15 -> 16`.
+  8. `life_lost` (420f, `compare_play = True`): `state_runs = [(7, 101), (11, 1), (5, 15), (6, 303)]`, verifica `prng` exacto tras `7 -> 11 -> 5`, nuevo saque con `A`, seguimiento de paleta y rotura de bloques (`bricks_left = 72`, `score_tens = 12`, `lives = 3`).
+  9. `game_over` (850f, `compare_play = True`): `state_runs = [(7, 101), (11, 377), (1, 1), (2, 25), (4, 221), (5, 7), (6, 29), (12, 20), (6, 34), (7, 35)]`, verifica llegada a Título (`State 2`), reinicio real con `Start`, telón inicial de `221` fotogramas, llegada a `State 5` con `score_tens = 0, lives = 4, stage = 0`, saque a segunda partida (`State 6`), Pausa (`State 12` durante 20 fotogramas) y Reanudación (`State 6`).
+  10. `stage32_ending` (2250f, Fase 32 -> Ending -> bucle a Fase 1): `state_runs = [(6, 73), (8, 600), (9, 1445), (4, 66), (5, 66)]`, `stage: 31 -> 0`, `score_tens = 1502`, `lives: 4 -> 5`.
+  11. `stage14_horizontal` (350f, `compare_play = True`, Fase 14 desplazamiento horizontal avanzado): `state_runs = [(6, 350)]`, verifica desplazamiento `row_shift_6 > 0`, física de bola/paleta y rotura de bloques (`bricks_left: 69 -> 61`, `score_tens = 13`).
+  12. `stage23_vertical` (450f, `compare_play = True`, Fase 23 descenso vertical avanzado): `state_runs = [(6, 450)]`, verifica descenso por rebotes de paleta (`row_offset: 20 -> 19`), limpieza de la fila inferior (`0x0BF2`) y colisiones (`bricks_left = 104`, `score_tens = 45`).
+- **Alcance verificado vs límites**:
+  - Tienen verificación diferencial de ejecución real PyBoy vs C las **Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32**. Las restantes fases de las 32 están cubiertas por inspección estructural de sus descriptores y mapas en ROM (`test_rom_stage_descriptor_layout_if_present`), sin afirmar que las 32 fases individuales tengan trazas de juego completas.
+- **Estado de la suite de pruebas**: **40 pruebas automatizadas ejecutadas y aprobadas (`40 OK, 0 expectedFailure`)** en ~9.0s.
 
 ## Lo que falta para el juego completo (siguiente paso para continuar)
 1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulación por software de barridos de tono (`0x6B76`/`0x6B8B`).
-2. **Pantalla de título completa (Estado 2, "PUSH START KEY") y animación del telón con Mario (Estados 0..4 / Estado 9)**.
-3. **Ajuste exacto del paso de PRNG (`0xFFA1`) en la transición `state 7 -> 11 -> 5` (`life_lost`)** para eliminar el `expectedFailure` restante.
-
-
-
+2. **Presentación visual completa de la pantalla de título (Estados 0..3) y animaciones de OAM/BG del telón con Mario (Estado 4) y celebración del final (Estado 9)** (cuyas duraciones y transiciones lógicas ya están verificadas al fotograma).
 

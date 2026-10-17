@@ -1,10 +1,11 @@
 """ORIGINAL (PyBoy) vs NATIVE (C) differential scenarios for Alleyway state/progression logic.
 
 The original is driven with PRIVATE injections (documented per scenario below); the native
-executable is started from a snapshot of the original taken at a logic-tick boundary and is then
-run AUTONOMOUSLY (`alleyway-lab.exe --run-scenario`): it receives only the joypad inputs that the
-original latched, never expected states, clocks or timers. The per-tick sequences of
-state/stage/lives/score/bonus are then compared and the first mismatch is reported.
+executable is started from a snapshot of the original taken at an atomic VBlank ISR boundary
+(0x01EF, LY=144) and is then run AUTONOMOUSLY (`alleyway-lab.exe --run-scenario`): it receives
+only the joypad inputs that the original latched, never expected states, clocks or timers.
+The per-tick sequences of state/stage/lives/score/bonus/prng (plus ball/paddle/scroll fields
+during active play) are then compared and the first mismatch is reported.
 
 Requires a local ROM (kept outside Git). Nothing here embeds ROM data.
 """
@@ -13,10 +14,16 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-HOOK_LOGIC_START = 0x051F  # latches joypad (0xFF8C/0xFF8D)
-HOOK_LOGIC_END = 0x0525    # end of one logic tick
+HOOK_VBLANK = 0x01EF       # VBlank ISR entry (LY=144): 100% of frame CPU work & PRNG step done
+HOOK_LOGIC_START = 0x051F  # latches joypad in play loop (0xFF8C/0xFF8D)
 
 COMPARE_FIELDS = ("state", "stage", "lives", "score_tens", "bonus_flag")
+PLAY_FIELDS = (
+    "paddle_x", "paddle_w",
+    "ball_x", "ball_x_sub", "ball_y", "ball_y_sub",
+    "ball_vx", "ball_vy", "speed_idx", "bricks_left",
+    "row_offset", "scroll_timer", "scroll_step", "row_shift_0", "row_shift_6",
+)
 
 
 def _boot_past_title(rom_path):
@@ -32,10 +39,13 @@ def _boot_past_title(rom_path):
 
 
 def _fast_forward_to_stage(gb, stage_idx):
-    """PRIVATE INJECTION: set stage = stage_idx-1, bricks_left = 0, state = 8 so the original
-    itself plays state 8 -> 4 -> 5 into the target stage (no native involvement)."""
+    """PRIVATE INJECTION: set stage = stage_idx-1, bonus_count (0xCA47) = stage_idx // 4,
+    bricks_left = 0, state = 8 so the original itself plays state 8 -> 4 -> 5 into the target
+    stage (no native involvement)."""
     m = gb.memory
     m[0xCA45] = stage_idx - 1
+    m[0xCA47] = stage_idx // 4
+    m[0xFFAA] = 0
     m[0xFFC8] = 0
     m[0xFFC9] = 0
     m[0xFFA4] = 8
@@ -70,7 +80,7 @@ def _record(gb, latched):
         "lives": m[0xCA44], "stage": m[0xCA45],
         "scroll_flag": m[0xFFAB], "bonus_flag": m[0xFFAA],
         "bonus_timer": m[0xCA48], "row_offset": m[0xFFA9],
-        "scroll_timer": 0, "scroll_step": 0,
+        "scroll_timer": m[0xFFC4], "scroll_step": m[0xFFC5],
         "in_joyp_raw": latched[0], "in_joyp_edge": latched[1],
         "logic_fired": 0,
     }
@@ -81,8 +91,10 @@ def _record(gb, latched):
     return rec
 
 
-# name -> dict(prepare_stage, inject, frames, description). `inject(mem, snap)` edits original RAM
-# AND the snapshot given to the native (they must stay identical).
+def _inject_noop(_mem, _snap):
+    pass
+
+
 def _inject_bricks_one(mem, snap):
     mem[0xFFC8] = 0
     mem[0xFFC9] = 1
@@ -109,30 +121,97 @@ def _inject_bonus_timer_one(mem, snap):
     snap["bonus_timer"] = 1
 
 
+def _inject_scroll_timer_two(mem, snap):
+    mem[0xFFC4] = 2
+    snap["scroll_timer"] = 2
+
+
 SCENARIOS = {
     # Normal stage 1 clear: last brick (bricks_left forced to 1) -> 8 -> 4 -> 5.
-    "normal_clear": dict(stage=None, inject=_inject_bricks_one, frames=420,
-                         doc="inject bricks_left=1 at first logic tick after serve"),
+    "normal_clear": dict(
+        stage=None, inject=_inject_bricks_one, frames=420,
+        doc="inject bricks_left=1 at first logic tick after serve",
+    ),
     # Bonus (stage 4) ball drop: ball_y forced below paddle -> 7 -> 4 -> 5, lives kept.
-    "bonus_drop": dict(stage=3, inject=_inject_ball_below_paddle, frames=700,
-                       doc="fast-forward original to stage 4, serve, inject ball_y=0xA0"),
+    "bonus_drop": dict(
+        stage=3, inject=_inject_ball_below_paddle, frames=700,
+        doc="fast-forward original to stage 4, serve, inject ball_y=0xA0",
+    ),
     # Bonus timer expiry: bonus_timer forced to 1 -> 7 -> 4 -> 5, lives kept.
-    "bonus_expire": dict(stage=3, inject=_inject_bonus_timer_one, frames=700,
-                         doc="fast-forward original to stage 4, serve, inject bonus_timer=1"),
-    # Bonus perfect clear: last brick -> 8 (499 frames, +500 tens once) -> 4 -> 5.
-    "bonus_perfect": dict(stage=3, inject=_inject_bricks_one, frames=800,
-                          doc="fast-forward original to stage 4, serve, inject bricks_left=1"),
-    # Normal life lost with spare lives: 7 -> 11 (lives--) -> 5.
-    "life_lost": dict(stage=None, inject=_inject_lives(4), frames=420,
-                      doc="inject lives=4 and ball_y=0xA0"),
-    # Last life lost (lives == 0): 7 -> 11 (Game Over, 377) -> 1 -> 2.
-    "game_over": dict(stage=None, inject=_inject_lives(0), frames=700,
-                      doc="inject lives=0 and ball_y=0xA0"),
+    "bonus_expire": dict(
+        stage=3, inject=_inject_bonus_timer_one, frames=700,
+        doc="fast-forward original to stage 4, serve, inject bonus_timer=1",
+    ),
+    # Bonus Round 0 (Stage 4) perfect clear: +500 tens in 50 steps of 10 (499 frames in State 8).
+    "bonus_perfect": dict(
+        stage=3, inject=_inject_bricks_one, frames=800,
+        doc="fast-forward original to stage 4 (Round 0 bonus), serve, inject bricks_left=1",
+    ),
+    # Bonus Round 1 (Stage 8) perfect clear: +700 tens in 70 steps of 10 (519 frames in State 8).
+    "bonus_perfect_r1": dict(
+        stage=7, inject=_inject_bricks_one, frames=800,
+        doc="fast-forward original to stage 8 (Round 1 bonus), serve, inject bricks_left=1",
+    ),
+    # Bonus Round 2 (Stage 12) perfect clear: +1000 tens in 100 steps + 1-UP (550 frames in State 8).
+    "bonus_perfect_r2": dict(
+        stage=11, inject=_inject_bricks_one, frames=800,
+        doc="fast-forward original to stage 12 (Round 2 bonus), serve, inject bricks_left=1",
+    ),
+    # Bonus Round 3 (Stage 16) perfect clear: +1500 tens in 150 steps + 1-UP (600 frames in State 8).
+    "bonus_perfect_r3": dict(
+        stage=15, inject=_inject_bricks_one, frames=850,
+        doc="fast-forward original to stage 16 (Round 3 bonus), serve, inject bricks_left=1",
+    ),
+    # Normal life lost with spare lives: 7 (101) -> 11 (1, lives--) -> 5 -> re-serve (A) & active play.
+    "life_lost": dict(
+        stage=None, inject=_inject_lives(4), frames=420, compare_play=True, track_ball=True,
+        button_events=[
+            (105, "press", "right"),
+            (112, "release", "right"),
+            (115, "press", "a"),
+            (118, "release", "a"),
+        ],
+        doc="inject lives=4 and ball_y=0xA0, then move paddle, re-serve with A, track ball and break bricks",
+    ),
+    # Last life lost -> Game Over (377) -> Title (1 -> 2) -> Start restart -> 221f curtain -> serve (A) -> Pause/Resume.
+    "game_over": dict(
+        stage=None, inject=_inject_lives(0), frames=850, compare_play=True,
+        button_events=[
+            (500, "press", "start"),
+            (503, "release", "start"),
+            (730, "press", "a"),
+            (733, "release", "a"),
+            (740, "press", "right"),
+            (750, "release", "right"),
+            (760, "press", "start"),
+            (763, "release", "start"),
+            (780, "press", "start"),
+            (783, "release", "start"),
+            (790, "press", "left"),
+            (810, "release", "left"),
+        ],
+        doc="inject lives=0 and ball_y=0xA0 -> Game Over -> Title -> Start restart -> serve -> Pause/Resume",
+    ),
+    # Stage 32 (stage=31) clear -> State 8 (600f) -> State 9 Ending (1445f, stage=0) -> State 4 (66f) -> State 5.
+    "stage32_ending": dict(
+        stage=31, inject=_inject_bricks_one, frames=2250,
+        doc="fast-forward original to stage 32 (stage=31), serve, inject bricks_left=1 -> Ending State 9 -> Stage 1",
+    ),
+    # Advanced horizontal scrolling stage (Stage 14, stage=13, Round 4 Type B): active play, scroll & collisions.
+    "stage14_horizontal": dict(
+        stage=13, inject=_inject_noop, frames=350, compare_play=True, track_ball=True,
+        doc="fast-forward original to stage 14 (stage=13), serve and track ball across scrolling rows",
+    ),
+    # Advanced vertical descending stage (Stage 23, stage=22, Round 6 Type C, 40 rows): paddle bounces & vertical drop.
+    "stage23_vertical": dict(
+        stage=22, inject=_inject_scroll_timer_two, frames=450, compare_play=True, track_ball=True,
+        doc="fast-forward original to stage 23 (stage=22), inject scroll_timer=2, bounce and verify vertical drop",
+    ),
 }
 
 
 def run_original(rom_path, name):
-    """Run the ORIGINAL; return (snapshot, inputs, expected) with one entry per logic tick."""
+    """Run the ORIGINAL; return (snapshot, inputs, expected) sampled atomically at VBlank ISR (0x01EF)."""
     sc = SCENARIOS[name]
     gb = _boot_past_title(rom_path)
     try:
@@ -141,41 +220,72 @@ def run_original(rom_path, name):
         _serve(gb)
         if gb.memory[0xFFA4] != 6:
             raise RuntimeError("original not in state 6 after serve")
-        latched = [0xFF, 0xFF]
-        state = {"snap": None, "fired": False}
+        state = {"snap": None, "logic_fired": False, "vblank_rec": None}
         records = []
 
-        def on_start(_ctx):
-            latched[0] = int(gb.memory[0xFF8C])
-            latched[1] = int(gb.memory[0xFF8D])
-            state["fired"] = True
+        def on_logic_start(_ctx):
+            state["logic_fired"] = True
 
-        def on_end(_ctx):
-            # The play-loop hook only fires in states 5/6; later states run other loops, so
-            # the expected sequence is sampled once per frame (see below), not per hook.
+        def on_vblank(_ctx):
+            # At 0x01EF (LY=144), the previous frame's CPU work & PRNG step (0x0522) are 100% done,
+            # and 0xFF8C/0xFF8D/0xFFA2 still hold the exact joypad & vblank_count of that frame.
+            latched = (int(gb.memory[0xFF8C]), int(gb.memory[0xFF8D]))
             if state["snap"] is None:
-                snap = _record(gb, latched)
-                sc["inject"](gb.memory, snap)
-                state["snap"] = snap
+                if state["logic_fired"]:
+                    snap = _record(gb, latched)
+                    sc["inject"](gb.memory, snap)
+                    state["snap"] = snap
+            else:
+                rec = _record(gb, latched)
+                rec["logic_fired"] = 1 if state["logic_fired"] else 0
+                state["vblank_rec"] = rec
+            state["logic_fired"] = False
 
-        gb.hook_register(0, HOOK_LOGIC_START, on_start, None)
-        gb.hook_register(0, HOOK_LOGIC_END, on_end, None)
-        # Run until the snapshot frame completes (injection happens inside the hook).
+        gb.hook_register(0, HOOK_LOGIC_START, on_logic_start, None)
+        gb.hook_register(0, HOOK_VBLANK, on_vblank, None)
+
         for _ in range(5):
             gb.tick()
             if state["snap"] is not None:
                 break
         if state["snap"] is None:
-            raise RuntimeError("logic hooks never fired")
-        for _ in range(sc["frames"]):
-            state["fired"] = False
-            latched[0], latched[1] = 0xFF, 0xFF
+            raise RuntimeError("vblank/logic hooks never fired for snapshot")
+
+        events_by_tick = {}
+        for t_idx, action, btn in sc.get("button_events", ()):
+            events_by_tick.setdefault(t_idx, []).append((action, btn))
+        track_ball = sc.get("track_ball", False)
+
+        for t in range(sc["frames"]):
+            for action, btn in events_by_tick.get(t, ()):
+                if action == "press":
+                    gb.button_press(btn)
+                else:
+                    gb.button_release(btn)
+            if track_ball and gb.memory[0xFFA4] == 6:
+                ball_x = gb.memory[0xFFB6]
+                pad_x = gb.memory[0xFFC0]
+                pad_w = gb.memory[0xFFC2]
+                target_x = ball_x - (pad_w // 2)
+                if pad_x < target_x - 1:
+                    gb.button_press("right")
+                    gb.button_release("left")
+                elif pad_x > target_x + 1:
+                    gb.button_press("left")
+                    gb.button_release("right")
+                else:
+                    gb.button_release("left")
+                    gb.button_release("right")
+
+            state["vblank_rec"] = None
             gb.tick()
-            if not state["fired"]:
-                latched[0], latched[1] = 0xFF, 0xFF
-            rec = _record(gb, latched)
-            rec["logic_fired"] = 1 if state["fired"] else 0
-            records.append(rec)
+            if state["vblank_rec"] is not None:
+                records.append(state["vblank_rec"])
+            else:
+                # Fallback when LCD is briefly off during screen transitions (0x01EF not triggered)
+                rec = _record(gb, (0xFF, 0xFF))
+                rec["logic_fired"] = 0
+                records.append(rec)
     finally:
         gb.stop()
     inputs = [(r["in_joyp_raw"], r["in_joyp_edge"]) for r in records]
@@ -201,7 +311,7 @@ def _bonus_timer_comparable(exp):
     return exp["bonus_flag"] == 1 and exp["state"] in (5, 6, 7, 8)
 
 
-def compare(expected, native, check_prng=True):
+def compare(expected, native, check_prng=True, compare_play=False):
     """Return None if identical, else a dict describing the FIRST mismatch."""
     if len(native) != len(expected):
         return {"tick": min(len(native), len(expected)), "field": "length",
@@ -211,18 +321,22 @@ def compare(expected, native, check_prng=True):
             if e[f] != n[f]:
                 return {"tick": i, "field": f, "expected": e[f], "native": n[f],
                         "expected_rec": {k: e[k] for k in COMPARE_FIELDS}, "native_rec": n}
-        # PRNG: compared only on frames where the original's play-loop tick completed
-        # (other frames are sampled mid-loop, so a 1-tick phase offset is expected there).
-        if check_prng and e.get("logic_fired") and e["prng"] != n["prng"]:
-            return {"tick": i, "field": "prng", "expected": e["prng"], "native": n["prng"]}
+        if check_prng and e["prng"] != n["prng"]:
+            return {"tick": i, "field": "prng", "expected": e["prng"], "native": n["prng"],
+                    "state": e["state"]}
         if _bonus_timer_comparable(e) and e["bonus_timer"] != n["bonus_timer"]:
             return {"tick": i, "field": "bonus_timer", "expected": e["bonus_timer"],
                     "native": n["bonus_timer"]}
+        if compare_play and e["state"] in (5, 6, 0x0C):
+            for f in PLAY_FIELDS:
+                if f in n and e[f] != n[f]:
+                    return {"tick": i, "field": f, "expected": e[f], "native": n[f],
+                            "state": e["state"]}
     return None
 
 
 def state_runs(records):
-    """Run-length encode the state sequence: [[state, frames, stage, lives, score]...]."""
+    """Run-length encode the state sequence: [(state, frames), ...]."""
     runs = []
     for r in records:
         if runs and runs[-1][0] == r["state"]:
@@ -232,16 +346,13 @@ def state_runs(records):
     return [(s, n) for s, n in runs]
 
 
-# KNOWN DIVERGENCE (documented, not hidden): after a normal life loss the native PRNG ends one
-# step ahead of the original (first mismatch: life_lost tick 102, expected 81, native 146).
-# The state/stage/lives/score/bonus sequence still matches exactly; PRNG is excluded for that
-# scenario only and covered by an expectedFailure test.
-KNOWN_PRNG_DIVERGENCE = {"life_lost"}
-
-
-def run_differential(exe, rom_path, name, workdir=None, check_prng=None):
-    if check_prng is None:
-        check_prng = name not in KNOWN_PRNG_DIVERGENCE
+def run_differential(exe, rom_path, name, workdir=None, check_prng=True):
+    sc = SCENARIOS[name]
     snap, inputs, expected = run_original(rom_path, name)
     native = run_native(exe, rom_path, snap, inputs, workdir)
-    return expected, native, compare(expected, native, check_prng)
+    return expected, native, compare(
+        expected, native,
+        check_prng=check_prng,
+        compare_play=sc.get("compare_play", False),
+    )
+

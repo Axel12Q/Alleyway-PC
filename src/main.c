@@ -32,8 +32,13 @@ typedef struct {
     bool rom_loaded;
     uint8_t state;
     uint16_t state_timer;    /* Remaining frames of a timed state; loaded ONLY by stage1_enter_state() */
+    uint16_t curtain_dur;    /* Initial State 4 duration loaded on entry */
     uint8_t game_over;       /* 1 while state 11 is the Game Over display */
     uint8_t curtain_grid_loaded;
+    uint8_t serve_pending;   /* 1 during the 1-VBlank delay inside 0x0773..0x07A5 before State 6 */
+    uint8_t first_curtain;   /* 1 on the first stage entered from Title State 2 (+155 frames Mario entry) */
+    uint16_t bonus_tally_remaining; /* Remaining bonus reward tens to tally in State 8 */
+    uint8_t bonus_1up_delay; /* 1 during the extra VBlank of CALL 0x47C7 inside 0x0C71 on bonus 1-UP */
     uint8_t prng;
     uint8_t paddle_x;
     uint8_t paddle_y;
@@ -79,37 +84,107 @@ static HWAVEOUT g_h_wave_out = NULL;
 static WAVEHDR g_wave_hdrs[AUDIO_NUM_BUFFERS];
 
 /*
- * Measured state durations (frames) from the original cartridge under PyBoy,
- * see docs/STATUS.md Hito 11. "Frames" = recorded frames in which the state value
- * is observed, counting the entry frame. Presentation (curtain graphics, banners)
- * is an ADAPTATION; only these durations/transitions are compared with the original.
+ * Measured state durations (frames) from the original cartridge under PyBoy at the
+ * atomic VBlank ISR boundary (0x01EF, LY=144), see docs/STATUS.md Hito 12.
+ * "Frames" = recorded VBlanks in which the state value is observed.
+ * Presentation (curtain graphics, banners) is an ADAPTATION; only these durations/transitions
+ * and gameplay variables are compared with the original.
  */
-#define DUR_CURTAIN 67u
-#define CURTAIN_GRID_LOAD_REMAINING 63u /* grid/bonus_flag swap 4 ticks after curtain entry */
-#define DUR_DEATH 100u
-#define DUR_BONUS_END 228u
-#define DUR_CLEAR 144u
-#define DUR_BONUS_TALLY 498u
-#define BONUS_TALLY_FRAMES 50u
+#define DUR_CURTAIN_DEFAULT 66u
+#define DUR_MARIO_ENTRY_EXTRA 155u
+#define CURTAIN_GRID_LOAD_OFFSET 3u /* grid/bonus_flag swap 3 VBlanks after curtain entry at 0x01EF */
+#define DUR_DEATH 101u
+#define DUR_BONUS_END 229u
+#define DUR_CLEAR 145u
+#define DUR_BONUS_PRE_TALLY 449u
 #define BONUS_TALLY_STEP_TENS 10u
+#define DUR_BONUS_TALLY (DUR_BONUS_PRE_TALLY + 50u) /* Round 0 default: 449 + 50 = 499 */
 #define DUR_LIFE_LOST_TRANSIENT 1u
 #define DUR_GAME_OVER 377u
 #define DUR_TITLE_ENTRY 1u
+#define DUR_TITLE_START_DELAY 3u
+#define DUR_ENDING 1445u
 
 static bool is_timed_state(uint8_t st) {
-    return st == 4 || st == 7 || st == 8 || st == 0x0B || st == 1;
+    return st == 4 || st == 7 || st == 8 || st == 9 || st == 0x0B || st == 1;
+}
+
+static uint16_t compute_stage_curtain_dur(const AlleywayStage1 *s, uint8_t stage_idx) {
+    uint16_t dur = DUR_CURTAIN_DEFAULT;
+    uint16_t desc_addr = (uint16_t)(0x1BE1u + (uint16_t)stage_idx * 3u);
+    if (s->rom_loaded && desc_addr + 2u < ROM_SIZE_BYTES) {
+        uint8_t desc0 = s->rom[desc_addr];
+        bool next_bonus = (desc0 & 0x80u) != 0;
+        uint16_t map_ptr = (uint16_t)s->rom[desc_addr + 1u] | ((uint16_t)s->rom[desc_addr + 2u] << 8);
+        uint32_t rows = 0;
+        uint32_t nonempty = 0;
+        int idx = 0;
+        if (map_ptr >= 0x1C00u) {
+            while (map_ptr + GRID_COLS <= ROM_SIZE_BYTES && s->rom[map_ptr] != 0xFF && idx + GRID_COLS <= GRID_CELLS) {
+                for (int c = 0; c < GRID_COLS; ++c) {
+                    if (s->rom[map_ptr + (uint16_t)c] != 0) nonempty++;
+                }
+                map_ptr = (uint16_t)(map_ptr + GRID_COLS);
+                idx += GRID_COLS;
+                rows++;
+            }
+        }
+        if (rows > 1u) {
+            uint16_t base = next_bonus ? 98u : 65u;
+            uint16_t extra = (uint16_t)((rows * 14u + nonempty * 5u) / 390u);
+            dur = (uint16_t)(base + extra);
+        }
+    }
+    if (s->first_curtain != 0) {
+        dur = (uint16_t)(dur + DUR_MARIO_ENTRY_EXTRA);
+    }
+    return dur;
 }
 
 /* Single shared entry path: loads the per-state timer exactly once on entry. */
 static void stage1_enter_state(AlleywayStage1 *s, uint8_t new_state) {
     s->state = new_state;
     switch (new_state) {
-    case 4:    s->state_timer = DUR_CURTAIN; s->curtain_grid_loaded = 0; break;
-    case 7:    s->state_timer = (s->bonus_flag != 0) ? DUR_BONUS_END : DUR_DEATH; break;
-    case 8:    s->state_timer = (s->bonus_flag != 0 && s->bricks_left == 0) ? DUR_BONUS_TALLY : DUR_CLEAR; break;
-    case 0x0B: s->state_timer = (s->game_over != 0) ? DUR_GAME_OVER : DUR_LIFE_LOST_TRANSIENT; break;
-    case 1:    s->state_timer = DUR_TITLE_ENTRY; break;
-    default:   s->state_timer = 0; break;
+    case 4:
+        s->curtain_dur = compute_stage_curtain_dur(s, s->stage);
+        s->state_timer = s->curtain_dur;
+        s->curtain_grid_loaded = 0;
+        s->first_curtain = 0;
+        break;
+    case 7:
+        s->state_timer = (s->bonus_flag != 0) ? DUR_BONUS_END : DUR_DEATH;
+        break;
+    case 8:
+        if (s->bonus_flag != 0 && s->bricks_left == 0) {
+            uint8_t round_idx = (uint8_t)(s->stage >> 2);
+            if (round_idx > 3u) round_idx = 3u;
+            uint16_t reward_tens = 500u;
+            uint16_t tbl = (uint16_t)(0x1B71u + (uint16_t)round_idx * 3u + 1u);
+            if (s->rom_loaded && tbl + 1u < ROM_SIZE_BYTES) {
+                uint16_t r = ((uint16_t)s->rom[tbl] << 8) | (uint16_t)s->rom[tbl + 1u];
+                if (r > 0u) reward_tens = r;
+            }
+            s->bonus_tally_remaining = reward_tens;
+            s->bonus_1up_delay = 0;
+            s->state_timer = (uint16_t)(DUR_BONUS_PRE_TALLY + (reward_tens / BONUS_TALLY_STEP_TENS));
+        } else {
+            s->bonus_tally_remaining = 0;
+            s->bonus_1up_delay = 0;
+            s->state_timer = DUR_CLEAR;
+        }
+        break;
+    case 9:
+        s->state_timer = DUR_ENDING;
+        break;
+    case 0x0B:
+        s->state_timer = (s->game_over != 0) ? DUR_GAME_OVER : DUR_LIFE_LOST_TRANSIENT;
+        break;
+    case 1:
+        s->state_timer = DUR_TITLE_ENTRY;
+        break;
+    default:
+        s->state_timer = 0;
+        break;
     }
 }
 
@@ -124,6 +199,7 @@ static bool state_timer_step(AlleywayStage1 *s) {
 static void stage1_begin_serve(AlleywayStage1 *s) {
     s->paddle_shrunk = 0;
     s->paddle_w = 0x18;
+    s->serve_pending = 0;
     stage1_enter_state(s, 5u);
 }
 
@@ -298,6 +374,12 @@ static void load_stage_grid(AlleywayStage1 *s) {
     s->row_offset = (rows >= 20) ? (uint8_t)(rows - 20) : 0u;
     s->bricks_left = destructible;
 
+    /* Authentic State 4 stage setup (0x06AE..0x06D8) also resets paddle position & width */
+    s->paddle_shrunk = 0;
+    s->paddle_w = 0x18;
+    s->paddle_x = 0x28;
+    s->paddle_y = 0x90;
+
     /* Initialize authentic bonus timer from 0x1B71 if in bonus stage (0x0735..0x0745) */
     if (s->bonus_flag != 0) {
         uint8_t round_idx = (uint8_t)(s->stage >> 2); /* stages 3, 7, 11, 15 -> rounds 0, 1, 2, 3 */
@@ -337,8 +419,13 @@ static void stage1_reset_for_play(AlleywayStage1 *s) {
     if (s->high_score_tens < 200) s->high_score_tens = 200;
     s->lives = 4; /* observed 0xCA44 = 4 at first serve of the original */
     s->state_timer = 0;
+    s->curtain_dur = DUR_CURTAIN_DEFAULT;
     s->game_over = 0;
     s->curtain_grid_loaded = 1;
+    s->serve_pending = 0;
+    s->first_curtain = 0;
+    s->bonus_tally_remaining = 0;
+    s->bonus_1up_delay = 0;
     s->stage = 0;
     s->bonus_flag = 0;
     s->scroll_flag = 0;
@@ -352,6 +439,20 @@ static void stage1_reset_for_play(AlleywayStage1 *s) {
 static uint8_t step_prng(AlleywayStage1 *s) {
     s->prng = (uint8_t)((s->prng + 0x41u) & 0xFFu);
     return s->prng;
+}
+
+/* 1-UP check against table at 0x1B5D (0x0C71..0x0CA5). Returns true when a 1-UP is awarded. */
+static bool check_1up_threshold(AlleywayStage1 *s) {
+    if (0x1B5Du + (uint16_t)s->up_index * 2u + 1u < ROM_SIZE_BYTES) {
+        uint16_t thresh = ((uint16_t)s->rom[0x1B5Du + (uint16_t)s->up_index * 2u] << 8) |
+                          (uint16_t)s->rom[0x1B5Du + (uint16_t)s->up_index * 2u + 1u];
+        if (thresh != 0xFFFFu && thresh != 0u && s->score_tens >= thresh) {
+            s->up_index++;
+            if (s->lives < 99) s->lives++;
+            return true;
+        }
+    }
+    return false;
 }
 
 static void load_speed_vector(const AlleywayStage1 *s, uint8_t speed_one_based, uint8_t angle_idx,
@@ -438,8 +539,10 @@ static void serve_ball(AlleywayStage1 *s) {
         vx = neg16(vx);
     }
     s->ball_vx = vx;
-    s->state = 6;
-    s->sfx_trigger = 7; /* SFX 7: Serve / Paddle bounce */
+    /* In 0x0773..0x07A5, after 0x101B initializes ball pos/vel, 0x0794 calls 0x47C7 (JP 0x0221)
+     * waiting 1 VBlank in State 5 without stepping PRNG; on the next VBlank, 0x0797 triggers SFX 7,
+     * 0x07A1 sets State 6, and 0x07A5 returns to 0x0522: CALL 0x0505. */
+    s->serve_pending = 1u;
 }
 
 static void snap_y_positive(AlleywayStage1 *s) {
@@ -540,15 +643,7 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
         s->high_score_tens = s->score_tens;
     }
 
-    /* 1-UP check against table at 0x1B5D (0x0C71..0x0CA5) */
-    if (0x1B5Du + (uint16_t)s->up_index * 2u + 1u < ROM_SIZE_BYTES) {
-        uint16_t thresh = ((uint16_t)s->rom[0x1B5Du + (uint16_t)s->up_index * 2u] << 8) |
-                          (uint16_t)s->rom[0x1B5Du + (uint16_t)s->up_index * 2u + 1u];
-        if (thresh != 0xFFFFu && s->score_tens >= thresh) {
-            s->up_index++;
-            if (s->lives < 99) s->lives++;
-        }
-    }
+    (void)check_1up_threshold(s);
 
     if (s->bricks_left > 0) {
         s->bricks_left--;
@@ -570,9 +665,25 @@ static void step_paddle_bounce_vertical_drop(AlleywayStage1 *s) {
         s->scroll_timer = 0xFFu;
     }
     if (s->scroll_timer == 0) {
-        /* Authentic vertical brick drop (0x1175: CALL 0x0BC7) */
+        /* Authentic vertical brick drop (0x1175: CALL 0x0BC7 -> CALL 0x0BF2):
+         * Decrements row_offset and clears row (row_offset + 20) that scrolled off the bottom,
+         * decrementing bricks_left for any destructible bricks on that row. */
         if (s->row_offset > 0) {
             s->row_offset--;
+            uint8_t drop_row = (uint8_t)(s->row_offset + 20u);
+            if (drop_row < GRID_ROWS) {
+                for (int c = 0; c < GRID_COLS; ++c) {
+                    int idx = (int)drop_row * GRID_COLS + c;
+                    if (s->grid_type[idx] != 0) {
+                        uint8_t hp = s->grid_hp[idx];
+                        s->grid_type[idx] = 0;
+                        if (hp != 0) {
+                            if (s->bricks_left > 0) s->bricks_left--;
+                            if (s->bricks_left == 0) stage1_enter_state(s, 8u);
+                        }
+                    }
+                }
+            }
         }
         if (s->scroll_step < 0x0Au) {
             uint8_t sc = s->scroll_step;
@@ -725,8 +836,7 @@ static void step_stage_timers(AlleywayStage1 *s) {
      * When bonus_flag is set, bonus timer counts down every 32 frames/ticks (vblank_count & 0x1F == 0).
      * 1 HUD unit = 32 VBlanks (~0.536s; 95 units = 3040 frames = ~50.9s).
      * When timer expires (hits 0), triggers state 7 (0x19C7: LD A, 7 / LDH (0xA4), A)
-     * which in bonus stages transitions cleanly to State 8 (0x07D3: if bonus_flag != 0 -> State 8)
-     * without losing a life!
+     * which in bonus stages transitions cleanly to State 4 (stage++, lives kept) without losing a life!
      */
     if (s->bonus_flag != 0 && s->bonus_timer > 0) {
         if ((s->vblank_count & 0x1Fu) == 0) {
@@ -741,28 +851,43 @@ static void step_stage_timers(AlleywayStage1 *s) {
 static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge, uint8_t elapsed_vblanks) {
     s->vblank_count = (uint8_t)(s->vblank_count + elapsed_vblanks);
     s->sfx_trigger = 0;
-    /* Observed (frame sampling of 0xFFA1): the original PRNG advances on play-loop ticks and ONCE
-     * on the tick where a timed state expires; it stays frozen during the frames in between.
-     * HYPOTHESIS: the one-frame state 11 after a normal life loss is a pass-through that does not
-     * advance it (data: 7->11->5 shows a single advance). */
+    /* Verified by disassembly (0x0505..0x0525, 0x0773..0x0804) & VBlank ISR (0x01EF) sampling:
+     * 0x0522: CALL 0x0505 advances PRNG (0xFFA1) when a state handler executes RET back to the
+     * main dispatch loop:
+     * 1) In play states (5, 6, 0x0C), every VBlank returns to 0x0522 EXCEPT the first VBlank of
+     *    a serve in State 5 (0x0794: CALL 0x47C7 waits 1 VBlank before 0x07A1 sets State 6 and RETs).
+     * 2) In timed/menu states (1, 2, 4, 7, 8, 9, 0x0B), the handler loops internally on 0x0221 and
+     *    only executes RET to 0x0522 on the tick it transitions to the next state, EXCEPT on 7 -> 0x0B
+     *    when lives > 0 (0x07ED: RET Z is only taken when lives == 0; normal life loss stays inside
+     *    0x07D3 across the 1-VBlank State 11 at 0x07F3 and RETs to 0x0522 on 0x0B -> 5!). */
     const bool play_loop_tick = (s->state == 5 || s->state == 6 || s->state == 0x0C);
     const uint8_t entry_state = s->state;
-    const bool entry_transient_11 = (entry_state == 0x0B && s->game_over == 0);
     if (s->state == 4) {
         /* State 4 (curtain). Timer loaded once by stage1_enter_state(). The new stage
-         * grid / bonus_flag swap happens CURTAIN_GRID_LOAD_REMAINING ticks after entry
-         * (observed: bonus_flag stays 1 for 4 frames after a bonus ends). */
+         * grid / bonus_flag swap happens CURTAIN_GRID_LOAD_OFFSET ticks after entry. */
         bool expired = state_timer_step(s);
-        if (!s->curtain_grid_loaded && (expired || s->state_timer <= CURTAIN_GRID_LOAD_REMAINING)) {
+        uint16_t load_rem = (s->curtain_dur > CURTAIN_GRID_LOAD_OFFSET)
+                          ? (uint16_t)(s->curtain_dur - CURTAIN_GRID_LOAD_OFFSET) : 0u;
+        if (!s->curtain_grid_loaded && (expired || s->state_timer <= load_rem)) {
             load_stage_grid(s);
             s->curtain_grid_loaded = 1;
         }
-        if (expired) stage1_begin_serve(s);
+        if (expired) {
+            s->scroll_step = 0u; /* 0x0730: XOR A; LDH (0xFFC5), A */
+            stage1_begin_serve(s);
+        }
     } else if (s->state == 5) {
-        step_horizontal_scroll(s);
-        update_paddle(s, joyp_raw);
-        if ((joyp_edge & 0x01u) == 0) {
-            serve_ball(s);
+        if (s->serve_pending != 0) {
+            /* 2nd VBlank of serve (0x0797..0x07A5): trigger SFX 7, enter State 6, RET to 0x0522 */
+            s->serve_pending = 0;
+            s->state = 6u;
+            s->sfx_trigger = 7u;
+        } else {
+            step_horizontal_scroll(s);
+            update_paddle(s, joyp_raw);
+            if ((joyp_edge & 0x01u) == 0) {
+                serve_ball(s);
+            }
         }
     } else if (s->state == 6) {
         step_horizontal_scroll(s);
@@ -777,7 +902,7 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
             s->state = 6;
         }
     } else if (s->state == 7) {
-        /* Ball lost / bonus ended. Observed: 100 frames (normal) or 228 frames (bonus),
+        /* Ball lost / bonus ended: 101 frames (normal) or 229 frames (bonus) at 0x01EF,
          * then bonus -> state 4 directly (stage++, no state 8, lives kept);
          * normal -> state 11 (lives-- first when lives > 0). */
         if (state_timer_step(s)) {
@@ -794,22 +919,39 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
             }
         }
     } else if (s->state == 8) {
-        /* Stage clear: 144 frames (normal). Perfect bonus: 498 frames; the last
-         * BONUS_TALLY_FRAMES frames add BONUS_TALLY_STEP_TENS tens each (+500 tens once). */
+        /* Stage clear: 145 frames (normal). Perfect bonus (0x19F7..0x1A68): 449 pre-tally frames
+         * + (reward_tens / 10) tally frames (+10 tens/frame) + 1 extra frame if 0x0C71 awards a 1-UP. */
         bool perfect_bonus = (s->bonus_flag != 0 && s->bricks_left == 0);
-        if (s->state_timer == (perfect_bonus ? DUR_BONUS_TALLY : DUR_CLEAR)) {
+        if (!perfect_bonus && s->state_timer == DUR_CLEAR) {
+            s->sfx_trigger = 8;
+        } else if (perfect_bonus && s->state_timer == (uint16_t)(DUR_BONUS_PRE_TALLY + (s->bonus_tally_remaining / BONUS_TALLY_STEP_TENS))) {
             s->sfx_trigger = 8;
         }
         bool expired = state_timer_step(s);
-        if (perfect_bonus && s->state_timer < BONUS_TALLY_FRAMES) {
-            uint32_t ns = (uint32_t)s->score_tens + BONUS_TALLY_STEP_TENS;
-            s->score_tens = (ns > 0xFFFFu) ? 0xFFFFu : (uint16_t)ns;
-            if (s->score_tens > s->high_score_tens) s->high_score_tens = s->score_tens;
+        if (perfect_bonus) {
+            if (s->bonus_1up_delay != 0) {
+                /* Extra VBlank consumed by CALL 0x47C7 inside 0x0C71 on 1-UP */
+                s->bonus_1up_delay = 0;
+            } else if (!expired && s->bonus_tally_remaining > 0u) {
+                uint16_t tally_frames_left = (uint16_t)(s->bonus_tally_remaining / BONUS_TALLY_STEP_TENS);
+                if (s->state_timer <= tally_frames_left) {
+                    uint16_t step = (s->bonus_tally_remaining >= BONUS_TALLY_STEP_TENS)
+                                  ? BONUS_TALLY_STEP_TENS : s->bonus_tally_remaining;
+                    uint32_t ns = (uint32_t)s->score_tens + (uint32_t)step;
+                    s->score_tens = (ns > 0xFFFFu) ? 0xFFFFu : (uint16_t)ns;
+                    if (s->score_tens > s->high_score_tens) s->high_score_tens = s->score_tens;
+                    s->bonus_tally_remaining = (uint16_t)(s->bonus_tally_remaining - step);
+                    if (check_1up_threshold(s)) {
+                        s->state_timer++;
+                        s->bonus_1up_delay = 1;
+                    }
+                }
+            }
         }
         if (expired) stage1_advance_stage(s);
     } else if (s->state == 9) {
-        /* State 9 ending: input-driven placeholder, timing NOT measured. */
-        if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
+        /* State 9 (Ending after Stage 32, 0x0839): timed 1445-frame celebration, then Stage 1 curtain. */
+        if (state_timer_step(s)) {
             s->stage = 0u;
             stage1_enter_state(s, 4u);
         }
@@ -820,21 +962,41 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
                 s->game_over = 0;
                 stage1_enter_state(s, 1u);
             } else {
+                s->scroll_step = 2u; /* 0x07FC: LD A, 0x02; LDH (0xFFC5), A */
                 stage1_begin_serve(s);
             }
         }
     } else if (s->state == 1) {
         if (state_timer_step(s)) stage1_enter_state(s, 2u);
     } else if (s->state == 2) {
-        /* Title wait: full title not implemented. Start/A begins a new run
-         * (timing of the original title->play sequence NOT measured). */
-        if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
-            stage1_reset_for_play(s);
-            s->stage = 0u;
-            stage1_enter_state(s, 4u);
+        /* Title wait (0x0582..0x0604): Start/A initializes new game (stage=0, score=0, lives=4,
+         * up_index=0, first_curtain=1) and waits 3 frames in State 2 before entering State 4. */
+        if (s->state_timer > 0u) {
+            if (state_timer_step(s)) {
+                stage1_enter_state(s, 4u);
+            }
+        } else if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
+            s->paddle_x = 0x28;
+            s->paddle_y = 0x90;
+            s->paddle_w = 0x18;
+            s->paddle_shrunk = 0;
+            s->paddle_hits = 0;
+            s->scroll_step = 0;
+            s->indestructible_hits = 0;
+            s->score_tens = 0;
+            s->lives = 4;
+            s->game_over = 0;
+            s->stage = 0;
+            s->up_index = 0;
+            s->serve_pending = 0;
+            s->first_curtain = 1u;
+            s->state_timer = DUR_TITLE_START_DELAY;
         }
     }
-    if (play_loop_tick || (entry_state != s->state && is_timed_state(entry_state) && !entry_transient_11)) {
+    const bool suppress_serve_frame1_prng = (entry_state == 5 && s->serve_pending != 0);
+    const bool suppress_life_lost_7_to_11_prng = (entry_state == 7 && s->state == 0x0B && s->game_over == 0);
+    if ((play_loop_tick && !suppress_serve_frame1_prng) ||
+        (entry_state != s->state && (is_timed_state(entry_state) || entry_state == 2) && !suppress_life_lost_7_to_11_prng)) {
         step_prng(s);
     }
 }
@@ -1300,6 +1462,10 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
          * compared separately by tools/scenario_diff.py (--run-scenario). */
         g_trace_backup = g_sim;
         stage1_step_tick_scheduler(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge, elapsed);
+        if (g_sim.serve_pending != 0) {
+            /* In logic_trace.jsonl (hooked at 0x051F..0x0525), the 2-VBlank serve is a single record */
+            stage1_step_tick_scheduler(&g_sim, 0xFFu, 0xFFu, 0u);
+        }
         if ((st == 5 || st == 6) && is_timed_state(g_sim.state)) {
             g_sim = g_trace_backup;
             stage1_step_tick_scheduler(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge, 1u);
@@ -1373,10 +1539,11 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
 /*
  * --run-scenario <rom> <scenario.jsonl>
  * Autonomous native run for ORIGINAL-vs-NATIVE differential tests.
- * Line 1: snapshot of the original taken at a logic-tick boundary (same keys as logic trace).
+ * Line 1: snapshot of the original taken at a VBlank boundary (same keys as logic trace).
  * Lines 2..N: ONLY inputs (in_joyp_raw / in_joyp_edge) latched by the original. No expected
  * values are read, so the native clock, timers and state machine run on their own.
- * Output: one JSON line per tick with state/stage/lives/score_tens/bonus_flag/bonus_timer/prng.
+ * Output: one JSON line per tick with state/stage/lives/score_tens/bonus_flag/bonus_timer/prng
+ * and ball/paddle/scroll fields.
  */
 static int run_scenario(const char *rom_path, const char *scenario_path) {
     if (!try_load_rom_file(&g_sim, rom_path)) {
@@ -1404,9 +1571,9 @@ static int run_scenario(const char *rom_path, const char *scenario_path) {
             if (extract_json_int(line, "prng", &v)) g_sim.prng = (uint8_t)v;
             if (extract_json_int(line, "paddle_x", &v)) g_sim.paddle_x = (uint8_t)v;
             if (extract_json_int(line, "paddle_w", &v)) g_sim.paddle_w = (uint8_t)v;
-            if (extract_json_int(line, "ball_x", &v)) g_sim.ball_x = (uint8_t)v;
+            if (extract_json_int(line, "ball_x", &v)) { g_sim.ball_x = (uint8_t)v; g_sim.ball_prev_x = (uint8_t)v; }
             if (extract_json_int(line, "ball_x_sub", &v)) g_sim.ball_x_sub = (uint8_t)v;
-            if (extract_json_int(line, "ball_y", &v)) g_sim.ball_y = (uint8_t)v;
+            if (extract_json_int(line, "ball_y", &v)) { g_sim.ball_y = (uint8_t)v; g_sim.ball_prev_y = (uint8_t)v; }
             if (extract_json_int(line, "ball_y_sub", &v)) g_sim.ball_y_sub = (uint8_t)v;
             if (extract_json_int(line, "ball_vx", &v)) g_sim.ball_vx = (uint16_t)v;
             if (extract_json_int(line, "ball_vy", &v)) g_sim.ball_vy = (uint16_t)v;
@@ -1419,6 +1586,15 @@ static int run_scenario(const char *rom_path, const char *scenario_path) {
             if (extract_json_int(line, "scroll_step", &v)) g_sim.scroll_step = (uint8_t)v;
             if (extract_json_int(line, "bonus_timer", &v)) g_sim.bonus_timer = (uint16_t)v;
             if (extract_json_int(line, "vblank_count", &v)) g_sim.vblank_count = (uint8_t)v;
+            for (int r = 0; r < 20; ++r) {
+                char key_p[32], key_s[32], key_t[32];
+                snprintf(key_p, sizeof(key_p), "row_pattern_%d", r);
+                snprintf(key_s, sizeof(key_s), "row_shift_%d", r);
+                snprintf(key_t, sizeof(key_t), "row_timer_%d", r);
+                if (extract_json_int(line, key_p, &v)) g_sim.row_pattern[r] = (uint8_t)v;
+                if (extract_json_int(line, key_s, &v)) g_sim.row_shift[r] = (uint8_t)v;
+                if (extract_json_int(line, key_t, &v)) g_sim.row_timer[r] = (uint8_t)v;
+            }
             /* A snapshot taken inside a timed state has no meaningful entry; scenarios snapshot in state 5/6 only. */
             if (st != 5 && st != 6) {
                 fprintf(stderr, "Error: scenario snapshot must be taken in state 5 or 6\n");
@@ -1431,10 +1607,17 @@ static int run_scenario(const char *rom_path, const char *scenario_path) {
         if (!extract_json_int(line, "in_joyp_raw", &in_raw)) continue;
         extract_json_int(line, "in_joyp_edge", &in_edge);
         stage1_step_tick(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge);
-        printf("{\"tick\":%d,\"state\":%u,\"stage\":%u,\"lives\":%u,\"score_tens\":%u,\"bonus_flag\":%u,\"bonus_timer\":%u,\"prng\":%u,\"bricks_left\":%u}\n",
+        printf("{\"tick\":%d,\"state\":%u,\"stage\":%u,\"lives\":%u,\"score_tens\":%u,\"bonus_flag\":%u,\"bonus_timer\":%u,\"prng\":%u,\"bricks_left\":%u,\"paddle_x\":%u,\"paddle_w\":%u,\"ball_x\":%u,\"ball_x_sub\":%u,\"ball_y\":%u,\"ball_y_sub\":%u,\"ball_vx\":%u,\"ball_vy\":%u,\"speed_idx\":%u,\"row_offset\":%u,\"scroll_timer\":%u,\"scroll_step\":%u,\"row_shift_0\":%u,\"row_shift_6\":%u}\n",
                tick, (unsigned)g_sim.state, (unsigned)g_sim.stage, (unsigned)g_sim.lives,
                (unsigned)g_sim.score_tens, (unsigned)g_sim.bonus_flag, (unsigned)g_sim.bonus_timer,
-               (unsigned)g_sim.prng, (unsigned)g_sim.bricks_left);
+               (unsigned)g_sim.prng, (unsigned)g_sim.bricks_left,
+               (unsigned)g_sim.paddle_x, (unsigned)g_sim.paddle_w,
+               (unsigned)g_sim.ball_x, (unsigned)g_sim.ball_x_sub,
+               (unsigned)g_sim.ball_y, (unsigned)g_sim.ball_y_sub,
+               (unsigned)g_sim.ball_vx, (unsigned)g_sim.ball_vy,
+               (unsigned)g_sim.speed_idx, (unsigned)g_sim.row_offset,
+               (unsigned)g_sim.scroll_timer, (unsigned)g_sim.scroll_step,
+               (unsigned)g_sim.row_shift[0], (unsigned)g_sim.row_shift[6]);
         tick++;
     }
     fclose(fp);
@@ -1511,10 +1694,12 @@ int main(int argc, char **argv) {
             pixels[143][159] != 0x346856) return 1;
         build_synthetic_stage1_rom(&g_sim);
         if (g_sim.bricks_left != 14 || g_sim.paddle_x != 40) return 1;
-        /* Move right 1 tick (+3 px), then serve with A, then step 1 tick */
+        /* Move right 1 tick (+3 px), then serve with A (2 VBlanks: setup + state 6 transition), then step 1 tick */
         stage1_step_tick(&g_sim, 0xEFu, 0xEFu);
         if (g_sim.paddle_x != 43) return 1;
         stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
+        if (g_sim.state != 5 || g_sim.serve_pending != 1 || g_sim.ball_y != 116) return 1;
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         if (g_sim.state != 6 || g_sim.ball_y != 116) return 1;
         stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         if (g_sim.ball_y_sub != 181 || g_sim.ball_x_sub != 75) return 1;
@@ -1539,15 +1724,17 @@ int main(int argc, char **argv) {
         }
         if (g_sim.vblank_count != 50 || g_sim.bonus_timer != 95 || g_sim.state != 5) return 2;
 
-        /* 2. Serve ball with A button edge */
+        /* 2. Serve ball with A button edge (2 VBlanks: setup + State 6 transition) */
         stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
-        if (g_sim.state != 6 || g_sim.vblank_count != 51) return 3;
+        if (g_sim.state != 5 || g_sim.serve_pending != 1 || g_sim.vblank_count != 51) return 3;
+        stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
+        if (g_sim.state != 6 || g_sim.vblank_count != 52) return 3;
 
         /* 3. Active play: 64 ticks = exactly 2 timer ticks (32 frames per unit) */
         for (int i = 0; i < 64; ++i) {
             stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         }
-        if (g_sim.vblank_count != 115 || g_sim.bonus_timer != 93 || g_sim.state != 6) return 4;
+        if (g_sim.vblank_count != 116 || g_sim.bonus_timer != 93 || g_sim.state != 6) return 4;
 
         /* 4. Pause toggled with Start edge */
         stage1_step_tick(&g_sim, 0xF7u, 0xF7u);
@@ -1557,7 +1744,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 64; ++i) {
             stage1_step_tick(&g_sim, 0xFFu, 0xFFu);
         }
-        if (g_sim.vblank_count != 180 || g_sim.bonus_timer != 93 || g_sim.state != 0x0C) return 6;
+        if (g_sim.vblank_count != 181 || g_sim.bonus_timer != 93 || g_sim.state != 0x0C) return 6;
 
         /* 6. Unpause with Start edge */
         stage1_step_tick(&g_sim, 0xF7u, 0xF7u);
@@ -1581,8 +1768,8 @@ int main(int argc, char **argv) {
         if (ticks_until_state_change(&g_sim, 7) != DUR_BONUS_END) return 10;
         if (g_sim.state != 4 || g_sim.stage != 4 || g_sim.lives != lives_before) return 10;
 
-        /* 9. Curtain lasts DUR_CURTAIN ticks, then serve state 5 */
-        if (ticks_until_state_change(&g_sim, 4) != DUR_CURTAIN) return 11;
+        /* 9. Curtain lasts DUR_CURTAIN_DEFAULT ticks, then serve state 5 */
+        if (ticks_until_state_change(&g_sim, 4) != DUR_CURTAIN_DEFAULT) return 11;
         if (g_sim.state != 5 || g_sim.lives != lives_before) return 11;
 
         puts("PASS: autonomous clock and bonus lifecycle verified");
@@ -1751,7 +1938,7 @@ int main(int argc, char **argv) {
         if (ticks_until_state_change(&g_sim, 7) != DUR_BONUS_END) return 40;
         if (g_sim.state != 4 || g_sim.lives != prev_lives || g_sim.stage != (uint8_t)(prev_stage + 1u)) return 40;
 
-        /* 6. Stage 32 clear: 144 ticks, wrap to stage 0, ending state 9, input -> curtain -> serve */
+        /* 6. Stage 32 clear: DUR_CLEAR ticks, wrap to stage 0, timed ending state 9 (1445 ticks) -> curtain -> serve */
         g_sim.stage = 31;
         g_sim.bonus_flag = 0;
         g_sim.bricks_left = 0;
@@ -1759,11 +1946,10 @@ int main(int argc, char **argv) {
         if (ticks_until_state_change(&g_sim, 8) != DUR_CLEAR) return 41;
         if (g_sim.stage != 0) return 41;
         if (g_sim.state != 9) return 42;
-        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
-        if (g_sim.state != 4) return 43;
-        if (ticks_until_state_change(&g_sim, 4) != DUR_CURTAIN || g_sim.state != 5) return 43;
+        if (ticks_until_state_change(&g_sim, 9) != DUR_ENDING || g_sim.state != 4) return 43;
+        if (ticks_until_state_change(&g_sim, 4) != DUR_CURTAIN_DEFAULT || g_sim.state != 5) return 43;
 
-        /* 7a. Normal life loss with spare lives: 100 ticks, lives--, 1-tick state 11, serve */
+        /* 7a. Normal life loss with spare lives: DUR_DEATH ticks, lives--, 1-tick state 11, serve */
         g_sim.bonus_flag = 0;
         g_sim.lives = 2;
         stage1_enter_state(&g_sim, 7u);
@@ -1772,18 +1958,19 @@ int main(int argc, char **argv) {
         if (ticks_until_state_change(&g_sim, 0x0B) != DUR_LIFE_LOST_TRANSIENT || g_sim.state != 5) return 44;
 
         /* 7b. Last life (lives == 0): Game Over 377 ticks -> state 1 (1 tick) -> title wait (2),
-         * Start/A -> new run (lives 4, stage 0) through the curtain */
+         * Start/A -> 3-tick start delay in state 2 -> 221-tick first curtain (66+155) -> serve (lives 4, stage 0) */
         g_sim.lives = 0;
         stage1_enter_state(&g_sim, 7u);
         if (ticks_until_state_change(&g_sim, 7) != DUR_DEATH) return 45;
         if (g_sim.state != 0x0B || g_sim.game_over != 1) return 45;
         if (ticks_until_state_change(&g_sim, 0x0B) != DUR_GAME_OVER || g_sim.state != 1) return 45;
         if (ticks_until_state_change(&g_sim, 1) != DUR_TITLE_ENTRY || g_sim.state != 2) return 45;
-        stage1_step_tick(&g_sim, 0xFEu, 0xFEu);
-        if (g_sim.state != 4 || g_sim.lives != 4 || g_sim.stage != 0) return 45;
-        if (ticks_until_state_change(&g_sim, 4) != DUR_CURTAIN || g_sim.state != 5) return 45;
+        stage1_step_tick(&g_sim, 0xF7u, 0xF7u); /* Start pressed on title */
+        if (g_sim.state != 2 || g_sim.lives != 4 || g_sim.stage != 0) return 45;
+        if (ticks_until_state_change(&g_sim, 2) != DUR_TITLE_START_DELAY || g_sim.state != 4) return 45;
+        if (ticks_until_state_change(&g_sim, 4) != (DUR_CURTAIN_DEFAULT + DUR_MARIO_ENTRY_EXTRA) || g_sim.state != 5) return 45;
 
-        /* 8a. Bonus ball drop: 228 ticks, lives kept, stage++ (no state 8) */
+        /* 8a. Bonus ball drop: DUR_BONUS_END ticks, lives kept, stage++ (no state 8) */
         g_sim.stage = 3;
         g_sim.bonus_flag = 1;
         g_sim.bricks_left = 15;
@@ -1792,7 +1979,7 @@ int main(int argc, char **argv) {
         if (ticks_until_state_change(&g_sim, 7) != DUR_BONUS_END) return 46;
         if (g_sim.state != 4 || g_sim.lives != 4 || g_sim.stage != 4) return 47;
 
-        /* 8b. Perfect bonus clear: 498 ticks, +500 tens added exactly once (10 tens x 50 ticks) */
+        /* 8b. Perfect bonus clear: Round 0 (499 ticks, +500 tens) and Round 1 (519 ticks, +700 tens) */
         g_sim.stage = 3;
         g_sim.bonus_flag = 1;
         g_sim.bricks_left = 0;
@@ -1801,6 +1988,14 @@ int main(int argc, char **argv) {
         if (ticks_until_state_change(&g_sim, 8) != DUR_BONUS_TALLY) return 48;
         if (g_sim.score_tens != 600) return 48;
         if (g_sim.stage != 4 || g_sim.state != 4) return 49;
+
+        g_sim.stage = 7; /* Round 1 bonus (reward = 700 tens -> 70 tally frames) */
+        g_sim.bonus_flag = 1;
+        g_sim.bricks_left = 0;
+        g_sim.score_tens = 100;
+        stage1_enter_state(&g_sim, 8u);
+        if (ticks_until_state_change(&g_sim, 8) != (DUR_BONUS_PRE_TALLY + 70u)) return 50;
+        if (g_sim.score_tens != 800 || g_sim.stage != 8 || g_sim.state != 4) return 50;
 
         puts("PASS: multi-stage rules verified (scroll wrap, bonus penetration, 1-UP threshold, vertical drop, bonus countdown, ending sequence, game over reset, bonus reward)");
         return 0;

@@ -45,9 +45,26 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
 - Backend Win32 `waveOut` implementado en `src/main.c`: 4 buffers rotativos a 44.1 kHz (~735 muestras por fotograma a 60 Hz). Despacha las tablas reales de la ROM (`0x701A`, `0x6FDE`, etc.) ante los eventos `sfx_trigger` (saque/paleta, techo, pared, bloques). Limpieza segura con `waveOutReset`/`waveOutUnprepareHeader`/`waveOutClose` en `WM_DESTROY`.
 - Modo determinista y headless: si `waveOutOpen` falla o se ejecuta sin dispositivo de audio, avanza el estado APU de forma identica sin fallar ni bloquearse.
 
+## Hito 5 (2026-10-17): Bloques moviles de Fase 2, fases de 40 filas, bonus y progresion de 32 fases
+### 1. Desplazamiento horizontal por fila (`0x0B21..0x0B66`)
+- Decodificacion de descriptores en `0x1BE1`: el byte 0 contiene flags de bonificacion (`0x80`), desplazamiento (`0x40`) y patron de velocidad (`0x3F`).
+- Punteros en tabla `0x4075` cargan los 8 patrones oficiales de 20 bytes en los buffers de fila (`row_pattern` y `row_timer`).
+- Cada fotograma en juego activo (`state == 6`), `step_horizontal_scroll` decrementa los temporizadores de fila y avanza el desplazamiento circular `row_shift[r]` (0..111 px).
+- La funcion de colision `check_brick_point` ajusta las sondas restando/sumando el desplazamiento modular de 112 px (14 columnas), y el renderizador `render_stage1` dibuja las celdas desplazadas con recorte exacto en los bordes izquierdo y derecho (`X=8..119`).
+
+### 2. Mecanica de bonificacion (`0xFFAA = 1`) y penetracion de bola
+- Descriptores con bit 7 en alto (fases 4, 8, 12, 16, 20, 24, 28, 32) configuran `bonus_flag = 1`.
+- Al colisionar con un bloque en fase de bonus, la bola destruye el bloque sin rebotar (`0x0E76`), permitiendo atravesar formaciones enteras en un unico pase.
+
+### 3. Progresion continua de fases (0..31) y vidas extra (1-UP)
+- Al completar la destruccion de bloques destructibles (`bricks_left == 0`), el estado pasa a 8 (Clear).
+- Al pulsar A o Start, el juego avanza ciclicamente a la siguiente fase (`(stage + 1) & 0x1F`), resetea la paleta y carga el nuevo mapa desde la ROM local.
+- Se implemento la verificacion de vidas extra (1-UP) contra la tabla en `0x1B5D` (umbrales de 10k a 90k puntos).
+
 ## Siguiente paso recomendado para Codex / futuras sesiones
-1. Implementar el desplazamiento horizontal de filas (`0x0B21..0x0B66`, patrones de la tabla `0x4075`) y el descenso vertical del mural (`0x0BC7..0x0C31`) para soportar las Fases 2 y 3.
-2. Implementar la regla de bonificacion (`0xFFAA == 1`, penetracion de bola en `0x0E76`) y la progresion automatica de fases (`0xCA45 = 0..31`).
-3. Avanzar en la sintesis de los canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido).
+1. Implementar el descenso vertical del mural (`0x0BC7..0x0C31`) cuando expira el temporizador de descenso en fases de 40 filas.
+2. Implementar la cuenta regresiva del temporizador de bonificacion en HUD (`0x198C..0x1A50`).
+3. Extender la sintesis APU a los Canales 2, 3 y 4.
+
 
 

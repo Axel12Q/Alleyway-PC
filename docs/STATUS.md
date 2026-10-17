@@ -39,9 +39,21 @@
   - *Sintesis PCM*: calculada en tiempo real por `src/gb_apu.h` en base a registros DMG reales y tablas de efectos extraidas de la ROM.
   - *Salida a dispositivo*: Win32 waveOut con reciclaje de buffers (`WHDR_PREPARED`/`WHDR_DONE`) y cierre seguro en `WM_DESTROY`.
 
+### Hito 5: Bloques moviles de Fase 2, fases de 40 filas, bonus y progresion de 32 fases
+- **Desplazamiento horizontal de filas (`0x0B21..0x0B66`)**:
+  - Implementado el motor de desplazamiento horizontal por fila: lectura del indice de patron desde el byte 0 del descriptor de fase (`desc0 & 0x3F`), punteros en tabla `0x4075` (8 patrones de 20 bytes), direccion (bit 7) y recarga de temporizador (`0xCA28`).
+  - Proyeccion ciclica en el espacio de juego (112 px = 14 columnas de 8 px) tanto en la sonda de colision `check_brick_point` como en el renderizado con recorte en los bordes laterales (`X=8..119`).
+- **Fases de bonificacion (`0xFFAA = 1`) y penetracion de bola**:
+  - Bit 7 de descriptor de fase (`0x1BE1[0] & 0x80`) activa `bonus_flag`.
+  - La bola destruye bloques sin rebotar (`check_brick_point` retorna 0 al penetrar y no invierte `ball_vx`/`ball_vy` en `step_ball_and_collisions` segun `0x0E76`).
+- **Progresion de fases (0..31) y umbral de vidas extra (1-UP)**:
+  - Al destruir todos los bloques (`bricks_left == 0`), el juego entra en estado 8 (Clear) y avanza ciclicamente a la siguiente fase (`(stage + 1) & 0x1F`) cargando su respectivo descriptor y matriz desde la ROM local.
+  - Verificacion de 1-UP implementada contra la tabla de umbrales en `0x1B5D` (`10,000` a `90,000` puntos) incrementando vidas hasta 99.
+
 ## Lo que falta para el juego completo (siguiente paso para continuar)
-1. **Desplazamiento vertical y horizontal de bloques (`0x0B21..0x0C31`)**: necesario para las fases con bloques moviles (`0xFFAB = 1`, patrones en tabla `0x4075`) y fases de mas de 20 filas (`0xFFA9 > 0`, como la Fase 3).
-2. **Fases de bonificacion (`0xFFAA = 1`, `0x198C..0x1A50`)**: donde la bola atraviesa bloques sin rebotar (`0x0E76`).
-3. **Progresion completa de las 32 fases (`0xCA45 = 0..31`), umbral de vidas extra (`1-UP` en `0x0C71..0x0CA5`, tabla `0x1B5D`) y avance a canales adicionales APU (Ch2, Ch3, Ch4)**.
+1. **Descenso vertical del mural (`0x0BC7..0x0C31`)**: desplazamiento paso a paso de filas de celdas hacia abajo en fases de 40 filas cuando expira el temporizador de descenso.
+2. **Temporizador descendente de fases de bonificacion (`0x198C..0x1A50`)**: cuenta atras de segundos en HUD durante las fases de bonus y finalizacion por tiempo.
+3. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)**.
+
 
 

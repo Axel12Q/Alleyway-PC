@@ -58,6 +58,10 @@ typedef struct {
     uint8_t row_offset;
     uint8_t prev_joyp_raw;
     uint8_t sfx_trigger; /* Queued SFX ID (0 = none, 7 = paddle bounce, 12 = wall bounce, etc.) */
+    uint8_t up_index;    /* Index in 0x1B5D 1-UP score table */
+    uint8_t row_shift[20];   /* Pixel shift for each of the 20 visible rows (0xCA00..0xCA13) */
+    uint8_t row_pattern[20]; /* Row speed & direction pattern (0xCA14..0xCA27) */
+    uint8_t row_timer[20];   /* Row timer / step period (0xCA28..0xCA3B) */
     uint8_t grid_type[GRID_CELLS];
     uint8_t grid_hp[GRID_CELLS];
 } AlleywayStage1;
@@ -183,8 +187,33 @@ static uint16_t neg16(uint16_t val) {
 static void load_stage_grid(AlleywayStage1 *s) {
     memset(s->grid_type, 0, sizeof(s->grid_type));
     memset(s->grid_hp, 0, sizeof(s->grid_hp));
+    memset(s->row_shift, 0, sizeof(s->row_shift));
+    memset(s->row_pattern, 0, sizeof(s->row_pattern));
+    memset(s->row_timer, 0, sizeof(s->row_timer));
+
     uint16_t desc_addr = (uint16_t)(0x1BE1u + (uint16_t)s->stage * 3u);
     if (desc_addr + 2u >= ROM_SIZE_BYTES) return;
+
+    uint8_t desc0 = s->rom[desc_addr];
+    s->bonus_flag = (desc0 & 0x80u) ? 1u : 0u;
+    s->scroll_flag = (desc0 & 0x40u) ? 1u : 0u;
+
+    /* Initialize horizontal scroll pattern buffer if scrolling is enabled */
+    if (s->scroll_flag != 0) {
+        uint8_t pattern_idx = (uint8_t)(desc0 & 0x3Fu);
+        uint16_t ptr_table = (uint16_t)(0x4075u + (uint16_t)pattern_idx * 2u);
+        if (ptr_table + 1u < ROM_SIZE_BYTES) {
+            uint16_t pattern_addr = (uint16_t)s->rom[ptr_table] | ((uint16_t)s->rom[ptr_table + 1u] << 8);
+            if (pattern_addr + 20u <= ROM_SIZE_BYTES) {
+                for (int r = 0; r < 20; ++r) {
+                    uint8_t p = s->rom[pattern_addr + (uint16_t)r];
+                    s->row_pattern[r] = p;
+                    s->row_timer[r] = (uint8_t)(p & 0x7Fu);
+                }
+            }
+        }
+    }
+
     uint16_t map_ptr = (uint16_t)s->rom[desc_addr + 1u] | ((uint16_t)s->rom[desc_addr + 2u] << 8);
     int idx = 0;
     int rows = 0;
@@ -239,6 +268,7 @@ static void stage1_reset_for_play(AlleywayStage1 *s) {
     s->scroll_flag = 0;
     s->prev_joyp_raw = 0xFF;
     s->sfx_trigger = 0;
+    s->up_index = 0;
     load_stage_grid(s);
 }
 
@@ -383,7 +413,13 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
     uint8_t row = (uint8_t)((a2_full & 0xFFu) >> 2);
     if (row >= GRID_ROWS) return 0;
 
-    uint8_t x_rel = (uint8_t)(x_probe - 0x10u);
+    /* Authentic horizontal shift from row_shift[row - row_offset] */
+    uint8_t shift = 0;
+    if (row >= s->row_offset && (row - s->row_offset) < 20) {
+        shift = s->row_shift[row - s->row_offset];
+    }
+
+    uint8_t x_rel = (uint8_t)((uint8_t)(x_probe - 0x10u) + shift);
     if (x_rel >= 0x70u) x_rel = (uint8_t)(x_rel - 0x70u);
     uint8_t col = (uint8_t)(x_rel >> 3);
     if (col >= GRID_COLS) return 0;
@@ -421,6 +457,17 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
     if (s->score_tens > s->high_score_tens) {
         s->high_score_tens = s->score_tens;
     }
+
+    /* 1-UP check against table at 0x1B5D (0x0C71..0x0CA5) */
+    if (0x1B5Du + (uint16_t)s->up_index * 2u + 1u < ROM_SIZE_BYTES) {
+        uint16_t thresh = ((uint16_t)s->rom[0x1B5Du + (uint16_t)s->up_index * 2u] << 8) |
+                          (uint16_t)s->rom[0x1B5Du + (uint16_t)s->up_index * 2u + 1u];
+        if (thresh != 0xFFFFu && s->score_tens >= thresh) {
+            s->up_index++;
+            if (s->lives < 99) s->lives++;
+        }
+    }
+
     if (s->bricks_left > 0) {
         s->bricks_left--;
     }
@@ -549,6 +596,32 @@ static void step_ball_and_collisions(AlleywayStage1 *s) {
     }
 }
 
+static void step_horizontal_scroll(AlleywayStage1 *s) {
+    if (s->scroll_flag == 0) return;
+    for (int r = 0; r < 20; ++r) {
+        if (s->row_timer[r] == 0) continue;
+        s->row_timer[r]--;
+        if (s->row_timer[r] == 0) {
+            uint8_t pat = s->row_pattern[r];
+            if (pat != 0) {
+                if ((pat & 0x80u) == 0) {
+                    /* Scroll right (INC shift mod 0x70) */
+                    uint8_t sh = (uint8_t)(s->row_shift[r] + 1u);
+                    if (sh >= 0x70u) sh = 0;
+                    s->row_shift[r] = sh;
+                } else {
+                    /* Scroll left (DEC shift mod 0x70) */
+                    uint8_t sh = s->row_shift[r];
+                    if (sh == 0) sh = 0x6Fu;
+                    else sh--;
+                    s->row_shift[r] = sh;
+                }
+            }
+            s->row_timer[r] = (uint8_t)(pat & 0x7Fu);
+        }
+    }
+}
+
 static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
     s->sfx_trigger = 0;
     if (s->state == 5) {
@@ -557,6 +630,7 @@ static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_e
             serve_ball(s);
         }
     } else if (s->state == 6) {
+        step_horizontal_scroll(s);
         step_ball_and_collisions(s);
         update_paddle(s, joyp_raw);
         if ((joyp_edge & 0x08u) == 0) {
@@ -580,8 +654,13 @@ static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_e
             s->state = 5;
         }
     } else if (s->state == 8) {
+        /* Stage Clear: advance to next stage (0..31) on A or Start */
         if ((joyp_edge & 0x08u) == 0 || (joyp_edge & 0x01u) == 0) {
-            stage1_reset_for_play(s);
+            s->stage = (uint8_t)((s->stage + 1u) & 0x1Fu);
+            s->state = 5;
+            s->paddle_shrunk = 0;
+            s->paddle_w = 0x18;
+            load_stage_grid(s);
         }
     }
     step_prng(s);
@@ -657,22 +736,24 @@ static void render_stage1(const AlleywayStage1 *s) {
     if (has_rom_tiles) {
         /* Render paired 8x8 tile rows (r = 0, 2, 4, ..., 18) */
         for (int r = 0; r < 20; r += 2) {
+            int shift = (int)s->row_shift[r];
             for (int c = 0; c < GRID_COLS; ++c) {
-                uint8_t top_t = s->grid_type[r * GRID_COLS + c];
-                uint8_t bot_t = s->grid_type[(r + 1) * GRID_COLS + c];
+                uint8_t top_t = s->grid_type[(r + s->row_offset) * GRID_COLS + c];
+                uint8_t bot_t = s->grid_type[(r + 1 + s->row_offset) * GRID_COLS + c];
                 if (top_t == 0 && bot_t == 0) continue;
 
-                int sx = 8 + c * 8;
+                /* Calculate screen X with horizontal shift wrapped across the 112 px (14 cols) width */
+                int col_pixel = (c * 8 - shift) % 112;
+                if (col_pixel < 0) col_pixel += 112;
+                int sx = 8 + col_pixel;
                 int sy = 8 + r * 4;
 
+                uint8_t tile_id = 0;
                 if (top_t == 4 || bot_t == 4) {
-                    /* Type 4 is top boundary wall (tile 179 at 0x56A5) */
-                    gb_tile_blit(&s->rom[0x56A5], sx, sy, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
+                    tile_id = 179;
                 } else {
-                    uint8_t tile_id = 0;
                     uint8_t ref_t = (top_t != 0) ? top_t : bot_t;
                     uint8_t base_offset = (ref_t >= 1 && ref_t <= 3) ? (uint8_t)(ref_t - 1) : 0u;
-
                     if (top_t != 0 && bot_t != 0) {
                         tile_id = (uint8_t)(168 + base_offset);
                     } else if (top_t != 0) {
@@ -680,18 +761,21 @@ static void render_stage1(const AlleywayStage1 *s) {
                     } else {
                         tile_id = (uint8_t)(174 + base_offset);
                     }
-                    uint32_t rom_addr = 0x55F5u + (uint32_t)(tile_id - 168) * 16u;
-                    gb_tile_blit(&s->rom[rom_addr], sx, sy, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
                 }
+                uint32_t rom_addr = (tile_id == 179) ? 0x56A5u : (0x55F5u + (uint32_t)(tile_id - 168) * 16u);
+                gb_tile_blit(&s->rom[rom_addr], sx, sy, false, false, false, 0xE4, DMG_SHADES, (uint32_t *)pixels, 160, 144);
             }
         }
     } else {
         /* Fallback synthetic / block renderer */
         for (int r = 0; r < 20; ++r) {
+            int shift = (int)s->row_shift[r];
             for (int c = 0; c < GRID_COLS; ++c) {
-                uint8_t t = s->grid_type[r * GRID_COLS + c];
+                uint8_t t = s->grid_type[(r + s->row_offset) * GRID_COLS + c];
                 if (t == 0) continue;
-                int sx = 8 + c * 8;
+                int col_pixel = (c * 8 - shift) % 112;
+                if (col_pixel < 0) col_pixel += 112;
+                int sx = 8 + col_pixel;
                 int sy = 8 + r * 4;
                 if (t == 4) {
                     fill_rect_fb(sx, sy, 8, 4, DMG_SHADES[2]);
@@ -703,6 +787,11 @@ static void render_stage1(const AlleywayStage1 *s) {
             }
         }
     }
+
+    /* Redraw left and right borders over any wrapped tiles extending into borders */
+    fill_rect_fb(0, 0, 8, 144, DMG_SHADES[2]);
+    fill_rect_fb(120, 0, 8, 144, DMG_SHADES[2]);
+    fill_rect_fb(128, 0, 32, 144, DMG_SHADES[3]);
 
     /* Render Paddle: OAM[0].X = paddle_x + 1 -> screen X = (paddle_x + 1) - 8 = paddle_x - 7
      * OAM.Y = 144 -> screen Y = 144 - 16 = 128.

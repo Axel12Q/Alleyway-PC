@@ -1,37 +1,35 @@
-# Codex + Antigravity
+# Codex + Antigravity: current working agreement
 
-## Reglas
+Canonical local workspace on this PC:
+- C:/Users/maric/Documents/Alleyway-PC-Trabajo/Codex -- main, parked integration checkout.
+- C:/Users/maric/Documents/Alleyway-PC-Trabajo/Antigravity -- antigravity/development, active worktree.
+- C:/Users/maric/Documents/Alleyway-PC-Trabajo/Local-Privado -- user's ROM and private evidence; outside repository.
 
-- main: base integrada. No ejecutar dos agentes en la misma carpeta.
-- Codex: src/ y tools/build.py, rama codex/runtime.
-- Antigravity: investigacion en docs/research/ y herramientas de referencia,
-  rama antigravity/research. Acuerdos de formatos antes de cambios cruzados.
-- Un responsable integra cada cambio, ejecuta validaciones y actualiza STATUS.
-- Las conversaciones no se sincronizan: registrar decisiones aqui.
-- Una rama no aisla archivos: usar worktrees o clones distintos.
+Remote: https://github.com/Axel12Q/Alleyway-PC.git
 
-## Crear carpeta independiente para Antigravity
+Antigravity owns implementation temporarily, including src/, tools/, tests/ and docs/.
+Codex must read STATUS and fetch the development branch before resuming work.
+When Codex returns, give it a separate branch/worktree for any concurrent task.
+Coordinate ownership before touching overlapping files. A branch alone does not
+isolate files. Do not open two agents on the same checkout.
 
-Desde este repositorio, una vez exista el commit inicial:
+Antigravity: commit each coherent tested milestone and push:
+`git push origin antigravity/development`
+Do not force-push. No automatic merge to main. Record exact tests, failures,
+ROM dependencies and next step in docs/STATUS.md and MODLOG.md.
+The user authorized project code uploads to this repository. Never upload ROMs,
+extracted assets, logs with secrets, tools, environments or private captures.
+No background polling service or scheduled automation is required: push after
+milestones during the running agent task.
 
-```powershell
-git worktree add ../alleyway-antigravity -b antigravity/research main
-```
+## Integration later
 
-Crear un entorno Python propio dentro de esa carpeta. `.venv`, `.tools` y
-`local` no se copian al crear worktrees. La carpeta adicional puede leer el
-volcado por ruta absoluta; no hace falta duplicarlo.
+From Codex's clean main checkout: fetch origin; review origin/antigravity/development,
+run checks, then integrate the reviewed changes. Preserve history and resolve
+conflicts deliberately. Do not reset another worktree.
 
-## Primer mensaje sugerido para Antigravity
+## Environments
 
-Lee AGENTS.md, README.md y docs/STATUS.md. Tu rama es antigravity/research y
-tu area es docs/research/ y herramientas de referencia. Primero comprueba las
-herramientas existentes y documenta un procedimiento reproducible para medir
-entrada, posicion de paleta y pelota por fotograma. Sin ROM disponible, prepara
-el procedimiento y separa hipotesis de hechos. No inventes direcciones de RAM,
-no descargues juegos y no modifiques src/. Coordina cualquier cambio de formato.
-
-## Remoto
-
-El usuario esta creando el repositorio. Todavia no hay origin ni publicaciones.
-Cuando entregue la URL, verificar el remoto y acordar el primer push.
+Each worktree has its own .venv/, .tools/, build/ and local/ (all ignored).
+The prepared Antigravity checkout already has dependencies and SameBoy.
+On another machine run tools/setup.ps1 with Python 3.12 and uv available.

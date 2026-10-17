@@ -20,3 +20,10 @@ globales. Git inicializado en main, sin remoto.
 
 Primera meta: una fase, con trazas de referencia reproducibles y comparacion
 de posiciones, rebotes, bloques, puntuacion y vidas.
+
+## Active handoff
+2026-10-17: canonical workspace moved by COPY to Documents/Alleyway-PC-Trabajo.
+Antigravity takes ownership on antigravity/development. Codex main checkout parked.
+Remote configured: https://github.com/Axel12Q/Alleyway-PC.git.
+Original Codex output retained as backup; use canonical workspace for future work.
+No genuine Alleyway dump provided yet. Independent infrastructure work may proceed.

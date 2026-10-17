@@ -48,3 +48,8 @@ https://github.com/Baekalfen/PyBoy, https://gbdev.io/pandocs/,
 https://www.nintendo.com/es-es/Juegos/Game-Boy/Alleyway-275451.html.
 El nombre Alleyway pertenece a sus titulares. Proyecto experimental no oficial;
 sin ROMs ni recursos comerciales incluidos. Asistencia de IA documentada.
+
+## Trabajo activo
+El proyecto compartido esta en Documents/Alleyway-PC-Trabajo. Antigravity trabaja
+en su propia carpeta y rama antigravity/development. Ver docs/COLLABORATION.md
+y docs/HANDOFF_ANTIGRAVITY.md antes de iniciar otro agente.

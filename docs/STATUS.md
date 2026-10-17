@@ -73,9 +73,28 @@
     6. Progresion y transicion ciclica de fases (31 -> 0) al pulsar A / Start en estado Clear.
 - **Ejecucion de pruebas**: 21 pruebas aprobadas en ~1.0s.
 
+### Hito 7: Pruebas de integracion del audio de produccion y primer informe de paridad real de Fase 2
+- **Desacoplamiento y pruebas de integracion de audio (`src/gb_audio_backend.h`)**:
+  - Extraido el despachador de sonido (`gb_audio_dispatch_sfx`) y la logica de gestion de cola (`gb_audio_step_frame`) a `src/gb_audio_backend.h`, consumido de forma identica por `src/main.c` y por el arnes de pruebas `tests/test_c_modules.c`.
+  - Definida la interfaz inyectable `GbAudioDeviceOps` para desacoplar las llamadas Win32 del bucle de simulacion y permitir pruebas con controladores simulados.
+  - La prueba `test_apu_dispatcher_production_nr10_zero` ejecuta directamente `gb_audio_dispatch_sfx` sobre un fixture de ROM con valores inventados/sinteticos (`NR10 = 0`), verificando registros y generacion de PCM disimil.
+  - La prueba `test_production_audio_backend_integration` inyecta un mock con seguimiento de llamadas y simula inicio, envio exitoso, cola ocupada (`buffer_done_status = false`), error de escritura en dispositivo, cierre seguro y apertura fallida. Se verifico que el estado APU avanza exactamente una vez independientemente de si el audio se envio o se omitio por cola ocupada.
+  - Se comprobo mediante mutaciones temporales provocadas que reintroducir el error `NR10 != 0` o suprimir la proteccion contra sobreescritura de buffers ocupados hace fallar el test de integracion de inmediato.
+- **Primer informe de paridad real de Fase 2 frente al cartucho (`tests/test_stage1_native.py`)**:
+  - Ampliado `tools/alleyway_watchpoints.json` con los 20 registros de desplazamiento (`0xCA00..0xCA13`) y los 20 temporizadores de fila (`0xCA28..0xCA3B`).
+  - Ampliado el verificador de trazas nativo en `src/main.c` (`--verify-trace`) para comparar tick a tick `stage`, `scroll_flag`, `bonus_flag`, los 20 `row_shift` y los 20 `row_timer`.
+  - Se descubrio que la rutina DMG en `0x0773` (Estado 5: saque) invoca `CALL 0x0B21` (desplazamiento de filas), de modo que los bloques se desplazan horizontalmente incluso antes de lanzar la bola; `src/main.c` se alineo con este comportamiento real.
+  - **Resultado de paridad Fase 2 (Alleyway USA.gb en PyBoy)**:
+    - Escenario: transicion desde Stage 1 Clear (`state = 8`) a Stage 2 (`stage = 1`, `state = 5`), saque con boton A y movimiento de paleta.
+    - **Ticks comparados**: **739 ticks consecutivos** de simulacion de logica sin una sola discrepancia (`mismatches = 0`).
+    - **Campos verificados bit a bit en cada tick**: `state`, `prng`, `paddle_x`, `paddle_w`, `ball_x`, `ball_x_sub`, `ball_y`, `ball_y_sub`, `ball_vx`, `ball_vy`, `speed_idx`, `bricks_left`, `score_tens`, `lives`, `stage`, `scroll_flag`, `bonus_flag`, 20 `row_shift` y 20 `row_timer`.
+    - **Eventos observados y validados**: desplazamiento continuo hacia la derecha (`row_pattern = 0x04`), avance de `row_shift` a traves de los 112 valores posibles (0 a 111 con wraparound modular a 0), y colision real con bloque en fila desplazada (`bricks_left: 84 -> 82`, `score_tens: 0 -> 2` [20 puntos], `speed_idx: 0 -> 3`).
+    - Verificacion multi-direccional inyectada: ejecucion de 939 ticks con filas alternadas izquierda (`0x83`) y derecha (`0x02`), alcanzando el rango completo de 0 a 111 en ambas direcciones sin divergencias (`mismatches = 0`).
+- **Ejecucion de pruebas**: **22 pruebas aprobadas** en ~1.2s.
+
 ## Lo que falta para el juego completo (siguiente paso para continuar)
-1. **Verificacion de trazas multi-fase grabadas contra PyBoy**: capturar secuencias de Fase 2 (bloques en movimiento) y Fase 3 (descenso de bloques) para comparar `row_shift` y `row_offset` contra las direcciones de RAM `0xCA00..0xCA13` y `0xFFA9`.
-2. **Temporizador descendente en pantalla durante el bonus**: visualizacion de digitos en el HUD y puntuacion de bonificacion remanente.
+1. **Paridad real de Fase 3 (descenso vertical `0x0BC7..0x0C31`)**: capturar y contrastar contra PyBoy la cadencia real de decremento de `row_offset` y su impacto en las colisiones.
+2. **Paridad real de Fases de bonificacion (`0xFFAA = 1`)**: verificar la cuenta atras del HUD (`0x198C..0x1A50`) y la penetracion continua en formaciones densas contra traza real.
 3. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)**.
 
 

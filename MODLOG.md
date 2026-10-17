@@ -87,9 +87,28 @@ Estado: primera meta alcanzada — Fase 1 nativa en C implementada, jugable en W
   - Wraparound ciclico de fases de 31 a 0 en pantalla de Stage Clear.
 - Todas las pruebas de regresion (21 pruebas en total) pasan en ~1.0s.
 
+## Hito 7 (2026-10-17): Pruebas de integracion de audio de produccion y primer informe de paridad real de Fase 2
+### 1. Pruebas de integracion del audio de produccion (`src/gb_audio_backend.h`)
+- Desacoplado el despachador de sonido (`gb_audio_dispatch_sfx`) y el avance de cola (`gb_audio_step_frame`) a una cabecera compartida sin dependencias directas de Win32.
+- Introducida la interfaz de operaciones de dispositivo `GbAudioDeviceOps` para permitir el puente transparente tanto hacia Win32 `waveOut` (en `src/main.c`) como hacia controladores mock de prueba (en `tests/test_c_modules.c`).
+- Las pruebas en C (`test_apu_dispatcher_production_nr10_zero` y `test_production_audio_backend_integration`) invocan directamente el codigo productivo usando fixtures de tablas de onda con datos inventados (sin copiar tablas comerciales):
+  - Verifica despacho con `NR10 = 0`, asignacion exacta de registros y sintesis de formas de onda diferenciadas.
+  - Simula cola ocupada (`buffer_done_status = false`): verifica que no se sobreescribe el buffer, no se avanza el indice y el estado de la APU avanza exactamente una vez.
+  - Verifica reanudacion de envio al liberar buffer, fallo de apertura de dispositivo, fallo de escritura y reseteo ordenado en el cierre.
+  - Comprobado mediante mutaciones forzadas que reintroducir `NR10 != 0` o eludir la proteccion de cola ocupada produce un fallo inmediato de la prueba C.
+
+### 2. Primer informe de paridad real de Fase 2 frente al cartucho original
+- Ampliado el arnes de captura (`tools/alleyway_watchpoints.json`) y el verificador de trazas nativo (`src/main.c`) con los 20 registros de desplazamiento (`0xCA00..0xCA13`) y los 20 temporizadores de fila (`0xCA28..0xCA3B`).
+- Descubrimiento de desensamblado: la rutina en `0x0773` (Estado 5: saque) llama a `0x0B21` (desplazamiento de filas), por lo que las filas se desplazan antes de lanzar la bola.
+- Verificacion bit a bit de la Fase 2 real ejecutada en PyBoy contra `build/alleyway-lab.exe --verify-trace`:
+  - **Ticks comparados**: **739 ticks consecutivos** (`mismatches = 0`).
+  - **Campos validados**: `state`, `prng`, `paddle_x`, `paddle_w`, `ball_x`, `ball_x_sub`, `ball_y`, `ball_y_sub`, `ball_vx`, `ball_vy`, `speed_idx`, `bricks_left`, `score_tens`, `lives`, `stage`, `scroll_flag`, `bonus_flag`, 20 `row_shift` y 20 `row_timer`.
+  - **Eventos observados y validados**: desplazamiento continuo hacia la derecha (`row_pattern = 0x04`), avance de `row_shift` a traves de los 112 valores posibles (0 a 111 con wraparound modular a 0), y colision real con bloque en fila desplazada (`bricks_left: 84 -> 82`, `score_tens: 0 -> 2` [20 puntos], `speed_idx: 0 -> 3`).
+  - Verificacion multi-direccional inyectada: ejecucion de 939 ticks con filas alternadas izquierda (`0x83`) y derecha (`0x02`), alcanzando el rango completo de 0 a 111 en ambas direcciones sin divergencias (`mismatches = 0`).
+
 ## Siguiente paso recomendado para Codex / futuras sesiones
-1. Verificacion de trazas multi-fase grabadas contra PyBoy: capturar secuencias de Fase 2 (bloques en movimiento) y Fase 3 (descenso de bloques) para comparar `row_shift` y `row_offset` contra las direcciones de RAM `0xCA00..0xCA13` y `0xFFA9`.
-2. Temporizador descendente en pantalla durante el bonus: visualizacion de digitos en el HUD y puntuacion de bonificacion remanente.
+1. Paridad real de Fase 3 (descenso vertical `0x0BC7..0x0C31`): contrastar con PyBoy la cadencia real de decremento de `row_offset`.
+2. Paridad real de Fases de bonificacion (`0xFFAA = 1`): verificar la cuenta atras del HUD (`0x198C..0x1A50`) y la penetracion continua.
 3. Extender la sintesis APU a los Canales 2, 3 y 4.
 
 

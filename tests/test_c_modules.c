@@ -195,123 +195,181 @@ static void test_apu_pcm_rendering(void) {
     ASSERT_TRUE(has_pos && has_neg, "pulse wave must output alternating positive and negative values");
 }
 
-static void test_apu_dispatcher_nr10_zero(void) {
-    /* Mock minimal ROM with authentic SFX tables:
-     * - SFX 1 (Brick type 1) at 0x6FDE: NR10=0x00, NR11=0x71, NR12=0xF2, NR13=0x59, NR14=0x87
-     * - SFX 2 (Brick type 2) at 0x6FBB: NR10=0x00, NR11=0x81, NR12=0x72, NR13=0x7B, NR14=0xC7
-     * - SFX 7 (Paddle bounce) at 0x701A: NR10=0x1A, NR11=0x81, NR12=0xF0, NR13=0x9D, NR14=0xC7
-     */
-    uint8_t mock_rom[32768] = {0};
-    /* SFX 1 */
-    mock_rom[0x6FDE] = 0x00; /* NR10 = 0 is VALID! (no sweep) */
-    mock_rom[0x6FDF] = 0x71;
-    mock_rom[0x6FE0] = 0xF2;
-    mock_rom[0x6FE1] = 0x59;
-    mock_rom[0x6FE2] = 0x87;
+#include "gb_audio_backend.h"
 
-    /* SFX 2 */
-    mock_rom[0x6FBB] = 0x00; /* NR10 = 0 */
-    mock_rom[0x6FBC] = 0x81;
-    mock_rom[0x6FBD] = 0x72;
-    mock_rom[0x6FBE] = 0x7B;
-    mock_rom[0x6FBF] = 0xC7;
+static void test_apu_dispatcher_production_nr10_zero(void) {
+    /* Test production gb_audio_dispatch_sfx using synthetic/invented fixtures (not copied ROM) */
+    uint8_t synth_rom[32768];
+    memset(synth_rom, 0, sizeof(synth_rom));
 
-    /* SFX 7 */
-    mock_rom[0x701A] = 0x1A; /* NR10 = 0x1A */
-    mock_rom[0x701B] = 0x81;
-    mock_rom[0x701C] = 0xF0;
-    mock_rom[0x701D] = 0x9D;
-    mock_rom[0x701E] = 0xC7;
+    /* Invented fixture table for SFX 1 at 0x6FDE: NR10 = 0x00 (NO SWEEP), freq low = 0x34, freq high = 0x85 */
+    synth_rom[0x6FDE] = 0x00; /* NR10 = 0 is VALID */
+    synth_rom[0x6FDF] = 0x81;
+    synth_rom[0x6FE0] = 0xF0;
+    synth_rom[0x6FE1] = 0x34;
+    synth_rom[0x6FE2] = 0x85;
+
+    /* Invented fixture table for SFX 2 at 0x6FBB: NR10 = 0x00, freq low = 0x78, freq high = 0xC6 */
+    synth_rom[0x6FBB] = 0x00;
+    synth_rom[0x6FBC] = 0x81;
+    synth_rom[0x6FBD] = 0xF0;
+    synth_rom[0x6FBE] = 0x78;
+    synth_rom[0x6FBF] = 0xC6;
 
     GbApuChannel1 ch1, ch2;
     gb_apu_ch1_init(&ch1, 44100);
     gb_apu_ch1_init(&ch2, 44100);
 
-    /* Dispatch SFX 1: table at 0x6FDE */
-    gb_apu_ch1_write_regs(&ch1, mock_rom[0x6FDE], mock_rom[0x6FDF], mock_rom[0x6FE0], mock_rom[0x6FE1], mock_rom[0x6FE2]);
-    ASSERT_TRUE(ch1.active, "SFX 1 active despite NR10 == 0");
-    ASSERT_EQ(ch1.nr10, 0x00, "SFX 1 NR10 is 0");
-    ASSERT_EQ(ch1.raw_frequency, ((0x87 & 7) << 8) | 0x59, "SFX 1 raw frequency matches table");
+    /* Invoke the ACTUAL production dispatcher gb_audio_dispatch_sfx! */
+    gb_audio_dispatch_sfx(synth_rom, sizeof(synth_rom), true, &ch1, 1);
+    ASSERT_TRUE(ch1.active, "production dispatcher must activate channel for SFX 1 with NR10 == 0");
+    ASSERT_EQ(ch1.nr10, 0x00, "SFX 1 NR10 is 0x00");
+    ASSERT_EQ(ch1.raw_frequency, ((0x85 & 7) << 8) | 0x34, "SFX 1 frequency matches synth fixture");
 
-    /* Dispatch SFX 2: table at 0x6FBB */
-    gb_apu_ch1_write_regs(&ch2, mock_rom[0x6FBB], mock_rom[0x6FBC], mock_rom[0x6FBD], mock_rom[0x6FBE], mock_rom[0x6FBF]);
-    ASSERT_TRUE(ch2.active, "SFX 2 active despite NR10 == 0");
-    ASSERT_EQ(ch2.raw_frequency, ((0xC7 & 7) << 8) | 0x7B, "SFX 2 raw frequency matches table");
-    ASSERT_TRUE(ch1.raw_frequency != ch2.raw_frequency, "SFX 1 and SFX 2 have distinct frequencies");
+    gb_audio_dispatch_sfx(synth_rom, sizeof(synth_rom), true, &ch2, 2);
+    ASSERT_TRUE(ch2.active, "production dispatcher must activate channel for SFX 2 with NR10 == 0");
+    ASSERT_EQ(ch2.raw_frequency, ((0xC6 & 7) << 8) | 0x78, "SFX 2 frequency matches synth fixture");
+    ASSERT_TRUE(ch1.raw_frequency != ch2.raw_frequency, "SFX 1 and SFX 2 produce distinct frequencies");
 
-    /* Render both and verify waveforms differ */
+    /* Render PCM and verify buffers differ */
     int16_t buf1[200], buf2[200];
     gb_apu_ch1_render(&ch1, buf1, 200);
     gb_apu_ch1_render(&ch2, buf2, 200);
-    bool buffers_differ = false;
+    bool diff = false;
     for (int i = 0; i < 200; ++i) {
-        if (buf1[i] != buf2[i]) {
-            buffers_differ = true;
-            break;
-        }
+        if (buf1[i] != buf2[i]) { diff = true; break; }
     }
-    ASSERT_TRUE(buffers_differ, "SFX 1 and SFX 2 generate distinct PCM buffers");
+    ASSERT_TRUE(diff, "production dispatcher generates distinct PCM for SFX 1 vs SFX 2");
 }
 
-/* Simulated waveOut queue safety test */
-#define MOCK_WHDR_DONE 0x00000001
-#define MOCK_WHDR_PREPARED 0x00000002
-
+/* Mock device ops for testing production gb_audio_step_frame */
 typedef struct {
-    uint32_t flags;
-    int16_t data[16];
-    int write_count;
-} MockBuffer;
+    int open_calls;
+    int write_calls;
+    int close_calls;
+    int reset_calls;
+    bool fail_open;
+    bool fail_write;
+    bool buffer_done_status[AUDIO_NUM_BUFFERS];
+    int last_written_buffer;
+    int16_t written_data[AUDIO_NUM_BUFFERS][AUDIO_SAMPLES_PER_FRAME];
+} MockAudioDeviceState;
 
-static void test_audio_queue_safety_simulation(void) {
-    /* 4-buffer ring buffer simulating waveOut queue state machine */
-    MockBuffer queue[4];
-    for (int i = 0; i < 4; ++i) {
-        queue[i].flags = MOCK_WHDR_PREPARED | MOCK_WHDR_DONE; /* Initially ready */
-        memset(queue[i].data, 0, sizeof(queue[i].data));
-        queue[i].write_count = 0;
+static int mock_dev_open(GbAudioDeviceOps *ops, uint32_t sample_rate) {
+    (void)sample_rate;
+    MockAudioDeviceState *s = (MockAudioDeviceState *)ops->user_data;
+    s->open_calls++;
+    return s->fail_open ? -1 : 0;
+}
+
+static int mock_dev_write(GbAudioDeviceOps *ops, int buffer_index, const int16_t *samples, int num_samples) {
+    MockAudioDeviceState *s = (MockAudioDeviceState *)ops->user_data;
+    s->write_calls++;
+    s->last_written_buffer = buffer_index;
+    if (s->fail_write) return -2;
+    memcpy(s->written_data[buffer_index], samples, (size_t)num_samples * sizeof(int16_t));
+    s->buffer_done_status[buffer_index] = false; /* Now in playback */
+    return 0;
+}
+
+static bool mock_dev_is_buffer_done(GbAudioDeviceOps *ops, int buffer_index) {
+    MockAudioDeviceState *s = (MockAudioDeviceState *)ops->user_data;
+    return s->buffer_done_status[buffer_index];
+}
+
+static void mock_dev_reset(GbAudioDeviceOps *ops) {
+    MockAudioDeviceState *s = (MockAudioDeviceState *)ops->user_data;
+    s->reset_calls++;
+}
+
+static void mock_dev_close(GbAudioDeviceOps *ops) {
+    MockAudioDeviceState *s = (MockAudioDeviceState *)ops->user_data;
+    s->close_calls++;
+}
+
+static void test_production_audio_backend_integration(void) {
+    MockAudioDeviceState dev_state;
+    memset(&dev_state, 0, sizeof(dev_state));
+    for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) dev_state.buffer_done_status[i] = true;
+
+    GbAudioDeviceOps ops = {
+        .user_data = &dev_state,
+        .open = mock_dev_open,
+        .write = mock_dev_write,
+        .is_buffer_done = mock_dev_is_buffer_done,
+        .reset = mock_dev_reset,
+        .close = mock_dev_close,
+    };
+
+    GbAudioContext ctx;
+    uint8_t synth_rom[32768];
+    memset(synth_rom, 0, sizeof(synth_rom));
+
+    /* 1. Init without prior submission */
+    gb_audio_init(&ctx, &ops);
+    ASSERT_TRUE(ctx.enabled, "audio context initialized successfully");
+    ASSERT_EQ(dev_state.open_calls, 1, "open called once");
+    ASSERT_EQ(ctx.current_buffer_idx, 0, "initial buffer index is 0");
+    for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
+        ASSERT_EQ(ctx.buffer_states[i], BUFFER_FREE, "all buffers initially BUFFER_FREE");
     }
 
-    int current_buf = 0;
-    int16_t frame_samples[16];
-    for (int s = 0; s < 16; ++s) frame_samples[s] = (int16_t)(s + 10);
+    /* 2. Successful write on frame 0 */
+    bool sent = gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    ASSERT_TRUE(sent, "frame 0 audio successfully written to device");
+    ASSERT_EQ(dev_state.write_calls, 1, "device write called");
+    ASSERT_EQ(ctx.buffer_states[0], BUFFER_QUEUED, "buffer 0 marked BUFFER_QUEUED");
+    ASSERT_EQ(ctx.current_buffer_idx, 1, "current buffer advanced to 1");
 
-    /* Frame 1: buffer 0 is DONE -> writes successfully, transitions to in-hardware (clear DONE) */
-    ASSERT_TRUE(queue[current_buf].flags & MOCK_WHDR_DONE, "buffer 0 ready");
-    memcpy(queue[current_buf].data, frame_samples, sizeof(frame_samples));
-    queue[current_buf].flags &= ~MOCK_WHDR_DONE; /* driver playing */
-    queue[current_buf].write_count++;
-    current_buf = (current_buf + 1) % 4;
+    /* 3. Successful write on frames 1, 2, 3 (filling queue) */
+    gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    ASSERT_EQ(dev_state.write_calls, 4, "4 buffers written to device");
+    ASSERT_EQ(ctx.current_buffer_idx, 0, "wrapped around to buffer 0");
 
-    /* Frame 2: buffer 1 is DONE -> writes successfully */
-    ASSERT_TRUE(queue[current_buf].flags & MOCK_WHDR_DONE, "buffer 1 ready");
-    memcpy(queue[current_buf].data, frame_samples, sizeof(frame_samples));
-    queue[current_buf].flags &= ~MOCK_WHDR_DONE;
-    queue[current_buf].write_count++;
-    current_buf = (current_buf + 1) % 4;
+    /* 4. Queue busy: buffer 0 is still in flight (buffer_done_status == false) */
+    dev_state.buffer_done_status[0] = false;
+    /* Record APU cycle accumulator before stepping frame to verify APU advances even if dropped */
+    uint64_t prev_acc = ctx.apu_ch1.cycle_frac_acc;
+    sent = gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    ASSERT_TRUE(!sent, "must safely drop/skip when buffer 0 is still queued");
+    ASSERT_EQ(ctx.buffer_states[0], BUFFER_QUEUED, "buffer 0 remains QUEUED");
+    ASSERT_EQ(ctx.current_buffer_idx, 0, "buffer index does NOT advance when queue busy");
+    ASSERT_EQ(dev_state.write_calls, 4, "device write must NOT be called on busy buffer");
+    ASSERT_TRUE(ctx.apu_ch1.cycle_frac_acc != prev_acc, "APU simulation must advance exactly once even on busy queue");
 
-    /* Frame 3: buffer 2 is NOT done (simulating device lag / audio still in flight) */
-    queue[current_buf].flags &= ~MOCK_WHDR_DONE;
-    int prev_buf = current_buf;
-    /* Queue safety check: must NOT overwrite buffer, must NOT advance index */
-    bool skipped = false;
-    if (!(queue[current_buf].flags & MOCK_WHDR_DONE)) {
-        skipped = true; /* Safe skip: do not overwrite in-flight audio */
+    /* 5. Driver completes playback of buffer 0: buffer_done_status becomes true */
+    dev_state.buffer_done_status[0] = true;
+    sent = gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    ASSERT_TRUE(sent, "buffer 0 written once driver finishes");
+    ASSERT_EQ(dev_state.write_calls, 5, "device write called after driver done");
+    ASSERT_EQ(ctx.current_buffer_idx, 1, "advanced to buffer 1");
+
+    /* 6. Device write error handling */
+    dev_state.buffer_done_status[1] = true;
+    dev_state.fail_write = true;
+    sent = gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    ASSERT_TRUE(!sent, "write error returns false");
+    ASSERT_EQ(ctx.buffer_states[1], BUFFER_FREE, "failed write leaves buffer FREE");
+    ASSERT_EQ(ctx.current_buffer_idx, 1, "failed write does not advance index");
+    dev_state.fail_write = false;
+
+    /* 7. Shutdown */
+    gb_audio_shutdown(&ctx);
+    ASSERT_TRUE(!ctx.enabled, "audio disabled after shutdown");
+    ASSERT_EQ(dev_state.reset_calls, 1, "reset called on shutdown");
+    ASSERT_EQ(dev_state.close_calls, 1, "close called on shutdown");
+    for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
+        ASSERT_EQ(ctx.buffer_states[i], BUFFER_FREE, "all buffers cleared to FREE after shutdown");
     }
-    ASSERT_TRUE(skipped, "must safely skip buffer when WHDR_DONE is not set");
-    ASSERT_EQ(current_buf, prev_buf, "buffer index does not advance on skip");
-    ASSERT_EQ(queue[current_buf].write_count, 0, "in-flight buffer must not be overwritten");
 
-    /* Driver finishes playback of buffer 2: sets WHDR_DONE */
-    queue[current_buf].flags |= MOCK_WHDR_DONE;
-    if (queue[current_buf].flags & MOCK_WHDR_DONE) {
-        memcpy(queue[current_buf].data, frame_samples, sizeof(frame_samples));
-        queue[current_buf].flags &= ~MOCK_WHDR_DONE;
-        queue[current_buf].write_count++;
-        current_buf = (current_buf + 1) % 4;
-    }
-    ASSERT_EQ(queue[2].write_count, 1, "buffer 2 successfully written once freed by driver");
-    ASSERT_EQ(current_buf, 3, "buffer index advanced to 3");
+    /* 8. Partial / failed open test */
+    dev_state.fail_open = true;
+    gb_audio_init(&ctx, &ops);
+    ASSERT_TRUE(!ctx.enabled, "context disabled when open fails");
+    sent = gb_audio_step_frame(&ctx, synth_rom, sizeof(synth_rom), true, 0);
+    ASSERT_TRUE(!sent, "step_frame safely returns false when disabled");
 }
 
 int main(int argc, char **argv) {
@@ -327,8 +385,8 @@ int main(int argc, char **argv) {
     test_apu_length_counter();
     test_apu_sweep_overflow();
     test_apu_pcm_rendering();
-    test_apu_dispatcher_nr10_zero();
-    test_audio_queue_safety_simulation();
+    test_apu_dispatcher_production_nr10_zero();
+    test_production_audio_backend_integration();
 
     if (g_failed > 0) {
         fprintf(stderr, "FAILURES: %d\n", g_failed);

@@ -8,6 +8,7 @@
 #include <string.h>
 #include "gb_tile.h"
 #include "gb_apu.h"
+#include "gb_audio_backend.h"
 
 /*
  * Alleyway PC research & native Stage 1 verifier/player.
@@ -69,15 +70,9 @@ typedef struct {
 } AlleywayStage1;
 
 static AlleywayStage1 g_sim;
-static GbApuChannel1 g_apu_ch1;
+static GbAudioContext g_audio_ctx;
 static HWAVEOUT g_h_wave_out = NULL;
-#define AUDIO_SAMPLE_RATE 44100
-#define AUDIO_SAMPLES_PER_FRAME (AUDIO_SAMPLE_RATE / 60)
-#define AUDIO_NUM_BUFFERS 4
 static WAVEHDR g_wave_hdrs[AUDIO_NUM_BUFFERS];
-static int16_t g_audio_buffers[AUDIO_NUM_BUFFERS][AUDIO_SAMPLES_PER_FRAME];
-static int g_current_audio_buf = 0;
-static bool g_audio_enabled = false;
 
 static bool g_key_left = false;
 static bool g_key_right = false;
@@ -85,56 +80,13 @@ static bool g_key_a = false;
 static bool g_key_b = false;
 static bool g_key_start = false;
 
-/*
- * Dispatch sound effect to APU Channel 1 using authentic ROM tables:
- * - SFX 1 (Brick type 1): table at 0x6FDE (NR10=0x00, NR11=0x71, NR12=0xF2, NR13=0x59, NR14=0x87)
- * - SFX 2 (Brick type 2): table at 0x6FBB (NR10=0x00, NR11=0x81, NR12=0x72, NR13=0x7B, NR14=0xC7)
- * - SFX 3 (Brick type 3): table at 0x6FCA (NR10=0x00, NR11=0x81, NR12=0xC2, NR13=0xAC, NR14=0xC7)
- * - SFX 7 (Paddle serve/bounce): table at 0x701A (NR10=0x1A, NR11=0x81, NR12=0xF0, NR13=0x9D, NR14=0xC7)
- * - SFX 11 (Ceiling bounce) & SFX 12 (Wall bounce): In the DMG driver, these are software-swept
- *   routines (0x6B76 / 0x6B8B) that dynamically write NR13/NR14 in VBlank. They remain partially
- *   modeled until full driver emulation is integrated.
- *
- * NOTE: NR10 = 0 is completely valid (no hardware frequency sweep). We must NOT test s->rom[addr] != 0.
- */
-static void apu_dispatch_sfx(const AlleywayStage1 *s, GbApuChannel1 *ch, uint8_t sfx_id) {
-    if (sfx_id == 0) return;
-
-    if (s->rom_loaded) {
-        if (sfx_id == 7 && 0x701A + 5 <= ROM_SIZE_BYTES) {
-            gb_apu_ch1_write_regs(ch, s->rom[0x701A], s->rom[0x701B], s->rom[0x701C], s->rom[0x701D], s->rom[0x701E]);
-            return;
-        } else if (sfx_id == 1 && 0x6FDE + 5 <= ROM_SIZE_BYTES) {
-            gb_apu_ch1_write_regs(ch, s->rom[0x6FDE], s->rom[0x6FDF], s->rom[0x6FE0], s->rom[0x6FE1], s->rom[0x6FE2]);
-            return;
-        } else if (sfx_id == 2 && 0x6FBB + 5 <= ROM_SIZE_BYTES) {
-            gb_apu_ch1_write_regs(ch, s->rom[0x6FBB], s->rom[0x6FBC], s->rom[0x6FBD], s->rom[0x6FBE], s->rom[0x6FBF]);
-            return;
-        } else if (sfx_id == 3 && 0x6FCA + 5 <= ROM_SIZE_BYTES) {
-            gb_apu_ch1_write_regs(ch, s->rom[0x6FCA], s->rom[0x6FCB], s->rom[0x6FCC], s->rom[0x6FCD], s->rom[0x6FCE]);
-            return;
-        } else if (sfx_id == 11) {
-            /* Explicitly partial: static approximation for ceiling bounce */
-            gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0xC0, 0x87);
-            return;
-        } else if (sfx_id == 12) {
-            /* Explicitly partial: static approximation for software-swept wall bounce */
-            gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0x85, 0x87);
-            return;
-        }
-    }
-
-    /* Fallback / synthetic tone */
-    gb_apu_ch1_write_regs(ch, 0x1A, 0x81, 0xF0, 0x9D, 0x87);
-}
-
-
-static void audio_backend_init(void) {
-    gb_apu_ch1_init(&g_apu_ch1, AUDIO_SAMPLE_RATE);
+/* Win32 waveOut device operations implementation */
+static int win32_waveout_open(GbAudioDeviceOps *ops, uint32_t sample_rate) {
+    (void)ops;
     WAVEFORMATEX wfx = {0};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
     wfx.nChannels = 1;
-    wfx.nSamplesPerSec = AUDIO_SAMPLE_RATE;
+    wfx.nSamplesPerSec = sample_rate;
     wfx.wBitsPerSample = 16;
     wfx.nBlockAlign = (WORD)(wfx.nChannels * (wfx.wBitsPerSample / 8));
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
@@ -142,72 +94,85 @@ static void audio_backend_init(void) {
     MMRESULT res = waveOutOpen(&g_h_wave_out, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
     if (res != MMSYSERR_NOERROR) {
         g_h_wave_out = NULL;
-        g_audio_enabled = false;
-        return;
+        return -1;
     }
 
     memset(g_wave_hdrs, 0, sizeof(g_wave_hdrs));
     for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
-        g_wave_hdrs[i].lpData = (LPSTR)g_audio_buffers[i];
+        g_wave_hdrs[i].lpData = (LPSTR)g_audio_ctx.sample_buffers[i];
         g_wave_hdrs[i].dwBufferLength = AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t);
         MMRESULT prep_res = waveOutPrepareHeader(g_h_wave_out, &g_wave_hdrs[i], sizeof(WAVEHDR));
         if (prep_res != MMSYSERR_NOERROR) {
-            /* Cleanup already prepared headers and close */
             for (int j = 0; j < i; ++j) {
                 waveOutUnprepareHeader(g_h_wave_out, &g_wave_hdrs[j], sizeof(WAVEHDR));
             }
             waveOutClose(g_h_wave_out);
             g_h_wave_out = NULL;
-            g_audio_enabled = false;
-            return;
+            return -2;
         }
-        /* Mark buffer initially as DONE so it can be written to on first frame */
-        g_wave_hdrs[i].dwFlags |= WHDR_DONE;
     }
-    g_audio_enabled = true;
+    return 0;
+}
+
+static int win32_waveout_write(GbAudioDeviceOps *ops, int buffer_index, const int16_t *samples, int num_samples) {
+    (void)ops; (void)samples; (void)num_samples;
+    if (!g_h_wave_out) return -1;
+    WAVEHDR *hdr = &g_wave_hdrs[buffer_index];
+    MMRESULT res = waveOutWrite(g_h_wave_out, hdr, sizeof(WAVEHDR));
+    return (res == MMSYSERR_NOERROR) ? 0 : -2;
+}
+
+static bool win32_waveout_is_buffer_done(GbAudioDeviceOps *ops, int buffer_index) {
+    (void)ops;
+    if (!g_h_wave_out) return true;
+    return (g_wave_hdrs[buffer_index].dwFlags & WHDR_DONE) != 0;
+}
+
+static void win32_waveout_reset(GbAudioDeviceOps *ops) {
+    (void)ops;
+    if (g_h_wave_out) {
+        waveOutReset(g_h_wave_out);
+    }
+}
+
+static void win32_waveout_close(GbAudioDeviceOps *ops) {
+    (void)ops;
+    if (g_h_wave_out) {
+        for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
+            if (g_wave_hdrs[i].dwFlags & WHDR_PREPARED) {
+                waveOutUnprepareHeader(g_h_wave_out, &g_wave_hdrs[i], sizeof(WAVEHDR));
+            }
+        }
+        waveOutClose(g_h_wave_out);
+        g_h_wave_out = NULL;
+    }
+}
+
+static GbAudioDeviceOps g_win32_audio_ops = {
+    .user_data = NULL,
+    .open = win32_waveout_open,
+    .write = win32_waveout_write,
+    .is_buffer_done = win32_waveout_is_buffer_done,
+    .reset = win32_waveout_reset,
+    .close = win32_waveout_close,
+};
+
+static void audio_backend_init(void) {
+    gb_audio_init(&g_audio_ctx, &g_win32_audio_ops);
 }
 
 static void audio_backend_shutdown(void) {
-    if (!g_h_wave_out) return;
-    g_audio_enabled = false;
-    waveOutReset(g_h_wave_out);
-    for (int i = 0; i < AUDIO_NUM_BUFFERS; ++i) {
-        if (g_wave_hdrs[i].dwFlags & WHDR_PREPARED) {
-            waveOutUnprepareHeader(g_h_wave_out, &g_wave_hdrs[i], sizeof(WAVEHDR));
-        }
-    }
-    waveOutClose(g_h_wave_out);
-    g_h_wave_out = NULL;
+    gb_audio_shutdown(&g_audio_ctx);
 }
 
 static void audio_step_frame(void) {
-    if (g_sim.sfx_trigger != 0) {
-        apu_dispatch_sfx(&g_sim, &g_apu_ch1, g_sim.sfx_trigger);
-    }
-
-    /* Advance simulation audio samples always */
-    int16_t current_samples[AUDIO_SAMPLES_PER_FRAME];
-    gb_apu_ch1_render(&g_apu_ch1, current_samples, AUDIO_SAMPLES_PER_FRAME);
-
-    if (!g_audio_enabled || !g_h_wave_out) {
-        return;
-    }
-
-    /* Check if current buffer is available (WHDR_DONE set by driver) */
-    WAVEHDR *hdr = &g_wave_hdrs[g_current_audio_buf];
-    if (!(hdr->dwFlags & WHDR_DONE)) {
-        /* Buffer is still playing in hardware: do NOT overwrite it or block */
-        return;
-    }
-
-    /* Copy synthesized samples into hardware buffer */
-    memcpy(g_audio_buffers[g_current_audio_buf], current_samples, sizeof(current_samples));
-
-    /* Send buffer to waveOut device without clearing WHDR_PREPARED */
-    MMRESULT write_res = waveOutWrite(g_h_wave_out, hdr, sizeof(WAVEHDR));
-    if (write_res == MMSYSERR_NOERROR) {
-        g_current_audio_buf = (g_current_audio_buf + 1) % AUDIO_NUM_BUFFERS;
-    }
+    gb_audio_step_frame(
+        &g_audio_ctx,
+        g_sim.rom,
+        ROM_SIZE_BYTES,
+        g_sim.rom_loaded,
+        g_sim.sfx_trigger
+    );
 }
 
 static uint16_t neg16(uint16_t val) {
@@ -683,6 +648,7 @@ static void step_stage_timers(AlleywayStage1 *s) {
 static void stage1_step_tick(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge) {
     s->sfx_trigger = 0;
     if (s->state == 5) {
+        step_horizontal_scroll(s);
         update_paddle(s, joyp_raw);
         if ((joyp_edge & 0x01u) == 0) {
             serve_ball(s);
@@ -990,6 +956,9 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
         int bx = 0, bx_sub = 0, by = 0, by_sub = 0, bvx = 0, bvy = 0;
         int spd = 0, bricks = 0, score = 0, lives = 0;
         int in_raw = 0xFF, in_edge = 0xFF, tick_id = 0;
+        int stg = 0, sc_flag = 0, bo_flag = 0;
+        int r_shifts[20], r_timers[20];
+        bool has_shifts = true;
 
         if (!extract_json_int(line, "state", &st)) continue;
         extract_json_int(line, "tick", &tick_id);
@@ -1008,10 +977,34 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
         extract_json_int(line, "lives", &lives);
         extract_json_int(line, "in_joyp_raw", &in_raw);
         extract_json_int(line, "in_joyp_edge", &in_edge);
+        extract_json_int(line, "stage", &stg);
+        extract_json_int(line, "scroll_flag", &sc_flag);
+        extract_json_int(line, "bonus_flag", &bo_flag);
+
+        for (int r = 0; r < 20; ++r) {
+            char key_s[32], key_t[32];
+            snprintf(key_s, sizeof(key_s), "row_shift_%d", r);
+            snprintf(key_t, sizeof(key_t), "row_timer_%d", r);
+            if (!extract_json_int(line, key_s, &r_shifts[r]) || !extract_json_int(line, key_t, &r_timers[r])) {
+                has_shifts = false;
+            }
+        }
+
+        int r_patterns[20];
+        bool has_patterns = true;
+        for (int r = 0; r < 20; ++r) {
+            char key_p[32];
+            snprintf(key_p, sizeof(key_p), "row_pattern_%d", r);
+            if (!extract_json_int(line, key_p, &r_patterns[r])) {
+                has_patterns = false;
+            }
+        }
 
         if (!initialized) {
             if (st == 5) {
                 stage1_reset_for_play(&g_sim);
+                g_sim.stage = (uint8_t)stg;
+                load_stage_grid(&g_sim);
                 g_sim.state = (uint8_t)st;
                 g_sim.prng = (uint8_t)prng;
                 g_sim.paddle_x = (uint8_t)pad_x;
@@ -1019,6 +1012,17 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
                 g_sim.bricks_left = (uint16_t)bricks;
                 g_sim.score_tens = (uint16_t)score;
                 g_sim.lives = (uint8_t)lives;
+                if (has_patterns) {
+                    for (int r = 0; r < 20; ++r) {
+                        g_sim.row_pattern[r] = (uint8_t)r_patterns[r];
+                    }
+                }
+                if (has_shifts) {
+                    for (int r = 0; r < 20; ++r) {
+                        g_sim.row_shift[r] = (uint8_t)r_shifts[r];
+                        g_sim.row_timer[r] = (uint8_t)r_timers[r];
+                    }
+                }
                 initialized = true;
             }
             continue;
@@ -1031,6 +1035,7 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
         stage1_step_tick(&g_sim, (uint8_t)in_raw, (uint8_t)in_edge);
         ticks_compared++;
 
+        bool mismatch_detected = false;
         if ((int)g_sim.state != st || (int)g_sim.prng != prng ||
             (int)g_sim.paddle_x != pad_x || (int)g_sim.paddle_w != pad_w ||
             (int)g_sim.ball_x != bx || (int)g_sim.ball_x_sub != bx_sub ||
@@ -1038,13 +1043,26 @@ static int run_verify_trace(const char *rom_path, const char *trace_path) {
             (int)g_sim.ball_vx != bvx || (int)g_sim.ball_vy != bvy ||
             (int)g_sim.speed_idx != spd || (int)g_sim.bricks_left != bricks ||
             (int)g_sim.score_tens != score || (int)g_sim.lives != lives) {
+            mismatch_detected = true;
+        }
+
+        if (has_shifts) {
+            for (int r = 0; r < 20; ++r) {
+                if ((int)g_sim.row_shift[r] != r_shifts[r] || (int)g_sim.row_timer[r] != r_timers[r]) {
+                    mismatch_detected = true;
+                    break;
+                }
+            }
+        }
+
+        if (mismatch_detected) {
             fprintf(stderr,
-                "Mismatch at tick=%d: native(st=%u,padX=%u,ball=%u.%u,%u.%u,v=%u,%u,spd=%u,bricks=%u,score=%u) "
-                "!= ref(st=%d,padX=%d,ball=%d.%d,%d.%d,v=%d,%d,spd=%d,bricks=%d,score=%d)\n",
+                "Mismatch at tick=%d: native(st=%u,padX=%u,ball=%u.%u,%u.%u,v=%u,%u,spd=%u,bricks=%u,score=%u,sh0=%u) "
+                "!= ref(st=%d,padX=%d,ball=%d.%d,%d.%d,v=%d,%d,spd=%d,bricks=%d,score=%d,sh0=%d)\n",
                 tick_id, g_sim.state, g_sim.paddle_x, g_sim.ball_x, g_sim.ball_x_sub,
                 g_sim.ball_y, g_sim.ball_y_sub, g_sim.ball_vx, g_sim.ball_vy,
-                g_sim.speed_idx, g_sim.bricks_left, g_sim.score_tens,
-                st, pad_x, bx, bx_sub, by, by_sub, bvx, bvy, spd, bricks, score);
+                g_sim.speed_idx, g_sim.bricks_left, g_sim.score_tens, g_sim.row_shift[0],
+                st, pad_x, bx, bx_sub, by, by_sub, bvx, bvy, spd, bricks, score, has_shifts ? r_shifts[0] : -1);
             mismatches++;
             break;
         }

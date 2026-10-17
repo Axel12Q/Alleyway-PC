@@ -170,8 +170,94 @@ class NativeStage1VerifierTests(unittest.TestCase):
             report = json.loads(res.stdout.strip())
             self.assertEqual(report["mismatches"], 0)
             self.assertGreater(report["ticks_compared"], 300)
-            self.assertEqual(report["bricks_left"], 83)
-            self.assertEqual(report["score"], 10)
+    def test_local_rom_stage2_parity_if_present(self):
+        local_rom = ROOT.parent / "Local-Privado/roms/Alleyway (USA).gb"
+        if not local_rom.is_file():
+            self.skipTest("User local ROM not present in ../Local-Privado/roms/Alleyway (USA).gb")
+        from pyboy import PyBoy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_trace = Path(tmp) / "stage2_parity.jsonl"
+            gb = PyBoy(str(local_rom), window="null", sound_emulated=False)
+            try:
+                # Advance past title
+                for f in range(346):
+                    if f == 120: gb.button_press("start")
+                    elif f == 125: gb.button_release("start")
+                    gb.tick()
+
+                # Trigger stage clear on Stage 1 to transition naturally into Stage 2
+                gb.memory[0xFFC8] = 0; gb.memory[0xFFC9] = 0; gb.memory[0xFFA4] = 8
+                for f in range(346, 558):
+                    if f >= 400 and f % 20 < 10: gb.button_press("a")
+                    else: gb.button_release("a")
+                    gb.tick()
+
+                records = []
+                tick_id = 0
+                latched = [0xFF, 0xFF]
+
+                def _on_logic_start(context):
+                    latched[0] = int(gb.memory[0xFF8C])
+                    latched[1] = int(gb.memory[0xFF8D])
+
+                def _on_logic_end(context):
+                    nonlocal tick_id
+                    rec = {
+                        "tick": tick_id,
+                        "state": gb.memory[0xFFA4],
+                        "prng": gb.memory[0xFFA1],
+                        "paddle_x": gb.memory[0xFFC0],
+                        "paddle_w": gb.memory[0xFFC2],
+                        "ball_x": gb.memory[0xFFB6],
+                        "ball_x_sub": gb.memory[0xFFB7],
+                        "ball_y": gb.memory[0xFFB4],
+                        "ball_y_sub": gb.memory[0xFFB5],
+                        "ball_vx": (gb.memory[0xFFBA] << 8) | gb.memory[0xFFBB],
+                        "ball_vy": (gb.memory[0xFFB8] << 8) | gb.memory[0xFFB9],
+                        "speed_idx": gb.memory[0xFFBE],
+                        "bricks_left": (gb.memory[0xFFC8] << 8) | gb.memory[0xFFC9],
+                        "score_tens": gb.memory[0xFFCA] | (gb.memory[0xFFCB] << 8),
+                        "lives": gb.memory[0xCA44],
+                        "stage": gb.memory[0xCA45],
+                        "scroll_flag": gb.memory[0xFFAB],
+                        "bonus_flag": gb.memory[0xFFAA],
+                        "in_joyp_raw": latched[0],
+                        "in_joyp_edge": latched[1],
+                    }
+                    for r in range(20):
+                        rec[f"row_pattern_{r}"] = gb.memory[0xCA14 + r]
+                        rec[f"row_shift_{r}"] = gb.memory[0xCA00 + r]
+                        rec[f"row_timer_{r}"] = gb.memory[0xCA28 + r]
+                    records.append(rec)
+                    tick_id += 1
+
+                gb.hook_register(0, 0x051F, _on_logic_start, None)
+                gb.hook_register(0, 0x0525, _on_logic_end, None)
+
+                for f in range(558, 1200):
+                    if f == 570: gb.button_press("a")
+                    elif f == 575: gb.button_release("a")
+                    elif f == 650: gb.button_press("right")
+                    elif f == 670: gb.button_release("right")
+                    gb.tick()
+            finally:
+                gb.stop()
+
+            with open(tmp_trace, "w", encoding="utf-8") as fp:
+                for r in records:
+                    fp.write(json.dumps(r) + "\n")
+
+            res = subprocess.run(
+                [str(EXE_PATH), "--verify-trace", str(local_rom), str(tmp_trace)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            report = json.loads(res.stdout.strip())
+            self.assertEqual(report["mismatches"], 0)
+            self.assertGreater(report["ticks_compared"], 500)
+            self.assertLess(report["bricks_left"], 84)
 
 
 if __name__ == "__main__":

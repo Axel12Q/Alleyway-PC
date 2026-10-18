@@ -8,5 +8,5 @@ out = root / "build"
 out.mkdir(exist_ok=True)
 subprocess.run([sys.executable, "-m", "ziglang", "cc", "-std=c11", "-Wall",
                 "-Wextra", "-Werror", "-O2", str(root / "src/main.c"),
-                "-o", str(out / "alleyway-lab.exe"), "-luser32", "-lgdi32", "-lwinmm"], check=True)
+                "-o", str(out / "alleyway-lab.exe"), "-luser32", "-lgdi32", "-lwinmm", "-lcomdlg32"], check=True)
 print(out / "alleyway-lab.exe")

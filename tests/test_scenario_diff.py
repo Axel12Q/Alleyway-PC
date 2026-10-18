@@ -33,7 +33,7 @@ def _build_mutant(out_path: Path) -> None:
     tmp.write_text(mutated, encoding="utf-8")
     try:
         subprocess.run([sys.executable, "-m", "ziglang", "cc", "-std=c11", "-O2", "-w", "-I", str(ROOT / "src"),
-                        str(tmp), "-o", str(out_path), "-luser32", "-lgdi32", "-lwinmm"],
+                        str(tmp), "-o", str(out_path), "-luser32", "-lgdi32", "-lwinmm", "-lcomdlg32"],
                        check=True, capture_output=True)
     finally:
         tmp.unlink(missing_ok=True)

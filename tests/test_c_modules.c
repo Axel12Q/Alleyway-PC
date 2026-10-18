@@ -372,6 +372,24 @@ static void test_production_audio_backend_integration(void) {
     ASSERT_TRUE(!sent, "step_frame safely returns false when disabled");
 }
 
+static void test_production_sfx_lifetime(void) {
+    GbAudioContext ctx;
+    uint8_t rom[32768]={0};
+    gb_audio_init(&ctx,NULL);
+    gb_audio_step_frame(&ctx,rom,sizeof rom,true,12);
+    for (int i=0;i<120;i++) gb_audio_step_frame(&ctx,rom,sizeof rom,true,0);
+    ASSERT_EQ(ctx.sfx.active,0,"wall sequencer completes without arbitrary timeout");
+    ASSERT_TRUE(!ctx.apu_ch1.active,"wall DAC is off after its ROM driver sequence");
+    int16_t tail[256];
+    gb_apu_ch1_render(&ctx.apu_ch1,tail,256);
+    for (int i=0;i<256;i++) ASSERT_EQ(tail[i],0,"completed wall effect has silent PCM tail");
+    gb_audio_step_frame(&ctx,rom,sizeof rom,true,11);
+    gb_audio_step_frame(&ctx,rom,sizeof rom,true,0);
+    gb_audio_silence(&ctx);
+    ASSERT_EQ(ctx.sfx.active,0,"desktop silence clears the sequencer");
+    ASSERT_TRUE(!ctx.apu_ch1.active,"desktop silence clears the oscillator");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--deliberate-fail") == 0) {
         fprintf(stderr, "Intentional failure mode for verification harness\n");
@@ -387,6 +405,7 @@ int main(int argc, char **argv) {
     test_apu_pcm_rendering();
     test_apu_dispatcher_production_nr10_zero();
     test_production_audio_backend_integration();
+    test_production_sfx_lifetime();
 
     if (g_failed > 0) {
         fprintf(stderr, "FAILURES: %d\n", g_failed);

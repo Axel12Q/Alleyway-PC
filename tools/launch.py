@@ -50,7 +50,7 @@ def main():
         for c in CANDIDATES:
             print(f"  - {c}")
         print()
-        print("Starting in DIAGNOSTIC FALLBACK mode (pattern display, press Esc to exit).")
+        print("Opening the local ROM selector. Cancel exits without modifying files.")
         print("To run with authentic assets, provide your ROM:")
         print("  python tools/launch.py \"path/to/Alleyway (USA).gb\"")
         print("  or place it in 'local/roms/' or '../Local-Privado/roms/' (ignored by Git).")
@@ -62,6 +62,7 @@ def main():
     print("  Left / Right  : Move paddle (standard 3 px/frame; or A / D keys)")
     print("  Shift / X     : Button B (Precision paddle movement: 1 px/frame)")
     print("  R             : Reset directly to Stage 1 Serve")
+    print("  M             : Mute / unmute. Switching windows freezes play and silences audio.")
     print("  Esc           : Close window and exit cleanly")
     print("=" * 70)
 

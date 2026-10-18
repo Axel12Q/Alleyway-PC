@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - "antigravity/**"
+      - "codex/**"
   pull_request:
 
 jobs:

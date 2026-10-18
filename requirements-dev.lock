@@ -2,6 +2,8 @@
 #    uv pip compile requirements-dev.in --output-file requirements-dev.lock --offline
 numpy==2.5.4
     # via pyboy
+pillow==13.0.0
+    # via -r requirements-dev.in
 pyboy==2.8.1
     # via -r requirements.txt
 pysdl2==0.9.17

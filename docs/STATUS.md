@@ -1,5 +1,20 @@
 # Estado
 
+## Candidato público 0.1.0-preview (Codex)
+
+- Entrada corta conservada hasta el próximo tick; pausa/suspensión por pérdida de foco,
+  limpieza de teclas y vaciado inmediato de audio; tecla M para silenciar.
+- Nuevo `alleyway_sfx.h`: secuenciador del canal 1 basado en las rutinas 0x69FB..0x6F9C.
+  Los efectos de pared/techo terminan por la secuencia original, no por un timeout arbitrario.
+- Oracle `capture_audio_reference.py`: inyección privada de solicitud en 0x69FB,
+  observación en 0x6806 y captura de escrituras NR10..NR14 en banco ROM 1.
+  La prueba exige capturas no vacías y contrasta los 12 efectos durante 160 VBlanks.
+  Esto verifica registros/contadores, no igualdad acústica ni fase PCM exacta.
+- Selector nativo de ROM local y validación de tamaño/identidad para uso interactivo.
+- Paquete portable con allowlist; no contiene ROM, capturas, audio extraído ni herramientas de desarrollo.
+- Siguen pendientes canales 2..4/música completa, animaciones intermedias y partida manual continua de 32 fases.
+  No se declara versión completa; los resultados históricos de abajo pertenecen a sus respectivos commits.
+
 2026-10-17: desarrollo activo en `antigravity/development` con volcado del usuario verificado en `../Local-Privado/roms/Alleyway (USA).gb` (fuera de Git).
 
 ## Hitos completados y subidos a `origin/antigravity/development`

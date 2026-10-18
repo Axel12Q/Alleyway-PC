@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "gb_apu.h"
+#include "alleyway_sfx.h"
 #include "gb_scheduler.h"
 
 #define AUDIO_SAMPLE_RATE 44100
@@ -42,6 +43,7 @@ typedef struct GbAudioDeviceOps {
 
 typedef struct {
     GbApuChannel1 apu_ch1;
+    AlleywaySfx sfx;
     bool enabled;
     GbAudioBufferState buffer_states[AUDIO_NUM_BUFFERS];
     int16_t sample_buffers[AUDIO_NUM_BUFFERS][AUDIO_MAX_SAMPLES_PER_FRAME];
@@ -66,31 +68,12 @@ static inline void gb_audio_dispatch_sfx(
     if (sfx_id == 0) return;
 
     if (rom_loaded && rom != NULL) {
-        if (sfx_id == 7 && 0x701Au + 5u <= rom_size) {
-            gb_apu_ch1_write_regs(ch, rom[0x701A], rom[0x701B], rom[0x701C], rom[0x701D], rom[0x701E]);
-            return;
-        } else if (sfx_id == 1 && 0x6FDEu + 5u <= rom_size) {
-            gb_apu_ch1_write_regs(ch, rom[0x6FDE], rom[0x6FDF], rom[0x6FE0], rom[0x6FE1], rom[0x6FE2]);
-            return;
-        } else if (sfx_id == 2 && 0x6FBBu + 5u <= rom_size) {
-            gb_apu_ch1_write_regs(ch, rom[0x6FBB], rom[0x6FBC], rom[0x6FBD], rom[0x6FBE], rom[0x6FBF]);
-            return;
-        } else if (sfx_id == 3 && 0x6FCAu + 5u <= rom_size) {
-            gb_apu_ch1_write_regs(ch, rom[0x6FCA], rom[0x6FCB], rom[0x6FCC], rom[0x6FCD], rom[0x6FCE]);
-            return;
-        } else if (sfx_id == 11) {
-            /* Partial / static approximation for ceiling bounce */
-            gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0xC0, 0x87);
-            return;
-        } else if (sfx_id == 12) {
-            /* Partial / static approximation for software-swept wall bounce */
-            gb_apu_ch1_write_regs(ch, 0x00, 0x81, 0xF0, 0x85, 0x87);
-            return;
-        }
+        AlleywaySfx initial = {0};
+        alleyway_sfx_step(&initial, ch, rom, rom_size, sfx_id);
+        return;
     }
-
-    /* Fallback / synthetic tone */
-    gb_apu_ch1_write_regs(ch, 0x1A, 0x81, 0xF0, 0x9D, 0x87);
+    /* Diagnostic-only finite tone; commercial SFX use the sequencer above. */
+    gb_apu_ch1_write_regs(ch, 0x1A, 0x81, 0xF0, 0x9D, 0xC7);
 }
 
 static inline void gb_audio_init(GbAudioContext *ctx, GbAudioDeviceOps *ops) {
@@ -124,6 +107,17 @@ static inline void gb_audio_shutdown(GbAudioContext *ctx) {
     }
 }
 
+/* Stop queued output immediately without closing the device. Used for desktop
+ * pause, loss of focus, mute and reset; never changes the game simulation. */
+static inline void gb_audio_silence(GbAudioContext *ctx) {
+    if (ctx->enabled && ctx->device_ops && ctx->device_ops->reset)
+        ctx->device_ops->reset(ctx->device_ops);
+    for (int i=0;i<AUDIO_NUM_BUFFERS;i++) ctx->buffer_states[i]=BUFFER_FREE;
+    ctx->current_buffer_idx=0;
+    memset(&ctx->sfx,0,sizeof(ctx->sfx));
+    gb_apu_ch1_init(&ctx->apu_ch1,AUDIO_SAMPLE_RATE);
+}
+
 /*
  * Steps one audio frame:
  * 1. Dispatches sfx_trigger if non-zero.
@@ -139,9 +133,8 @@ static inline bool gb_audio_step_frame(
     bool rom_loaded,
     uint8_t sfx_trigger
 ) {
-    if (sfx_trigger != 0) {
-        gb_audio_dispatch_sfx(rom, rom_size, rom_loaded, &ctx->apu_ch1, sfx_trigger);
-    }
+    if (rom_loaded) alleyway_sfx_step(&ctx->sfx,&ctx->apu_ch1,rom,rom_size,sfx_trigger);
+    else if (sfx_trigger != 0) gb_audio_dispatch_sfx(rom, rom_size, false, &ctx->apu_ch1, sfx_trigger);
 
     ctx->audio_frac_acc += GB_AUDIO_FRAC_NUM;
     int samples_this_frame = GB_AUDIO_SAMPLE_BASE;

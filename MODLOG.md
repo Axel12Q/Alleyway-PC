@@ -245,3 +245,12 @@ Estado: Hito 12 completado — Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verifica
 2026-10-17 Codex: real desktop taps of Enter were lost when WM_KEYDOWN and WM_KEYUP drained before the simulation tick. Added a one-frame pending-press latch in codex/input-taps (separate worktree). Window regression now releases Enter before stepping; no game-rule changes. Validation recorded below after completion.
 
 Validation: all 44 tests pass, including Enter down+up before a frame; real desktop title/start/serve and right-arrow movement now work. Real short session broke one brick and lost one life. User reported lingering sound: private C probe of production wall SFX12 remained active=1 volume=15 with 4410/4410 nonzero samples in final100ms after3s. Root: static NR12=F0 / NR14=87 with neither length expiry nor envelope, missing software SFX sequence. Audio remains incomplete; no fabricated-duration fix applied.
+
+2026-10-17 public-preview candidate (Codex):
+- Replaced static channel-1 effects with a title-specific driver sequence (0x69FB..0x6F9C), reading tables only from the local ROM.
+- Corrected the first oracle harness: audio hooks must use ROM bank 1. The committed test requires nonempty captures, so an inactive hook cannot report parity. All 12 isolated requests match 160-frame state/register-write traces; no PCM-phase equivalence claimed. Wall/ceiling/serve stop via original sequencing at measured 9/20/15 subsequent frames.
+- Added immediate output silence on pause, focus loss, mute, title and reset; focus loss clears held inputs and freezes simulation.
+- Added native ROM picker, exact-size and supported-USA identity validation; portable package script with fixed file allowlist and SHA-256 manifest. Added MIT license for project code only and explicit preview limits/AI/tool credits.
+- 47 tests OK locally (21.690s), including all previous logic/visual/window regressions and new SFX oracle, finite-tail, focus/mute and ROM rejection checks. One earlier auxiliary test binary was blocked by Windows application control; no policy was changed. The final rebuilt regression harness and complete suite executed successfully.
+- Desktop verification: fast Start reached serve, Space launched, block score increased, pause responded, Esc closed. No acoustic recording/complete 32-stage manual playthrough claimed.
+- Channels 2..4/full music and some intermediate animations remain incomplete; this is 0.1.0-preview, not a complete audiovisual port.

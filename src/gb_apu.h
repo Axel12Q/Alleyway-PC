@@ -280,6 +280,34 @@ static inline void gb_apu_ch1_advance_cycles(GbApuChannel1 *ch, int32_t cycles) 
 /*
  * Writes the 5 registers of Channel 1 and handles length / trigger semantics.
  */
+static inline void gb_apu_ch1_write_reg(GbApuChannel1 *ch, uint8_t reg, uint8_t value) {
+    switch (reg) {
+    case 0x10: ch->nr10=value; break;
+    case 0x11:
+        ch->nr11=value;
+        ch->length_counter=(uint8_t)(64u-(value&63u));
+        break;
+    case 0x12:
+        ch->nr12=value;
+        ch->dac_enabled=(value&0xF8u)!=0;
+        if (!ch->dac_enabled) ch->active=false;
+        break;
+    case 0x13:
+        ch->nr13=value;
+        ch->raw_frequency=(uint16_t)((ch->raw_frequency&0x700u)|value);
+        ch->timer_period_cycles=(2048-(int)ch->raw_frequency)*4;
+        break;
+    case 0x14:
+        ch->nr14=value;
+        ch->raw_frequency=(uint16_t)(((value&7u)<<8)|ch->nr13);
+        ch->timer_period_cycles=(2048-(int)ch->raw_frequency)*4;
+        ch->length_enabled=(value&0x40u)!=0;
+        if (value&0x80u) gb_apu_ch1_trigger(ch);
+        break;
+    default: break;
+    }
+}
+
 static inline void gb_apu_ch1_write_regs(
     GbApuChannel1 *ch,
     uint8_t nr10,

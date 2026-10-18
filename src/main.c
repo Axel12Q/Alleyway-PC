@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#include <commdlg.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -237,6 +238,8 @@ static bool g_key_b = false;
 static bool g_key_start = false;
 /* Keep a short key press until the next simulation frame consumes it. */
 static uint8_t g_pending_presses = 0;
+static bool g_window_focused = true;
+static bool g_muted = false;
 
 /* Win32 waveOut device operations implementation */
 static int win32_waveout_open(GbAudioDeviceOps *ops, uint32_t sample_rate) {
@@ -1617,11 +1620,14 @@ static void render_stage1(const AlleywayStage1 *s) {
 }
 
 static bool try_load_rom_file(AlleywayStage1 *s, const char *path) {
-    FILE *fp = fopen(path, "rb");
+    wchar_t wide_path[32768];
+    if (!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,wide_path,32768)) return false;
+    FILE *fp = _wfopen(wide_path, L"rb");
     if (!fp) return false;
     size_t n = fread(s->rom, 1, ROM_SIZE_BYTES, fp);
+    int extra=fgetc(fp);
     fclose(fp);
-    if (n != ROM_SIZE_BYTES) return false;
+    if (n != ROM_SIZE_BYTES || extra!=EOF) return false;
     uint8_t chk = 0;
     for (int i = 0x134; i < 0x14D; ++i) {
         chk = (uint8_t)((chk - s->rom[i] - 1u) & 0xFFu);
@@ -1629,6 +1635,41 @@ static bool try_load_rom_file(AlleywayStage1 *s, const char *path) {
     if (chk != s->rom[0x14D]) return false;
     s->rom_loaded = true;
     stage1_reset_for_play(s);
+    return true;
+}
+
+static uint32_t rom_crc32(const uint8_t *data,size_t size) {
+    uint32_t crc=0xFFFFFFFFu;
+    for (size_t i=0;i<size;i++) {
+        crc^=data[i];
+        for (int bit=0;bit<8;bit++) crc=(crc>>1)^((crc&1u)?0xEDB88320u:0);
+    }
+    return crc^0xFFFFFFFFu;
+}
+
+/* Identity check for the supported USA release, not a general Game Boy loader. */
+static bool supported_interactive_rom(const AlleywayStage1 *s) {
+    return s->rom_loaded && rom_crc32(s->rom,ROM_SIZE_BYTES)==0x5CC01586u;
+}
+
+static bool choose_user_rom(AlleywayStage1 *s) {
+    wchar_t path[32768]={0};
+    OPENFILENAMEW dialog={0};
+    dialog.lStructSize=sizeof(dialog);
+    dialog.lpstrFilter=L"Game Boy ROM (*.gb)\0*.gb\0All files\0*.*\0\0";
+    dialog.lpstrFile=path;
+    dialog.nMaxFile=32768;
+    dialog.lpstrTitle=L"Select your local Alleyway (USA) ROM - 32 KiB";
+    dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&dialog)) return false;
+    char utf8[131072];
+    if (!WideCharToMultiByte(CP_UTF8,0,path,-1,utf8,sizeof(utf8),NULL,NULL) ||
+        !try_load_rom_file(s,utf8) || !supported_interactive_rom(s)) {
+        s->rom_loaded=false;
+        MessageBoxW(NULL,L"Unsupported ROM. Select the 32 KiB Alleyway USA release. No ROM is included with this application.",
+                    L"Alleyway PC - ROM not supported",MB_OK|MB_ICONERROR);
+        return false;
+    }
     return true;
 }
 
@@ -2050,7 +2091,7 @@ static int run_scenario(const char *rom_path, const char *scenario_path, int dum
 }
 
 static void step_window_frame(void) {
-    if (!g_sim.rom_loaded) return;
+    if (!g_sim.rom_loaded || !g_window_focused) return;
     uint8_t joyp_raw = 0xFFu;
     if (g_key_a)     joyp_raw &= (uint8_t)~0x01u;
     if (g_key_b)     joyp_raw &= (uint8_t)~0x02u;
@@ -2065,15 +2106,20 @@ static void step_window_frame(void) {
     uint8_t joyp_edge = (uint8_t)(~newly_pressed_high);
     g_sim.prev_joyp_raw = joyp_raw;
 
+    uint8_t previous_state=g_sim.state;
     stage1_step_tick(&g_sim, joyp_raw, joyp_edge);
-    audio_step_frame();
+    if (g_sim.state==0x0C) {
+        if (previous_state!=0x0C) gb_audio_silence(&g_audio_ctx);
+    } else if (!g_muted) audio_step_frame();
     render_stage1(&g_sim);
 }
 
 static void handle_key_change(WPARAM vk, bool down, HWND w) {
     if (vk == VK_ESCAPE && down) { DestroyWindow(w); return; }
-    if (vk == 'R' && down && g_sim.rom_loaded) { stage1_reset_for_play(&g_sim); return; }
+    if (vk == 'M' && down) { g_muted=!g_muted; gb_audio_silence(&g_audio_ctx); return; }
+    if (vk == 'R' && down && g_sim.rom_loaded) { gb_audio_silence(&g_audio_ctx); stage1_reset_for_play(&g_sim); return; }
     if (vk == 'T' && down && g_sim.rom_loaded) {
+        gb_audio_silence(&g_audio_ctx);
         stage1_reset_for_play(&g_sim);
         g_sim.state = 2;
         g_sim.normal_stage_count = 0;
@@ -2098,7 +2144,19 @@ static uint32_t g_paint_count = 0;
 
 static LRESULT CALLBACK window_proc(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m == WM_DESTROY) { audio_backend_shutdown(); PostQuitMessage(0); return 0; }
-    if (m == WM_KEYDOWN) { handle_key_change(a, true, w); return 0; }
+    if (m == WM_KILLFOCUS) {
+        g_window_focused=false;
+        g_key_left=g_key_right=g_key_a=g_key_b=g_key_start=false;
+        g_pending_presses=0;
+        g_sim.prev_joyp_raw=0xFF;
+        gb_audio_silence(&g_audio_ctx);
+        return 0;
+    }
+    if (m == WM_SETFOCUS) { g_window_focused=true; return 0; }
+    if (m == WM_KEYDOWN) {
+        if ((b & (1L<<30)) && (a=='M' || a=='R' || a=='T')) return 0;
+        handle_key_change(a, true, w); return 0;
+    }
     if (m == WM_KEYUP)   { handle_key_change(a, false, w); return 0; }
     if (m == WM_PAINT) {
         PAINTSTRUCT paint; HDC dc = BeginPaint(w, &paint);
@@ -2236,6 +2294,22 @@ static int run_verify_window_session(const char *rom_path, const char *out_dir) 
     step_window_frame();
     SendMessageW(window, WM_KEYUP, VK_RETURN, 0);
     if (g_sim.state != 6) { DestroyWindow(window); audio_backend_shutdown(); return 11; }
+
+    /* Loss of focus cancels held inputs, freezes simulation and flushes audio. */
+    SendMessageW(window,WM_KEYDOWN,VK_RIGHT,0);
+    SendMessageW(window,WM_KILLFOCUS,0,0);
+    uint8_t focus_x=g_sim.paddle_x, focus_vblank=g_sim.vblank_count;
+    for (int i=0;i<5;i++) step_window_frame();
+    if (g_sim.paddle_x!=focus_x || g_sim.vblank_count!=focus_vblank ||
+        g_key_right || g_pending_presses || g_audio_ctx.apu_ch1.active) {
+        DestroyWindow(window); audio_backend_shutdown(); return 14;
+    }
+    SendMessageW(window,WM_SETFOCUS,0,0);
+    SendMessageW(window,WM_KEYDOWN,'M',0);
+    SendMessageW(window,WM_KEYUP,'M',0);
+    if (!g_muted || g_audio_ctx.apu_ch1.active) { DestroyWindow(window); return 15; }
+    SendMessageW(window,WM_KEYDOWN,'M',0);
+    SendMessageW(window,WM_KEYUP,'M',0);
 
     /* 5. Press 'R' to reset to Stage 1 Serve (State 5, paddle_x = 40), then Esc to close window */
     SendMessageW(window, WM_KEYDOWN, 'R', 0);
@@ -2584,6 +2658,13 @@ int main(int argc, char **argv) {
         return run_verify_trace(argv[2], argv[3]);
     }
 
+    if (argc==3 && strcmp(argv[1],"--check-rom")==0) {
+        bool ok=try_load_rom_file(&g_sim,argv[2]) && supported_interactive_rom(&g_sim);
+        printf("{\"supported\":%s}\n",ok?"true":"false");
+        return ok?0:1;
+    }
+    bool explicit_rom=argc==3 && strcmp(argv[1],"--rom")==0;
+    bool diagnostic=argc==2 && strcmp(argv[1],"--diagnostic")==0;
     const char *rom_candidates[] = {
         (argc == 3 && strcmp(argv[1], "--rom") == 0) ? argv[2] : NULL,
         "local/roms/Alleyway (USA).gb",
@@ -2592,13 +2673,25 @@ int main(int argc, char **argv) {
         "../Local-Privado/roms/alleyway.gb",
     };
     for (size_t i = 0; i < sizeof(rom_candidates) / sizeof(rom_candidates[0]); ++i) {
-        if (rom_candidates[i] && try_load_rom_file(&g_sim, rom_candidates[i])) {
+        if (diagnostic) break;
+        if (rom_candidates[i] && try_load_rom_file(&g_sim, rom_candidates[i]) && supported_interactive_rom(&g_sim)) {
             /* Start interactive window sessions at Title Screen ("PUSH START", State 2) */
             g_sim.state = 2;
             g_sim.normal_stage_count = 0;
             g_sim.bonus_stage_count = 0;
             break;
         }
+        g_sim.rom_loaded=false;
+        if (explicit_rom) break;
+    }
+    if (!g_sim.rom_loaded && !diagnostic) {
+        if (explicit_rom) {
+            MessageBoxW(NULL,L"ROM missing or unsupported. This build requires Alleyway USA, 32 KiB.",L"Alleyway PC",MB_OK|MB_ICONERROR);
+            return 1;
+        }
+        if (!choose_user_rom(&g_sim)) return 0;
+        g_sim.state=2;
+        g_sim.normal_stage_count=g_sim.bonus_stage_count=0;
     }
     render_stage1(&g_sim);
     audio_backend_init();

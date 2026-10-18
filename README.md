@@ -1,5 +1,28 @@
 # Alleyway PC research
 
+## Windows preview 0.1.0
+
+Reimplementación nativa de investigación para Windows x64. Descarga el paquete
+`Alleyway-PC-0.1.0-preview-windows-x64.zip` en [Releases](https://github.com/Axel12Q/Alleyway-PC/releases),
+extráelo y abre **Alleyway-PC.exe**. Selecciona tu ROM local de Alleyway USA (32 KiB).
+El paquete no necesita Python, Zig ni instalación y **no incluye ROM ni recursos del juego**.
+
+Enter inicia/pausa, flechas mueven, Espacio saca, M silencia, R reinicia,
+T vuelve al título y Esc sale. Cambiar de ventana suspende juego y audio.
+La versión admite la ROM USA verificada, no cualquier juego de Game Boy.
+
+Es una **preview**, con canales de audio 2..4/música y animaciones intermedias aún
+incompletos. No es un conversor automático ni un port audiovisual completo.
+Consulta [controles y límites](docs/RELEASE_README.txt) y [cambios](CHANGELOG.md).
+Las pulsaciones rápidas y el tono de pared persistente están corregidos;
+la secuencia de registros de los 12 efectos primarios se contrasta con PyBoy.
+
+Nuestro código y herramientas son MIT; ROM, gráficos y música no están cubiertos
+por esa licencia. Proyecto no oficial, sin afiliación con Nintendo.
+Desarrollado con asistencia de OpenAI Codex y Google Antigravity (Gemini/Claude).
+
+## Laboratorio y evidencia de investigación
+
 Laboratorio para investigar Alleyway (Game Boy, 1989) y construir una reimplementacion
 nativa verificable en Windows.
 

@@ -22,7 +22,8 @@ def package(destination):
     folder.mkdir()
     for source,name in ((ROOT/"build/alleyway-lab.exe","Alleyway-PC.exe"),
                         (ROOT/"docs/RELEASE_README.txt","LEEME.txt"),
-                        (ROOT/"LICENSE","LICENSE"),(ROOT/"CHANGELOG.md","CHANGELOG.md")):
+                        (ROOT/"LICENSE","LICENSE"),(ROOT/"CHANGELOG.md","CHANGELOG.md"),
+                        (ROOT/"THIRD_PARTY_NOTICES.txt","THIRD_PARTY_NOTICES.txt")):
         shutil.copyfile(source,folder/name)
     revision=subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip()
     dirty=bool(subprocess.check_output(["git","status","--porcelain"],cwd=ROOT,text=True).strip())

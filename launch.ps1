@@ -5,8 +5,10 @@
 #   .\launch.ps1 "path/to/Alleyway (USA).gb"
 
 $Python = "python"
-if (Test-Path ".\.venv\Scripts\python.exe") {
-    $Python = ".\.venv\Scripts\python.exe"
+$VenvPython = Join-Path -Path $PSScriptRoot -ChildPath ".venv\Scripts\python.exe"
+if (Test-Path -LiteralPath $VenvPython) {
+    $Python = $VenvPython
 }
 
-& $Python tools/launch.py @args
+$LaunchScript = Join-Path -Path $PSScriptRoot -ChildPath "tools\launch.py"
+& $Python $LaunchScript @args

@@ -23,7 +23,8 @@ def find_rom():
         p = Path(sys.argv[1]).resolve()
         if p.is_file():
             return p
-        print(f"Warning: specified ROM path not found: {sys.argv[1]}")
+        sys.stderr.write(f"Error: specified ROM file does not exist: {sys.argv[1]}\n")
+        sys.exit(1)
     for c in CANDIDATES:
         if c.is_file():
             return c.resolve()
@@ -33,7 +34,7 @@ def find_rom():
 def main():
     if not EXE_PATH.is_file():
         print("Executable not found. Building with tools/build.py...")
-        subprocess.run([sys.executable, str(ROOT / "tools/build.py")], check=True)
+        subprocess.run([sys.executable, str(ROOT / "tools/build.py")], cwd=str(ROOT), check=True)
 
     rom = find_rom()
 
@@ -69,7 +70,7 @@ def main():
         cmd.extend(["--rom", str(rom)])
 
     try:
-        proc = subprocess.run(cmd)
+        proc = subprocess.run(cmd, cwd=str(ROOT))
         sys.exit(proc.returncode)
     except KeyboardInterrupt:
         sys.exit(0)

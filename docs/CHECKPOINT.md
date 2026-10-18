@@ -78,7 +78,7 @@ El lanzador:
    - Game Over con reinicio en título (`State 2`), telón inicial de Mario de 221 fotogramas, segunda partida y pausa/reanudación (`State 12`).
    - Final de Fase 32 -> Ending (`State 9`, 1445 fotogramas) -> retorno a Fase 1 conservando vidas y puntos.
 4. **Telones en las 32 Fases y Alineaciones de VBlank**:
-   - Las 32 transiciones de fase (`0..31 -> 1..0`) y 16 alineaciones de VBlank (`0, 7, 16, 31`) automatizadas en [`test_all_32_curtain_transitions_and_vblank_alignments`](file:///c:/Users/maric/Documents/Alleyway-PC-Trabajo/Antigravity/tests/test_scenario_diff.py#L171), exigiendo alcanzar el stage destino, `curtain_frames > 0` y saque (0 discrepancias).
+   - Las 32 transiciones de fase (`0..31 -> 1..0`) y 16 alineaciones de VBlank (`0, 7, 16, 31`) automatizadas en [`test_all_32_curtain_transitions_and_vblank_alignments`](../tests/test_scenario_diff.py#L171), exigiendo alcanzar el stage destino, `curtain_frames > 0` y saque (0 discrepancias). Esto valida las transiciones de estado y duraciones de telón entre todas las fases y con diferentes desfasajes de VBlank, no un recorrido continuo manual de 32 fases.
 5. **Paridad Visual**:
    - 100.00% de coincidencia tono a tono (23,040 de 23,040 píxeles idénticos) frente a PyBoy en Pantalla de Título y Saque de Fase 1.
 
@@ -86,9 +86,9 @@ El lanzador:
 
 ## 3. Qué es Adaptación de Plataforma
 
-- **Presentación**: Ventana Win32 GDI con escalado entero (`StretchDIBits`) a 60 Hz en lugar de pantalla LCD DMG física.
+- **Presentación**: Ventana Win32 GDI con escalado entero (`StretchDIBits`) desacoplada del bucle de simulación; no se presupone ni se mide VSync a 60 Hz en el host, sino que se repinta bajo demanda o por tick de simulación.
 - **Entrada**: Teclado de PC mapeado a la máscara de bits de Joypad de Game Boy (`P14`/`P15`).
-- **Temporización**: Monotónica de alta precisión mediante `QueryPerformanceCounter` a ~59.7275 Hz DMG con acumulador de tiempo fraccionario en lugar de reloj de cuarzo de hardware.
+- **Temporización**: Monotónica de alta precisión mediante `QueryPerformanceCounter` para cadencia de simulación DMG (~59.7275 Hz) con acumulador de tiempo fraccionario en lugar de reloj de cuarzo de hardware.
 - **Audio**: Síntesis PCM mono a 44,100 Hz de 16 bits en buffer circular `waveOut` con generador fraccionario sin deriva (`738 + 23157/65536` muestras/frame).
 - **Modelo de Telón**: Aproximación lineal de presupuesto de ciclos (`compute_stage_curtain_dur`) que reproduce los fotogramas exactos del bucle de desempaquetado de mapa.
 
@@ -102,4 +102,4 @@ El lanzador:
 2. **Animaciones intermedias de OAM**:
    - La secuencia donde Mario corre y entra a la pala (`0x43DC` en Estado 4) y la celebración con Mario saludando en el final (`0x45BD` en Estado 9) están temporizadas de forma exacta en fotogramas, pero aún no dibujan los fotogramas de animación intermedia de los sprites.
 3. **Partidas largas manuales**:
-   - Aunque las 32 fases y sus transiciones están verificadas matemáticamente y de forma diferencial, no se ha jugado una partida manual continua de principio a fin durante 32 fases en la ventana interactiva.
+   - Lo que está verificado matemáticamente y de forma diferencial son las **32 transiciones de fase + 16 alineaciones de VBlank** y un conjunto acotado de trazas de juego activo (Fases 1, 2, 3, 4, 14, 23). No se ha realizado ni afirmado una partida manual continua de principio a fin a lo largo de las 32 fases en la ventana interactiva.

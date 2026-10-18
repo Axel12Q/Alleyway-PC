@@ -223,17 +223,21 @@ Estado: Hito 12 completado — Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verifica
 ## Checkpoint Jugable y Mapa de Reutilizacion para Codex (2026-10-17)
 - **Lanzador local (`tools/launch.py`, `launch.ps1`)**:
   - Lanzador limpio para abrir Alleyway con ROM local detectada automaticamente (`local/roms/` o `../Local-Privado/roms/`) o pasada por linea de comandos.
-  - No copia, mueve ni publica la ROM, ni altera partidas guardadas.
-  - Si no hay ROM, muestra mensaje claro en consola y arranca en modo diagnostico fallback.
+  - Hardening de `launch.ps1`: utiliza `$PSScriptRoot`, `Join-Path` y `-LiteralPath` para resolver Python y `tools/launch.py` de forma robusta ante ejecuciones desde otros directorios o rutas con espacios.
+  - Hardening de `tools/launch.py`: si el usuario especifica una ruta de ROM inexistente, reporta un error explicito a `stderr` y termina con codigo de salida 1 de inmediato sin buscar otras ROMs silenciosamente. Establece `cwd=ROOT` para la compilacion y ejecucion.
+  - Si no se especifica ROM y no existe ninguna en los directorios de busqueda, arranca en modo diagnostico fallback.
   - Imprime instrucciones completas de controles (Enter, Espacio/Z, Flechas/AD, Shift/X, R, Esc).
 - **Documento formal de Checkpoint (`docs/CHECKPOINT.md`)**:
-  - Detalla SHA, comandos de compilacion y prueba, controles, alcance probado rigurosamente (física 8.8, 44 tests, 32 telones), adaptaciones (Win32, QPC, waveOut) y limites pendientes (APU 2..4, animaciones OAM intermedias, partidas largas manuales), evitando llamarlo port completo.
+  - Detalla SHA, comandos de compilacion y prueba, controles, alcance probado rigurosamente (física 8.8, 44 tests, 32 transiciones de fase y 16 alineaciones de VBlank), adaptaciones (Win32, QPC a cadencia DMG ~59.7275 Hz desacoplada de presentacion de host, waveOut) y limites pendientes (APU 2..4, animaciones OAM intermedias, partidas largas manuales), evitando llamarlo port completo.
+  - Enlaces ajustados a rutas relativas al repositorio (sin `file:///`).
 - **Mapa de Reutilizacion para Codex (`docs/REUSABILITY_ARCHITECTURE.md`)**:
-  - Inventario exhaustivo de funciones y modulos de tiles (`src/gb_tile.h`), sintesis APU (`src/gb_apu.h`), backend de audio (`src/gb_audio_backend.h`), scheduler monotónico y generador fraccionario sin deriva (`src/gb_scheduler.h`), inspeccion de ROM (`tools/inspect_rom.py`), generador sintético (`tools/synthetic_rom.py`) y harness de comparacion diferencial (`tools/scenario_diff.py`).
-  - Delimitacion entre servicios de hardware DMG genericos y reglas/direcciones especificas de Alleyway.
-  - Lineamientos de diseno para desacoplar estos componentes hacia `GB-Native-Lab` sin modificarlo.
+  - Inventario exhaustivo auditado contra las firmas reales del codigo: `inspect`/`inspect_file` en `tools/inspect_rom.py`, `build_synthetic_rom` en `tools/synthetic_rom.py`, y `gb_tile_decode_indices`/`gb_tile_decode_pixels`/`gb_tile_blit` en `src/gb_tile.h`.
+  - Reemplazadas afirmaciones absolutas ("100% reutilizable") por clasificaciones rigurosas ("Candidato reutilizable", "Parcial", "Mixto").
+  - Delimitacion entre servicios genericos y reglas especificas de Alleyway (tablas SFX embebidas en `gb_audio_backend.h`, direcciones WRAM en `scenario_diff.py`).
+  - Documentados los requisitos reales para un compilador universal `ROM -> C -> EXE` (traductor de CPU SM83, bus de memoria, interrupciones, PPU por scanlines y APU completo).
 
 ## Siguiente paso recomendado para Codex / futuras sesiones
 1. Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido) y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
 2. Animaciones intermedias completas de metasprites OAM (entrada de Mario `0x43DC` en Estado 4 y celebracion animada del final `0x45BD` en Estado 9).
+
 

@@ -235,6 +235,8 @@ static bool g_key_right = false;
 static bool g_key_a = false;
 static bool g_key_b = false;
 static bool g_key_start = false;
+/* Keep a short key press until the next simulation frame consumes it. */
+static uint8_t g_pending_presses = 0;
 
 /* Win32 waveOut device operations implementation */
 static int win32_waveout_open(GbAudioDeviceOps *ops, uint32_t sample_rate) {
@@ -2055,9 +2057,11 @@ static void step_window_frame(void) {
     if (g_key_start) joyp_raw &= (uint8_t)~0x08u;
     if (g_key_right) joyp_raw &= (uint8_t)~0x10u;
     if (g_key_left)  joyp_raw &= (uint8_t)~0x20u;
+    joyp_raw &= (uint8_t)~g_pending_presses;
 
     /* Active-low newly pressed edge: bit is 0 iff currently 0 and previously 1 */
-    uint8_t newly_pressed_high = (uint8_t)((~joyp_raw) & g_sim.prev_joyp_raw);
+    uint8_t newly_pressed_high = (uint8_t)(((~joyp_raw) & g_sim.prev_joyp_raw) | g_pending_presses);
+    g_pending_presses = 0;
     uint8_t joyp_edge = (uint8_t)(~newly_pressed_high);
     g_sim.prev_joyp_raw = joyp_raw;
 
@@ -2075,6 +2079,13 @@ static void handle_key_change(WPARAM vk, bool down, HWND w) {
         g_sim.normal_stage_count = 0;
         g_sim.bonus_stage_count = 0;
         return;
+    }
+    if (down) {
+        if ((vk == VK_LEFT || vk == 'A') && !g_key_left) g_pending_presses |= 0x20;
+        if ((vk == VK_RIGHT || vk == 'D') && !g_key_right) g_pending_presses |= 0x10;
+        if ((vk == VK_SPACE || vk == 'Z') && !g_key_a) g_pending_presses |= 0x01;
+        if ((vk == VK_SHIFT || vk == 'X') && !g_key_b) g_pending_presses |= 0x02;
+        if (vk == VK_RETURN && !g_key_start) g_pending_presses |= 0x08;
     }
     if (vk == VK_LEFT || vk == 'A')  g_key_left = down;
     if (vk == VK_RIGHT || vk == 'D') g_key_right = down;
@@ -2174,8 +2185,9 @@ static int run_verify_window_session(const char *rom_path, const char *out_dir) 
 
     /* 1. Press Enter (VK_RETURN) on Title -> 3-tick start delay -> 221-tick Mario curtain -> Serve (State 5) */
     SendMessageW(window, WM_KEYDOWN, VK_RETURN, 0);
-    step_window_frame();
     SendMessageW(window, WM_KEYUP, VK_RETURN, 0);
+    /* Regression: both messages can arrive before the next scheduler tick. */
+    step_window_frame();
     for (int i = 0; i < 3; ++i) step_window_frame();
     if (g_sim.state != 4 || g_sim.curtain_dur != 221) { DestroyWindow(window); audio_backend_shutdown(); return 5; }
 

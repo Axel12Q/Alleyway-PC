@@ -241,3 +241,7 @@ Estado: Hito 12 completado — Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verifica
 2. Animaciones intermedias completas de metasprites OAM (entrada de Mario `0x43DC` en Estado 4 y celebracion animada del final `0x45BD` en Estado 9).
 
 
+
+2026-10-17 Codex: real desktop taps of Enter were lost when WM_KEYDOWN and WM_KEYUP drained before the simulation tick. Added a one-frame pending-press latch in codex/input-taps (separate worktree). Window regression now releases Enter before stepping; no game-rule changes. Validation recorded below after completion.
+
+Validation: all 44 tests pass, including Enter down+up before a frame; real desktop title/start/serve and right-arrow movement now work. Real short session broke one brick and lost one life. User reported lingering sound: private C probe of production wall SFX12 remained active=1 volume=15 with 4410/4410 nonzero samples in final100ms after3s. Root: static NR12=F0 / NR14=87 with neither length expiry nor envelope, missing software SFX sequence. Audio remains incomplete; no fabricated-duration fix applied.

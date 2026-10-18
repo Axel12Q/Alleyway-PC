@@ -263,6 +263,19 @@
   - **Resultados de las 32 transiciones de fase (`0..31 -> 1..0`) y 16 alineaciones de VBlank (`0, 7, 16, 31`)**: **100% de coincidencia bit a bit frente a PyBoy (0 discrepancias)**.
 - **Estado de la suite de pruebas**: **44 pruebas automatizadas ejecutadas y aprobadas (`44 OK, 0 expectedFailure`)** en ~19.1s.
 
+### Checkpoint Jugable y Mapa de Reutilización (2026-10-17)
+- **Lanzador local limpio (`tools/launch.py`, `launch.ps1`)**:
+  - Permite abrir Alleyway de forma sencilla con la ROM local del usuario (`local/roms/` o `../Local-Privado/roms/`) o especificando una ruta por parámetro.
+  - No copia, no mueve, no publica la ROM ni altera archivos de guardado.
+  - Si no se encuentra ninguna ROM, emite un mensaje claro en consola y arranca de forma segura en modo diagnóstico fallback.
+  - Imprime instrucciones claras de controles: Start (Enter), Saque/Aceleración (Espacio/Z), Pala (Flechas/AD), Precisión (Shift/X), Reinicio (R), Salir (Esc).
+- **Documento formal de Checkpoint (`docs/CHECKPOINT.md`)**:
+  - Resume SHA, comandos de compilación/ejecución, controles, qué está probado matemáticamente (física 8.8, 44 tests, 32 transiciones de telón), qué es adaptación de plataforma (Win32 GDI, QPC monotónico, waveOut) y qué falta (APU 2..4, animaciones OAM intermedias, partidas largas manuales), evitando explícitamente calificarlo de port completo.
+- **Mapa de Reutilización para Codex (`docs/REUSABILITY_ARCHITECTURE.md`)**:
+  - Tabla detallada identificando módulos/funciones de decodificación de tiles (`src/gb_tile.h`), síntesis APU (`src/gb_apu.h`), backend de audio (`src/gb_audio_backend.h`), scheduler monotónico y generador fraccionario sin deriva (`src/gb_scheduler.h`), inspección de ROM (`tools/inspect_rom.py`), generador sintético (`tools/synthetic_rom.py`) y arnés de escenarios diferenciales (`tools/scenario_diff.py`).
+  - Separación rigurosa entre servicios de hardware DMG reutilizables y reglas/direcciones de memoria propias de Alleyway.
+  - Hoja de ruta para desacoplar estos componentes hacia una biblioteca base reutilizable para el generador `ROM -> C -> EXE` de `GB-Native-Lab`.
+
 ## Lo que falta para el juego completo (siguiente paso para continuar)
 1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulación por software de barridos de tono (`0x6B76`/`0x6B8B`).
 2. **Animaciones intermedias completas de OAM en el telón (caminata y salto de Mario 0x43DC en State 4) y celebración animada del final (Mario saludando 0x45BD en State 9)**.

@@ -220,6 +220,19 @@ Estado: Hito 12 completado — Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verifica
   - **Resultados de las 32 transiciones de fase (`0..31 -> 1..0`) y 16 alineaciones de VBlank (`0, 7, 16, 31`)**: **100% de coincidencia bit a bit frente a PyBoy (0 discrepancias)**.
 - Total de la suite automatizada: **44 pruebas ejecutadas y aprobadas (`44 OK, 0 expectedFailure`)** en ~19.1s.
 
+## Checkpoint Jugable y Mapa de Reutilizacion para Codex (2026-10-17)
+- **Lanzador local (`tools/launch.py`, `launch.ps1`)**:
+  - Lanzador limpio para abrir Alleyway con ROM local detectada automaticamente (`local/roms/` o `../Local-Privado/roms/`) o pasada por linea de comandos.
+  - No copia, mueve ni publica la ROM, ni altera partidas guardadas.
+  - Si no hay ROM, muestra mensaje claro en consola y arranca en modo diagnostico fallback.
+  - Imprime instrucciones completas de controles (Enter, Espacio/Z, Flechas/AD, Shift/X, R, Esc).
+- **Documento formal de Checkpoint (`docs/CHECKPOINT.md`)**:
+  - Detalla SHA, comandos de compilacion y prueba, controles, alcance probado rigurosamente (física 8.8, 44 tests, 32 telones), adaptaciones (Win32, QPC, waveOut) y limites pendientes (APU 2..4, animaciones OAM intermedias, partidas largas manuales), evitando llamarlo port completo.
+- **Mapa de Reutilizacion para Codex (`docs/REUSABILITY_ARCHITECTURE.md`)**:
+  - Inventario exhaustivo de funciones y modulos de tiles (`src/gb_tile.h`), sintesis APU (`src/gb_apu.h`), backend de audio (`src/gb_audio_backend.h`), scheduler monotónico y generador fraccionario sin deriva (`src/gb_scheduler.h`), inspeccion de ROM (`tools/inspect_rom.py`), generador sintético (`tools/synthetic_rom.py`) y harness de comparacion diferencial (`tools/scenario_diff.py`).
+  - Delimitacion entre servicios de hardware DMG genericos y reglas/direcciones especificas de Alleyway.
+  - Lineamientos de diseno para desacoplar estos componentes hacia `GB-Native-Lab` sin modificarlo.
+
 ## Siguiente paso recomendado para Codex / futuras sesiones
 1. Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido) y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).
 2. Animaciones intermedias completas de metasprites OAM (entrada de Mario `0x43DC` en Estado 4 y celebracion animada del final `0x45BD` en Estado 9).

@@ -406,8 +406,26 @@ def run_stage_curtain_transition_diff(exe, rom_path, from_stage, vblank_offset=N
             raise RuntimeError(f"snapshot failed for stage {from_stage}")
 
         next_stage = (from_stage + 1) & 0x1F
-        max_frames = 2250 if from_stage == 31 else 800
+        max_frames = 2500 if from_stage == 31 else 1500
         for _ in range(max_frames):
+            if gb.memory[0xFFA4] == 6:
+                bx = gb.memory[0xFFB6]
+                px = gb.memory[0xFFC0]
+                pw = gb.memory[0xFFC2]
+                tx = bx - (pw // 2)
+                if px < tx - 1:
+                    gb.button_press("right")
+                    gb.button_release("left")
+                elif px > tx + 1:
+                    gb.button_press("left")
+                    gb.button_release("right")
+                else:
+                    gb.button_release("left")
+                    gb.button_release("right")
+            else:
+                gb.button_release("left")
+                gb.button_release("right")
+
             state["vblank_rec"] = None
             gb.tick()
             if state["vblank_rec"] is not None:
@@ -423,9 +441,33 @@ def run_stage_curtain_transition_diff(exe, rom_path, from_stage, vblank_offset=N
 
     inputs = [(r["in_joyp_raw"], r["in_joyp_edge"]) for r in records]
     native = run_native(exe, rom_path, state["snap"], inputs, workdir)
-    mismatch = compare(records, native, check_prng=True, compare_play=False)
     exp_curtain = sum(1 for r in records if r["state"] == 4)
     nat_curtain = sum(1 for r in native if r["state"] == 4)
+
+    orig_done = len(records) > 0 and records[-1]["state"] == 5 and records[-1]["stage"] == next_stage and exp_curtain > 0
+    nat_done = len(native) > 0 and native[-1]["state"] == 5 and native[-1]["stage"] == next_stage and nat_curtain > 0
+
+    if not orig_done or not nat_done:
+        mismatch = {
+            "error": "inconclusive_scenario",
+            "from_stage": from_stage,
+            "next_stage": next_stage,
+            "orig_done": orig_done,
+            "nat_done": nat_done,
+            "orig_final": (records[-1]["state"], records[-1]["stage"]) if records else None,
+            "nat_final": (native[-1]["state"], native[-1]["stage"]) if native else None,
+            "exp_curtain": exp_curtain,
+            "nat_curtain": nat_curtain,
+        }
+    else:
+        mismatch = compare(records, native, check_prng=True, compare_play=False)
+        if mismatch is None and exp_curtain != nat_curtain:
+            mismatch = {
+                "field": "curtain_frames",
+                "expected": exp_curtain,
+                "native": nat_curtain,
+            }
+
     return {
         "from_stage": from_stage,
         "next_stage": next_stage,

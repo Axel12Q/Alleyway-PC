@@ -168,6 +168,31 @@ class OriginalVsNativeDifferentialTests(unittest.TestCase):
         self.assertEqual((nat23[0]["row_offset"], nat23[-1]["row_offset"]), (20, 19))
         self.assertLess(nat23[-1]["bricks_left"], nat23[0]["bricks_left"])
 
+    def test_all_32_curtain_transitions_and_vblank_alignments(self):
+        """Validate compute_stage_curtain_dur and state transitions across all 32 stages
+        (next_stage = 0..31 via from_stage = 0..31), plus initial VBlank alignments (0, 7, 16, 31).
+        Every scenario must reach next_stage, spend > 0 frames in State 4 (curtain),
+        and terminate in State 5 with bit-exact parity between Original (PyBoy) and Native C."""
+        transitions, alignments = sd.verify_all_32_curtain_transitions(EXE_PATH, LOCAL_ROM)
+        self.assertEqual(len(transitions), 32)
+        for res in transitions:
+            self.assertIsNone(
+                res["mismatch"],
+                f"Stage {res['from_stage']} -> {res['next_stage']} mismatch: {res['mismatch']} "
+                f"(runs_exp={res['expected_runs']}, runs_nat={res['native_runs']})"
+            )
+            self.assertGreater(res["expected_curtain_frames"], 0)
+            self.assertEqual(res["expected_curtain_frames"], res["native_curtain_frames"])
+
+        self.assertEqual(len(alignments), 16)
+        for res in alignments:
+            self.assertIsNone(
+                res["mismatch"],
+                f"Stage {res['from_stage']} -> {res['next_stage']} (offset={res['vblank_offset']}) mismatch: {res['mismatch']}"
+            )
+            self.assertGreater(res["expected_curtain_frames"], 0)
+            self.assertEqual(res["expected_curtain_frames"], res["native_curtain_frames"])
+
     def test_mutation_without_timer_initialisation_fails_differential(self):
         """Mutation check: a build whose stage1_enter_state() never loads state_timer must FAIL
         the same differential (the mutated copy lives only in build/, never in Git)."""

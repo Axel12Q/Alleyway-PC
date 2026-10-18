@@ -204,15 +204,21 @@ Estado: Hito 12 completado — Fases 1, 2, 3, 4, 8, 12, 14, 16, 23 y 32 verifica
   - **Pantalla de Titulo (`State 2`)**: **100.00% de coincidencia** (23,040 de 23,040 pixeles identicos, 0 diferencias).
   - **Pantalla de Saque Fase 1 (`State 5`)**: **100.00% de coincidencia** (23,040 de 23,040 pixeles identicos, 0 diferencias).
 - **Sesion de ventana Win32 verificada de extremo a extremo (`--verify-window-session`)**:
-  - Prueba automatizada que crea la ventana real `HWND`, procesa mensajes Win32, despacha `WM_PAINT`, ejecuta eventos `WM_KEYDOWN`/`WM_KEYUP` para Start (`VK_RETURN`), movimiento (`VK_RIGHT`), saque (`VK_SPACE`), pausa/reanudacion (`VK_RETURN`), reinicio (`R`) y cierre (`Esc`), comprobando el cierre ordenado y el apagado seguro de audio `waveOut`.
-- **Medicion de duraciones de telon en las 32 fases (`tools/scenario_diff.py`)**:
-  - Modelo lineal de ciclos `(next_bonus ? 98 : 65) + (rows * 14 + nonempty * 5) / 390` evaluado frente a fotogramas observados en PyBoy:
-    - Fases normales: `66..70` fotogramas observados (`0` fotogramas de discrepancia frente al modelo).
-    - Fases de bonus: `100..101` fotogramas observados (`0` fotogramas de discrepancia).
-    - Entrada desde Titulo (Fase 1): `221` fotogramas observados (`66 + 155` de entrada de Mario `0x43DC`).
-    - Retorno de Ending: `66` fotogramas observados (`0` discrepancias).
-    - Alineaciones de VBlank (`0, 7, 16, 31`): `0` discrepancias.
-- Total de la suite automatizada: **43 pruebas ejecutadas y aprobadas (`43 OK, 0 expectedFailure`)** en ~6.3s.
+  - Prueba automatizada que crea la ventana real `HWND`, procesa la bomba de mensajes Win32 (`PeekMessageW`/`TranslateMessage`/`DispatchMessageW`), despacha `WM_PAINT`, y despacha eventos sinteticos `WM_KEYDOWN`/`WM_KEYUP` para Start (`VK_RETURN`), movimiento (`VK_RIGHT`), saque (`VK_SPACE`), pausa/reanudacion (`VK_RETURN`), reinicio (`R`) y cierre (`Esc`), comprobando el cierre ordenado y el apagado seguro de audio `waveOut`.
+  - *Alcance delimitado*: valida la integracion con la API de ventanas y la bomba de mensajes del SO; **NO valida pulsacion fisica en teclado ni captura acustica de audio por microfono**.
+
+## Hito 14 (2026-10-17): Resolucion de colision multi-bloque en Fase 17 y suite automatizada de telones en 32 fases
+- **Resolucion autentica de la colision multi-bloque (`0x09F9 -> 0x023D`) en `src/main.c`**:
+  - Investigacion de la discrepancia de tick 85 en Fase 17 (`runs_exp = [(6, 85), (8, 146), (4, 68), (5, 1)]` vs `runs_nat = [(6, 85), (8, 145), (4, 68), (5, 2)]`, primer mismatch `tick 85 prng expected 104 native 169 state 8`).
+  - Al destruir un segundo bloque en el mismo fotograma (colisiones de esquina con dos bloques), la subrutina `0x09F9` llama a `0x023D`, la cual comprueba `0xFFA3` (`vram_brick_dirty`). Si esta activo, ejecuta `JR 0x0221` (`HALT`), deteniendo la CPU en espera del siguiente VBlank antes de decrementar `bricks_left` (`0xFFC8`) en `0x0E68` y aplicar el rebote.
+  - Durante este `HALT`, el VBlank del tick 85 muestrea `state = 8`, `prng = 104` (sin avanzar en `0x0522`), `bricks_left = 0` y `ball = (28, 91)` antes del rebote vertical. En tick 86, la CPU reanuda: decrementa `bricks_left` de `0` a `65535` (`0xFFFF`), ejecuta el rebote vertical a `ball_y = 92`, avanza `prng` a `169` y comienza la cuenta de 145 fotogramas de `State 8`, totalizando **146 fotogramas**.
+  - Implementado en `src/main.c` mediante los campos `vram_brick_dirty` y `multi_brick_pending`, logrando paridad bit a bit estricta sin excepciones por numero de fase ni muletas en pruebas.
+- **Suite automatizada de telones en las 32 fases y alineaciones de VBlank (`test_all_32_curtain_transitions_and_vblank_alignments`)**:
+  - Integrada en `tests/test_scenario_diff.py` como prueba formal de regresion continua (44 pruebas en total).
+  - En `tools/scenario_diff.py` (`run_stage_curtain_transition_diff`), se incorporo seguimiento activo de bola con la paleta durante `state == 6`, garantizando que la bola alcance los bloques objetivo sin caer prematuramente en fases complejas (como fases 28, 29 y 30 que anteriormente terminaban en perdida de vida con 0 frames de telon).
+  - Condicion de fallo estricta: la prueba exige alcanzar `next_stage`, pasar por `state == 4` con duracion `curtain > 0`, y terminar en `state == 5` de saque. Cualquier escenario inconcluso se reporta como fallo de discrepancia (`mismatch`).
+  - **Resultados de las 32 transiciones de fase (`0..31 -> 1..0`) y 16 alineaciones de VBlank (`0, 7, 16, 31`)**: **100% de coincidencia bit a bit frente a PyBoy (0 discrepancias)**.
+- Total de la suite automatizada: **44 pruebas ejecutadas y aprobadas (`44 OK, 0 expectedFailure`)** en ~19.1s.
 
 ## Siguiente paso recomendado para Codex / futuras sesiones
 1. Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido) y modulacion por software de barridos de tono (`0x6B76`/`0x6B8B`).

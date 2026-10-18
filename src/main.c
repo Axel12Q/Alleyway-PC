@@ -73,6 +73,8 @@ typedef struct {
     uint8_t prev_joyp_raw;
     uint8_t sfx_trigger; /* Queued SFX ID (0 = none, 7 = paddle bounce, 12 = wall bounce, etc.) */
     uint8_t up_index;    /* Index in 0x1B5D 1-UP score table */
+    uint8_t vram_brick_dirty;    /* 0xFFA3: set when a brick destroy queues a VRAM update in current frame */
+    uint8_t multi_brick_pending; /* 0x023D: 2nd brick destroyed in same frame waits 1 VBlank before 0x0E64 */
     uint8_t row_shift[20];   /* Pixel shift for each of the 20 visible rows (0xCA00..0xCA13) */
     uint8_t row_pattern[20]; /* Row speed & direction pattern (0xCA14..0xCA27) */
     uint8_t row_timer[20];   /* Row timer / step period (0xCA28..0xCA3B) */
@@ -459,6 +461,8 @@ static void stage1_reset_for_play(AlleywayStage1 *s) {
     s->sfx_trigger = 0;
     s->up_index = 0;
     s->vblank_count = 0;
+    s->vram_brick_dirty = 0;
+    s->multi_brick_pending = 0;
     load_stage_grid(s);
 }
 
@@ -616,13 +620,28 @@ static void bounce_horizontal(AlleywayStage1 *s) {
     s->ball_prev_x = s->ball_x;
 }
 
+enum {
+    BRICK_HIT_NONE = 0,
+    BRICK_HIT_SOLID = 1,
+    BRICK_DESTROYED = 2,
+    BRICK_DESTROYED_HALTED = 3
+};
+
+enum {
+    PENDING_BOUNCE_NONE = 1,
+    PENDING_BOUNCE_VERT = 2,
+    PENDING_BOUNCE_HORIZ = 3,
+    PENDING_SNAP_X_POS = 4,
+    PENDING_SNAP_X_NEG = 5
+};
+
 static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe) {
     uint8_t scroll_y = (uint8_t)((s->row_offset << 2) & 0xFFu);
     uint8_t a1 = (uint8_t)(y_probe - 0x18u);
     uint16_t a2_full = (uint16_t)a1 + (uint16_t)scroll_y;
-    if (a2_full > 0xFFu) return 0;
+    if (a2_full > 0xFFu) return BRICK_HIT_NONE;
     uint8_t row = (uint8_t)((a2_full & 0xFFu) >> 2);
-    if (row >= GRID_ROWS) return 0;
+    if (row >= GRID_ROWS) return BRICK_HIT_NONE;
 
     /* Authentic horizontal shift from row_shift[row - row_offset] */
     uint8_t shift = 0;
@@ -633,11 +652,11 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
     uint8_t x_rel = (uint8_t)((uint8_t)(x_probe - 0x10u) + shift);
     if (x_rel >= 0x70u) x_rel = (uint8_t)(x_rel - 0x70u);
     uint8_t col = (uint8_t)(x_rel >> 3);
-    if (col >= GRID_COLS) return 0;
+    if (col >= GRID_COLS) return BRICK_HIT_NONE;
 
     int idx = (int)row * GRID_COLS + (int)col;
     uint8_t btype = s->grid_type[idx];
-    if (btype == 0) return 0;
+    if (btype == 0) return BRICK_HIT_NONE;
 
     uint8_t min_spd = s->rom[0x1B87u + (uint16_t)(btype - 1u) * 6u + 4u];
     if (min_spd != 0 && s->speed_idx < min_spd) {
@@ -652,13 +671,13 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
             reindex_velocity_random_angle(s);
             s->indestructible_hits = 0;
         }
-        return 1;
+        return BRICK_HIT_SOLID;
     }
 
     if (s->bonus_flag == 0) {
         hp--;
         s->grid_hp[idx] = hp;
-        if (hp != 0) return 0;
+        if (hp != 0) return BRICK_HIT_NONE;
     }
 
     s->grid_type[idx] = 0;
@@ -671,17 +690,23 @@ static int check_brick_point(AlleywayStage1 *s, uint8_t y_probe, uint8_t x_probe
 
     (void)check_1up_threshold(s);
 
-    if (s->bricks_left > 0) {
-        s->bricks_left--;
+    if (s->vram_brick_dirty != 0) {
+        /* In Alleyway DMG (0x0E5F: CALL 0x09F9 -> CALL 0x023D), destroying a 2nd brick
+         * in the same frame finds 0xFFA3 != 0 and executes HALT (0x0221) waiting for VBlank
+         * before decrementing 0xFFC8 (bricks_left) at 0x0E68 and executing the probe bounce! */
+        return BRICK_DESTROYED_HALTED;
     }
+
+    s->vram_brick_dirty = 1;
+    s->bricks_left = (uint16_t)(s->bricks_left - 1u);
     if (s->bricks_left == 0) {
         stage1_enter_state(s, 8u);
     }
     /* Authentic Alleyway brick hit sound: byte 5 of 0x1B87 brick properties */
     uint8_t sfx_id = (btype <= 3) ? btype : 1;
     s->sfx_trigger = sfx_id;
-    if (s->bonus_flag != 0) return 0;
-    return 1;
+    if (s->bonus_flag != 0) return BRICK_HIT_NONE;
+    return BRICK_DESTROYED;
 }
 
 static void step_paddle_bounce_vertical_drop(AlleywayStage1 *s) {
@@ -727,6 +752,7 @@ static void step_paddle_bounce_vertical_drop(AlleywayStage1 *s) {
 }
 
 static void step_ball_and_collisions(AlleywayStage1 *s) {
+    s->vram_brick_dirty = 0;
     s->ball_prev_y = s->ball_y;
     uint16_t y16 = (uint16_t)((((uint16_t)s->ball_y << 8) | (uint16_t)s->ball_y_sub) + s->ball_vy);
     s->ball_y = (uint8_t)(y16 >> 8);
@@ -792,38 +818,78 @@ static void step_ball_and_collisions(AlleywayStage1 *s) {
     for (int pass = 0; pass < 2; ++pass) {
         int hits = 0;
         if ((s->ball_vx & 0x8000u) == 0) {
-            if (check_brick_point(s, s->ball_prev_y, (uint8_t)(s->ball_x + 3u))) {
+            int res = check_brick_point(s, s->ball_prev_y, (uint8_t)(s->ball_x + 3u));
+            if (res == BRICK_DESTROYED_HALTED) {
+                s->multi_brick_pending = PENDING_BOUNCE_HORIZ;
+                return;
+            } else if (res != BRICK_HIT_NONE) {
                 hits++;
                 bounce_horizontal(s);
-            } else if (check_brick_point(s, s->ball_prev_y, s->ball_x)) {
-                hits++;
-                if ((s->ball_vx & 0x8000u) != 0) snap_x_positive(s);
-                else snap_x_negative(s);
+            } else {
+                res = check_brick_point(s, s->ball_prev_y, s->ball_x);
+                if (res == BRICK_DESTROYED_HALTED) {
+                    s->multi_brick_pending = ((s->ball_vx & 0x8000u) != 0) ? PENDING_SNAP_X_POS : PENDING_SNAP_X_NEG;
+                    return;
+                } else if (res != BRICK_HIT_NONE) {
+                    hits++;
+                    if ((s->ball_vx & 0x8000u) != 0) snap_x_positive(s);
+                    else snap_x_negative(s);
+                }
             }
         } else {
-            if (check_brick_point(s, s->ball_prev_y, s->ball_x)) {
+            int res = check_brick_point(s, s->ball_prev_y, s->ball_x);
+            if (res == BRICK_DESTROYED_HALTED) {
+                s->multi_brick_pending = PENDING_BOUNCE_HORIZ;
+                return;
+            } else if (res != BRICK_HIT_NONE) {
                 hits++;
                 bounce_horizontal(s);
-            } else if (check_brick_point(s, s->ball_prev_y, (uint8_t)(s->ball_x + 3u))) {
-                hits++;
-                if ((s->ball_vx & 0x8000u) != 0) snap_x_positive(s);
-                else snap_x_negative(s);
+            } else {
+                res = check_brick_point(s, s->ball_prev_y, (uint8_t)(s->ball_x + 3u));
+                if (res == BRICK_DESTROYED_HALTED) {
+                    s->multi_brick_pending = ((s->ball_vx & 0x8000u) != 0) ? PENDING_SNAP_X_POS : PENDING_SNAP_X_NEG;
+                    return;
+                } else if (res != BRICK_HIT_NONE) {
+                    hits++;
+                    if ((s->ball_vx & 0x8000u) != 0) snap_x_positive(s);
+                    else snap_x_negative(s);
+                }
             }
         }
 
         if ((s->ball_vy & 0x8000u) == 0) {
-            if (check_brick_point(s, (uint8_t)(s->ball_y + 3u), s->ball_prev_x)) {
+            int res = check_brick_point(s, (uint8_t)(s->ball_y + 3u), s->ball_prev_x);
+            if (res == BRICK_DESTROYED_HALTED) {
+                s->multi_brick_pending = PENDING_BOUNCE_VERT;
+                return;
+            } else if (res != BRICK_HIT_NONE) {
                 hits++;
                 bounce_vertical(s);
-            } else if (check_brick_point(s, s->ball_y, s->ball_prev_x)) {
-                hits++;
+            } else {
+                res = check_brick_point(s, s->ball_y, s->ball_prev_x);
+                if (res == BRICK_DESTROYED_HALTED) {
+                    s->multi_brick_pending = PENDING_BOUNCE_NONE;
+                    return;
+                } else if (res != BRICK_HIT_NONE) {
+                    hits++;
+                }
             }
         } else {
-            if (check_brick_point(s, s->ball_y, s->ball_prev_x)) {
+            int res = check_brick_point(s, s->ball_y, s->ball_prev_x);
+            if (res == BRICK_DESTROYED_HALTED) {
+                s->multi_brick_pending = PENDING_BOUNCE_VERT;
+                return;
+            } else if (res != BRICK_HIT_NONE) {
                 hits++;
                 bounce_vertical(s);
-            } else if (check_brick_point(s, (uint8_t)(s->ball_y + 3u), s->ball_prev_x)) {
-                hits++;
+            } else {
+                res = check_brick_point(s, (uint8_t)(s->ball_y + 3u), s->ball_prev_x);
+                if (res == BRICK_DESTROYED_HALTED) {
+                    s->multi_brick_pending = PENDING_BOUNCE_NONE;
+                    return;
+                } else if (res != BRICK_HIT_NONE) {
+                    hits++;
+                }
             }
         }
 
@@ -877,6 +943,26 @@ static void step_stage_timers(AlleywayStage1 *s) {
 static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint8_t joyp_edge, uint8_t elapsed_vblanks) {
     s->vblank_count = (uint8_t)(s->vblank_count + elapsed_vblanks);
     s->sfx_trigger = 0;
+    if (s->multi_brick_pending != 0) {
+        uint8_t pending_action = s->multi_brick_pending;
+        s->multi_brick_pending = 0;
+        s->vram_brick_dirty = 0;
+        s->bricks_left = (uint16_t)(s->bricks_left - 1u);
+        if (s->bricks_left == 0) {
+            stage1_enter_state(s, 8u);
+        }
+        if (pending_action == PENDING_BOUNCE_VERT) {
+            bounce_vertical(s);
+        } else if (pending_action == PENDING_BOUNCE_HORIZ) {
+            bounce_horizontal(s);
+        } else if (pending_action == PENDING_SNAP_X_POS) {
+            snap_x_positive(s);
+        } else if (pending_action == PENDING_SNAP_X_NEG) {
+            snap_x_negative(s);
+        }
+        step_prng(s);
+        return;
+    }
     /* Verified by disassembly (0x0505..0x0525, 0x0773..0x0804) & VBlank ISR (0x01EF) sampling:
      * 0x0522: CALL 0x0505 advances PRNG (0xFFA1) when a state handler executes RET back to the
      * main dispatch loop:
@@ -919,9 +1005,11 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
         step_horizontal_scroll(s);
         step_stage_timers(s);
         step_ball_and_collisions(s);
-        update_paddle(s, joyp_raw);
-        if ((joyp_edge & 0x08u) == 0) {
-            s->state = 0x0C; /* Pause */
+        if (s->multi_brick_pending == 0) {
+            update_paddle(s, joyp_raw);
+            if ((joyp_edge & 0x08u) == 0) {
+                s->state = 0x0C; /* Pause */
+            }
         }
     } else if (s->state == 0x0C) {
         if ((joyp_edge & 0x08u) == 0) {
@@ -1023,8 +1111,9 @@ static void stage1_step_tick_scheduler(AlleywayStage1 *s, uint8_t joyp_raw, uint
     }
     const bool suppress_serve_frame1_prng = (entry_state == 5 && s->serve_pending != 0);
     const bool suppress_life_lost_7_to_11_prng = (entry_state == 7 && s->state == 0x0B && s->game_over == 0);
-    if ((play_loop_tick && !suppress_serve_frame1_prng) ||
-        (entry_state != s->state && (is_timed_state(entry_state) || entry_state == 2) && !suppress_life_lost_7_to_11_prng)) {
+    if (s->multi_brick_pending == 0 &&
+        ((play_loop_tick && !suppress_serve_frame1_prng) ||
+         (entry_state != s->state && (is_timed_state(entry_state) || entry_state == 2) && !suppress_life_lost_7_to_11_prng))) {
         step_prng(s);
     }
 }

@@ -239,23 +239,29 @@
   - **Pantalla de Título (`State 2`, `test_title_screen_bit_exact_visual_parity`)**: **100.00% de coincidencia** (23,040 de 23,040 píxeles idénticos tono a tono, 0 diferencias).
   - **Pantalla de Saque Fase 1 (`State 5`, `test_stage1_serve_bit_exact_visual_parity`)**: **100.00% de coincidencia** (23,040 de 23,040 píxeles idénticos tono a tono, 0 diferencias).
 - **Sesión de ventana Win32 verificada de extremo a extremo (`--verify-window-session`)**:
-  - Crea ventana real HWND (`CreateWindowW`, `ShowWindow`, `PeekMessageW`/`DispatchMessageW`), inicializa audio `waveOut`, renderiza Pantalla de Título mediante `WM_PAINT`, envía eventos reales `WM_KEYDOWN`/`WM_KEYUP` para:
-    1. Enter (`VK_RETURN`, Start): delay de 3 fotogramas -> telón de entrada de Mario (`221` fotogramas) -> Saque (`State 5`, vidas 4, stage 0).
-    2. Flecha derecha (`VK_RIGHT` durante 5 fotogramas): movimiento de pala (`paddle_x: 40 -> 55`).
-    3. Espacio (`VK_SPACE`): saque a juego activo (`State 6`) disparando efecto de sonido SFX 7.
-    4. Enter (`VK_RETURN`): pausa a `State 0x0C` (verifica que la bola queda congelada 5 fotogramas) y reanudación a `State 6`.
-    5. Tecla `R`: reinicio directo a saque de Fase 1 (`paddle_x = 40`).
-    6. Tecla `Esc`: cierre ordenado (`DestroyWindow`) y apagado seguro de audio (`audio_backend_shutdown`).
-- **Validación de la duración de telón (`State 4`) en las 32 fases (`tools/scenario_diff.py`)**:
-  - **Modelo lineal de presupuesto de ciclos (`compute_stage_curtain_dur`)**: en el original, el desempaquetado de mapa (`0x0942..0x09E0`) corre con la pantalla activa y dura `(next_bonus ? 98 : 65) + (rows * 14 + nonempty * 5) / 390` fotogramas. Se documenta explícitamente que es una aproximación empírica lineal del bucle de CPU (no un emulador ciclo a ciclo de hardware).
-  - **Tabla de mediciones en PyBoy (fotogramas observados en frontera atómica VBlank 0x01EF) vs Modelo**:
-    - Fases normales (1..3, 5..7, 9..11, 13..15, 17..19, 21..23, 25..27, 29..31): `66..70` fotogramas observados (`diff = 0` fotogramas frente al modelo en todas las fases cuando no hay Mario entrance).
-    - Fases de bonus (4, 8, 12, 16, 20, 24, 28, 32): `100..101` fotogramas observados (`diff = 0`).
-    - Entrada desde Título a Fase 1: `221` fotogramas observados (`66 + 155` de entrada de Mario `0x43DC`).
-    - Retorno tras Ending (Fase 32 -> 1): `66` fotogramas observados (`diff = 0`).
-    - Alineaciones de VBlank (`vblank_count = 0, 7, 16, 31`): `diff = 0`.
-  - *Límite documentado*: este test valida las transiciones y cadencia del telón de las 32 fases, no una partida jugada completa de las 32 fases.
-- **Estado de la suite de pruebas**: **43 pruebas automatizadas ejecutadas y aprobadas (`43 OK, 0 expectedFailure`)** en ~6.3s.
+  - Valida la integración de extremo a extremo con el subsistema de ventanas del sistema operativo Windows:
+    - Creación de ventana HWND nativa (`CreateWindowW`, `ShowWindow`).
+    - Procedimiento de ventana (`WndProc`), bucle y bomba de mensajes de Win32 (`PeekMessageW`/`TranslateMessage`/`DispatchMessageW`).
+    - Despacho y procesamiento de mensajes de repintado (`WM_PAINT` con `StretchDIBits`) y eventos sintéticos de entrada (`WM_KEYDOWN`/`WM_KEYUP`) inyectados a la cola de mensajes para:
+      1. Enter (`VK_RETURN`, Start): delay de 3 fotogramas -> telón de entrada de Mario (`221` fotogramas) -> Saque (`State 5`, vidas 4, stage 0).
+      2. Flecha derecha (`VK_RIGHT` durante 5 fotogramas): movimiento de pala (`paddle_x: 40 -> 55`).
+      3. Espacio (`VK_SPACE`): saque a juego activo (`State 6`) disparando efecto de sonido SFX 7.
+      4. Enter (`VK_RETURN`): pausa a `State 0x0C` (verifica que la bola queda congelada 5 fotogramas) y reanudación a `State 6`.
+      5. Tecla `R`: reinicio directo a saque de Fase 1 (`paddle_x = 40`).
+      6. Tecla `Esc`: cierre ordenado (`DestroyWindow`) y apagado seguro de audio (`audio_backend_shutdown`).
+  - *Aclaración explícita de límites*: esta prueba valida la bomba de mensajes, los procedimientos de ventana y el despacho de eventos de la API de Win32; **NO valida pulsación física de teclas en un teclado por un usuario ni captura acústica de ondas sonoras mediante micrófono**.
+
+### Hito 14: Verificación automatizada de telones en las 32 fases, alineaciones de VBlank y resolución de colisión multi-bloque en Fase 17
+- **Resolución auténtica de la colisión multi-bloque (`0x09F9 -> 0x023D`) en `src/main.c`**:
+  - En el cartucho DMG (`0x0E5F`), destruir un bloque llama a `0x09F9`. Al destruir un segundo bloque dentro del mismo fotograma (colisión en esquina con dos bloques en un solo paso de física), la subrutina `0x023D` comprueba `0xFFA3` (`vram_brick_dirty`). Al estar activo por el primer bloque, ejecuta `JR 0x0221` (`HALT`), deteniendo la CPU en espera del siguiente VBlank antes de decrementar `bricks_left` (`0xFFC8`) en `0x0E68` y rebotar.
+  - Esto explicaba la divergencia observada en Fase 17 tick 85: en el original, el tick 85 se muestreó durante el `HALT` con `state = 8`, `prng = 104` (sin avanzar en `0x0522`), `bricks_left = 0` y `ball = (28, 91)` antes del rebote vertical. En tick 86, la CPU reanuda: decrementa `bricks_left` de `0` a `65535` (`0xFFFF`), ejecuta el rebote vertical a `ball_y = 92`, avanza `prng` a `169` y comienza la cuenta de 145 fotogramas de `State 8`, totalizando **146 fotogramas** (`(8, 146)`).
+  - Implementado en `src/main.c` mediante los campos `vram_brick_dirty` y `multi_brick_pending`, logrando paridad bit a bit estricta (`runs_exp = runs_nat = [(6, 85), (8, 146), (4, 68), (5, 1)]`) sin excepciones por número de fase ni muletas en pruebas.
+- **Suite automatizada de telones en las 32 fases y alineaciones de VBlank (`test_all_32_curtain_transitions_and_vblank_alignments`)**:
+  - Integrada en `tests/test_scenario_diff.py` como prueba formal de regresión continua (elevando la suite a 44 pruebas).
+  - En `tools/scenario_diff.py` (`run_stage_curtain_transition_diff`), se incorporó seguimiento activo de bola con la paleta durante `state == 6`, garantizando que la bola alcance los bloques objetivo sin caer prematuramente en fases complejas (como fases 28, 29 y 30 que anteriormente terminaban en pérdida de vida con 0 frames de telón).
+  - Condición de fallo estricta: la prueba exige alcanzar `next_stage`, pasar por `state == 4` con duración `curtain > 0`, y terminar en `state == 5` de saque. Cualquier escenario inconcluso se reporta como fallo de discrepancia (`mismatch`).
+  - **Resultados de las 32 transiciones de fase (`0..31 -> 1..0`) y 16 alineaciones de VBlank (`0, 7, 16, 31`)**: **100% de coincidencia bit a bit frente a PyBoy (0 discrepancias)**.
+- **Estado de la suite de pruebas**: **44 pruebas automatizadas ejecutadas y aprobadas (`44 OK, 0 expectedFailure`)** en ~19.1s.
 
 ## Lo que falta para el juego completo (siguiente paso para continuar)
 1. **Canales adicionales APU (Canal 2 pulso, Canal 3 onda programable, Canal 4 ruido)** y modulación por software de barridos de tono (`0x6B76`/`0x6B8B`).

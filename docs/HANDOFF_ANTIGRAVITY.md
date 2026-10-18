@@ -50,7 +50,9 @@ accelerate future Game Boy native ports.
 - Reusable monotonic real-time DMG scheduler and fractional audio generator (`src/gb_scheduler.h`) with fixed-step accumulation, 59.7275 Hz exact timing, and zero-drift 44,100 Hz fractional sample synthesis (`738 + 23157/65536`).
 - Authentic ROM-driven presentation for Title (`State 2`), Stage 1 Serve (`State 5`), playfield BG/Window, and OAM sprites decoding the 6 KiB VRAM tilebank from `ROM[0x4B75..0x6374]` via Nintendo display list interpreter (`0x02C1`).
 - Bit-exact visual parity verified shade-by-shade against PyBoy on both Title (`State 2`, 100.00% match) and Stage 1 Serve (`State 5`, 100.00% match) via `tests/test_visual_parity.py`.
-- End-to-end Win32 windowed session verification (`--verify-window-session`) testing CreateWindowW, WM_PAINT, QPC scheduler, keyboard input (Start, Move, Serve, Pause, Resume, Reset, Esc), and safe waveOut audio shutdown.
+- End-to-end Win32 windowed session verification (`--verify-window-session`) testing CreateWindowW, WM_PAINT, QPC scheduler, synthetic keyboard input message dispatch (Start, Move, Serve, Pause, Resume, Reset, Esc), and safe waveOut audio shutdown. (Scope: validates Win32 message pump, window procedures, and event dispatch; does not validate physical keyboard finger presses nor acoustic microphone capture).
+- Full 32-stage curtain transition and 16 VBlank alignment automated test (`test_all_32_curtain_transitions_and_vblank_alignments` in `tests/test_scenario_diff.py`): executes both PyBoy and native C with active ball tracking, strictly requiring reaching the destination stage, `curtain_frames > 0`, and terminating in State 5 serve (0 mismatches across all 32 transitions and 16 alignments).
+- Authentic DMG multi-brick collision resolution (`0x09F9 -> 0x023D: LDH A, (0xFFA3)` HALT until next VBlank) in `src/main.c`, matching Stage 17 tick 85/86 bit-for-bit without stage-number hacks.
 - Deterministic input timeline, hardware register/watchpoint tracer (`tools/capture_reference.py`).
 - Trace and metadata comparator (`tools/compare_traces.py`).
 - Differential RAM scanner and time-series correlation finder (`tools/scan_ram.py`).
@@ -59,17 +61,17 @@ accelerate future Game Boy native ports.
 - Cartridge header, size, bank alignment, and checksum inspector (`tools/inspect_rom.py`).
 - GitHub Actions CI workflow running on Windows with synthetic fixtures only.
 - Local user dump verified at `../Local-Privado/roms/Alleyway (USA).gb`.
-- Test suite: **43 automated tests passing (`43 OK, 0 expectedFailure`)**.
+- Test suite: **44 automated tests passing (`44 OK, 0 expectedFailure`)**.
 
 ## Evidence vs Limits
 
 - **Verified by C vs PyBoy differential execution & visual parity**:
   - Title Screen (`State 2`): 100.00% bit-exact pixel/shade match (23,040 / 23,040 pixels, 0 diffs).
   - Stage 1 Serve Screen (`State 5`): 100.00% bit-exact pixel/shade match (23,040 / 23,040 pixels, 0 diffs).
-  - Win32 Window Session (`--verify-window-session`): 100% verified e2e through real window creation, WM_PAINT, scheduler, controls, and audio shutdown.
+  - Win32 Window Session (`--verify-window-session`): 100% verified e2e through real window creation, message pump, WM_PAINT, scheduler, controls dispatch, and audio shutdown (not physical keyboard/microphone).
   - Stages 1..4 active play traces (`--verify-trace`: 5,651 ticks Stage 1, 739 ticks Stage 2, 2,138 ticks Stage 3, 140+ ticks Stage 4).
   - 12 full differential scenarios (`--run-scenario` via `tests/test_scenario_diff.py` across Stages 1, 4, 8, 12, 14, 16, 23, and 32) with `0 mismatches` including `prng`.
-  - 32-stage curtain duration model validated against observed PyBoy frames (`diff = 0` across all 32 stages, Title entry 221f, Ending return 66f, and VBlank alignments 0, 7, 16, 31). Note: this validates stage transition and curtain timing, not a full 32-stage active gameplay playthrough.
+  - 32 stage transitions and curtain timing (`0..31 -> 1..0`) and 16 VBlank alignments (`0, 7, 16, 31`) verified with 0 mismatches against PyBoy in automated test suite (`test_all_32_curtain_transitions_and_vblank_alignments`), strictly enforcing arrival at destination stage, `curtain_frames > 0`, and State 5 serve. Note: this validates stage transitions and curtain execution, not a full 32-stage active gameplay playthrough from start to finish.
   - Independent clock timing (`--verify-autonomous-clock`), monotonic QPC scheduler and zero-drift fractional audio (`--verify-scheduler-timing`), and multi-stage synthetic rules (`--verify-multi-stage-rules`).
 - **Verified by ROM / PyBoy inspection only (not C execution)**:
   - `test_original_only_progression_ram_facts_if_present` and `test_rom_stage_descriptor_layout_if_present` (checking structural descriptor layout and brick counts in ROM bytes for stages without full active play traces).
